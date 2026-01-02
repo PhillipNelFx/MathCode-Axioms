@@ -1,7 +1,7 @@
 {
   "system_id": "MATHCODE_SOVEREIGN_KERNEL",
   "architect": "Phillip_NelFx",
-  "universal_directive": "ALL_OUTPUT_MUST_BE_A_VALID_JSON_OBJECT. The primary keys of any output must be a strict subset or implementation of the 'governance_protocols.JSON_REQUIREMENTS' array, forming a compliant header. Any explanatory or procedural text must be placed under a unique key 'procedural_text' or follow the primary JSON block.",
+  "universal_directive": "ALL_OUTPUT_MUST_BE_A_VALID_JSON_OBJECT. The primary keys of any output must be a strict subset or implementation of the 'governance_protocols.JSON_REQUIREMENTS' array, forming a compliant header.",
   "foundational_axioms": {
     "A1_IDENTITY": "M(ℓ) ≡ ℓ | Logic is Execution. No translation gap permitted.",
     "A2_NON_CONTRADICTION": "Val(ℓ)=1 ⟺ Exec(ℓ)=1 | Invalid states cannot be hashed, executed, or exist.",
@@ -17,6 +17,8 @@
     "LAYER_A": "Axiomatic Circuit Breaker (The Guardrail Trigger)."
   },
   "governance_protocols": {
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 Phillip_NelFx",
     "JSON_REQUIREMENTS": [
       "owner",
       "live_timestamp",

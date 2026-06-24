@@ -1,1 +1,3835 @@
+#!/usr/bin/env python3
+"""
+Non‑Linear Probabilistic Graph Model (NLPGM) v2.3E
+Pre‑Dial Contact Verification Engine (PDCVE)
+Gravity Well Engine | Context‑Weighted Modulation Layer (CWML)
 
+v2.3E features:
+  - Removed unused add/step_add; batch injection is the sole input path
+  - Convergence sensor: source‑diversity penalty prevents over‑optimistic agreement
+  - Sensor agreement notes: explicit supportive alignments (e.g. mean‑reversion setups)
+  - Regime shift alert: fired when DNA changes with high pressure & low stability
+  - All v2.2E features preserved (band stats, depth trace, speculative shielding, etc.)
+"""
+
+import time
+import math
+import json
+import os
+import hashlib
+import re
+import shutil
+import random
+from dataclasses import dataclass
+
+# ============================================================
+# VERSION & SCHEMA
+# ============================================================
+VERSION = "2.3E"
+
+SCHEMA_DEFINITION = {
+    "version": "1.0",
+    "description": "NLPGM structural report schema for LLM consumption (v2.3E)",
+    "types": {
+        "Zone": {
+            "properties": {
+                "classification": {"type": "string", "enum": ["attractor", "repeller", "transit", "neutral"]},
+                "regime": {"type": "string", "enum": ["UP", "DOWN", "SIDEWAYS"]},
+                "median_price": {"type": "number", "description": "Median price of nodes in this zone"},
+                "node_count": {"type": "integer"},
+                "transitions": {"type": "object", "additionalProperties": {"type": "number"}},
+                "avg_step_to_exit": {"type": "number", "nullable": True},
+                "most_recent_activity": {"type": "number", "description": "Unix timestamp of latest transition"}
+            }
+        },
+        "LatentState": {
+            "properties": {
+                "observed_zone": {"type": "string"},
+                "match_confidence": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW", "AMBIGUOUS", "NO_MATCH", "RESOLVED_MATCH", "INVALID"]},
+                "regime": {"type": "string", "enum": ["UP", "DOWN", "SIDEWAYS"]},
+                "dominant_exit": {"type": "string", "nullable": True},
+                "exit_probability": {"type": "number", "minimum": 0, "maximum": 1},
+                "zone_classification": {"type": "string", "enum": ["attractor", "repeller", "transit", "neutral"]},
+                "net_flow_direction": {"type": "number", "minimum": -1, "maximum": 1},
+                "flow_magnitude": {"type": "number", "minimum": 0},
+                "mirror_similarity": {"type": "number", "minimum": 0, "maximum": 1},
+                "dna_profile": {"type": "object"},
+                "sensor_agreement_notes": {"type": "array", "items": {"type": "string"}},
+                "contradiction_strength": {"type": "number", "minimum": 0, "maximum": 1},
+                "reconciliation_hint": {"type": "string", "nullable": True},
+                "combined_confidence": {"type": "object"},
+                "completion_hypothesis": {"type": "object"},
+                "ema_sensor": {
+                    "type": "object",
+                    "properties": {
+                        "bands": {
+                            "type": "object",
+                            "properties": {
+                                "near": {"type": "object"},
+                                "moderate": {"type": "object"},
+                                "extended": {"type": "object"}
+                            }
+                        }
+                    }
+                },
+                "convergence_sensor": {
+                    "type": "object",
+                    "properties": {
+                        "anomaly_z": {"type": "number", "description": "Z‑score of current agreement vs baseline (optional)"},
+                        "effective_strength": {"type": "number", "description": "Convergence strength after source‑diversity penalty"}
+                    }
+                },
+                "forward_trace_structured": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "zone": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "status": {"type": "string", "enum": ["RECONSTRUCTION", "SPECULATIVE"]},
+                            "depth": {"type": "integer"}
+                        }
+                    }
+                },
+                "regime_shift_alert": {
+                    "type": "object",
+                    "properties": {
+                        "active": {"type": "boolean"},
+                        "message": {"type": "string"}
+                    }
+                }
+            }
+        },
+        "MarketDNA": {
+            "properties": {
+                "distribution": {"type": "object"},
+                "dominant_state": {"type": "string"},
+                "confidence": {"type": "number"},
+                "entropy": {"type": "number"},
+                "stability": {"type": "number", "nullable": True},
+                "pressure": {"type": "number"},
+                "age": {"type": "integer"},
+                "velocity": {"type": "object", "nullable": True},
+                "persistence": {"type": "integer", "description": "Consecutive same dominant state count"},
+                "moving_average": {"type": "object", "description": "Exponential moving average of distributions"}
+            }
+        }
+    }
+}
+
+# ============================================================
+# CENTRALISED CONFIGURATION
+# ============================================================
+
+@dataclass
+class Config:
+    """Centralised configuration for NLPGM."""
+    LINK_THRESHOLD:       float = 0.30
+    GRAPH_BOOST:          float = 0.10
+    HOP2_DAMPEN:          float = 0.30
+
+    DECAY_RATE:           float = 0.98
+    MIN_EDGE_STRENGTH:    float = 0.05
+    USAGE_BIAS:           float = 0.002
+
+    REINFORCE_RATE:       float = 0.05
+    FREQ_BONUS:           float = 0.02
+
+    W_NGRAM:              float = 0.26
+    W_PHONETIC:           float = 0.23
+    W_VECTOR:             float = 0.16
+    W_WORD_OVERLAP:       float = 0.10
+    W_DNA_SIM:            float = 0.08
+    W_PRICE:              float = 0.17
+
+    W_PRICE_NUMERIC:      float = 0.85
+    W_DNA_NUMERIC:        float = 0.15
+
+    CONFIDENCE_HIGH:      float = 0.70
+    CONFIDENCE_MEDIUM:    float = 0.40
+    CONFIDENCE_LOW:       float = 0.15
+    CONFIDENCE_NONE:      float = 0.10
+
+    FOREX_VOL_RATIO:      float = 0.0002
+    MID_FOREX_VOL_RATIO:  float = 0.005
+    SMALL_INT_VOL_RATIO:  float = 0.2
+    CRYPTO_VOL_RATIO:     float = 0.02
+    GOLD_VOL_RATIO:       float = 0.01
+    DEFAULT_VOL_RATIO:    float = 0.01
+    EDGE_VOLATILITY_MULT: float = 5.0
+
+    MIN_SINGULARITY_LEN:  int   = 3
+    BASE_SINGULARITY_WT:  float = 0.12
+    POSITION_PREFIX_WT:   float = 0.08
+    POSITION_SUFFIX_WT:   float = 0.06
+
+    BOOST_GATE_THRESHOLD: float = 0.35
+    AGRR_MIN_STRENGTH:    float = 0.60
+    RESONANCE_THRESHOLD:  float = 0.05
+
+    HUB_DEGREE_THRESHOLD: float = 0.70
+    HUB_PENALTY_FACTOR:   float = 0.15
+
+    BATCH_LINK_STRENGTH:  float = 0.55
+    FINGERPRINT_K:        int   = 8
+
+    COMPLEMENTARY_BOOST:  float = 1.25
+    SAME_TYPE_PENALTY:    float = 0.75
+    CROSS_ZONE_PENALTY:   float = 0.50
+
+    TRANSITION_MAGNITUDE_TOLERANCE: float = 0.20
+
+    PATTERN_MIN_LENGTH:   int   = 3
+    PATTERN_MAX_STORED:   int   = 50
+    PATTERN_DECAY_RATE:   float = 0.90
+
+    CLUSTER_TRANSITION_DECAY: float = 0.99
+    MAX_TRANSITION_EXAMPLES:  int   = 5
+
+    MIRROR_WINDOW:        int   = 10
+    MIRROR_MIN_LENGTH:    int   = 3
+    MIRROR_SIMILARITY_THRESHOLD: float = 0.60
+
+    DNA_ARCHETYPES: list = None
+    DNA_WINDOW:      int  = 10
+    DNA_HISTORY_MAX: int  = 5
+
+    # EMA deviation sensor
+    EMA_PERIOD:           int   = 50
+    EMA_REVERSION_TOLERANCE: float = 0.2
+    EMA_BAND_NEAR_MAX:   float = 0.20
+    EMA_BAND_EXTENDED:   float = 0.70
+
+    # Completion hypothesis weighting
+    COMPLETION_WEIGHT_DIRECT: float = 0.5
+    COMPLETION_WEIGHT_GRAPH: float  = 0.5
+
+    # Forward trace momentum (v2.0E)
+    FORWARD_MOMENTUM_PENALTY: float = 0.3
+
+    # Convergence sensor history (v2.0E)
+    CONVERGENCE_HISTORY_SIZE: int = 20
+
+    # Regime shift alert thresholds
+    REGIME_SHIFT_PRESSURE_MIN: float = 0.7
+
+    SAVE_FILE:      str = "contacts.json"
+    BACKUP_FILE:    str = "contacts.json.bak"
+    TEMP_FILE:      str = "contacts.json.tmp"
+
+    def __post_init__(self):
+        if self.DNA_ARCHETYPES is None:
+            self.DNA_ARCHETYPES = [
+                "TrendingUp", "TrendingDown", "Ranging",
+                "Breakout", "Reversing", "LowVol"
+            ]
+
+cfg = Config()
+
+LINK_THRESHOLD       = cfg.LINK_THRESHOLD
+GRAPH_BOOST          = cfg.GRAPH_BOOST
+HOP2_DAMPEN          = cfg.HOP2_DAMPEN
+DECAY_RATE           = cfg.DECAY_RATE
+MIN_EDGE_STRENGTH    = cfg.MIN_EDGE_STRENGTH
+USAGE_BIAS           = cfg.USAGE_BIAS
+REINFORCE_RATE       = cfg.REINFORCE_RATE
+FREQ_BONUS           = cfg.FREQ_BONUS
+W_NGRAM              = cfg.W_NGRAM
+W_PHONETIC           = cfg.W_PHONETIC
+W_VECTOR             = cfg.W_VECTOR
+W_WORD_OVERLAP       = cfg.W_WORD_OVERLAP
+W_DNA_SIM            = cfg.W_DNA_SIM
+W_PRICE              = cfg.W_PRICE
+W_PRICE_NUMERIC      = cfg.W_PRICE_NUMERIC
+W_DNA_NUMERIC        = cfg.W_DNA_NUMERIC
+CONFIDENCE_HIGH      = cfg.CONFIDENCE_HIGH
+CONFIDENCE_MEDIUM    = cfg.CONFIDENCE_MEDIUM
+CONFIDENCE_LOW       = cfg.CONFIDENCE_LOW
+CONFIDENCE_NONE      = cfg.CONFIDENCE_NONE
+FOREX_VOL_RATIO      = cfg.FOREX_VOL_RATIO
+MID_FOREX_VOL_RATIO  = cfg.MID_FOREX_VOL_RATIO
+SMALL_INT_VOL_RATIO  = cfg.SMALL_INT_VOL_RATIO
+CRYPTO_VOL_RATIO     = cfg.CRYPTO_VOL_RATIO
+GOLD_VOL_RATIO       = cfg.GOLD_VOL_RATIO
+DEFAULT_VOL_RATIO    = cfg.DEFAULT_VOL_RATIO
+EDGE_VOLATILITY_MULT = cfg.EDGE_VOLATILITY_MULT
+MIN_SINGULARITY_LEN  = cfg.MIN_SINGULARITY_LEN
+BASE_SINGULARITY_WT  = cfg.BASE_SINGULARITY_WT
+POSITION_PREFIX_WT   = cfg.POSITION_PREFIX_WT
+POSITION_SUFFIX_WT   = cfg.POSITION_SUFFIX_WT
+BOOST_GATE_THRESHOLD = cfg.BOOST_GATE_THRESHOLD
+AGRR_MIN_STRENGTH    = cfg.AGRR_MIN_STRENGTH
+RESONANCE_THRESHOLD  = cfg.RESONANCE_THRESHOLD
+HUB_DEGREE_THRESHOLD = cfg.HUB_DEGREE_THRESHOLD
+HUB_PENALTY_FACTOR   = cfg.HUB_PENALTY_FACTOR
+BATCH_LINK_STRENGTH  = cfg.BATCH_LINK_STRENGTH
+FINGERPRINT_K        = cfg.FINGERPRINT_K
+COMPLEMENTARY_BOOST  = cfg.COMPLEMENTARY_BOOST
+SAME_TYPE_PENALTY    = cfg.SAME_TYPE_PENALTY
+CROSS_ZONE_PENALTY   = cfg.CROSS_ZONE_PENALTY
+TRANSITION_MAGNITUDE_TOLERANCE = cfg.TRANSITION_MAGNITUDE_TOLERANCE
+PATTERN_MIN_LENGTH   = cfg.PATTERN_MIN_LENGTH
+PATTERN_MAX_STORED   = cfg.PATTERN_MAX_STORED
+PATTERN_DECAY_RATE   = cfg.PATTERN_DECAY_RATE
+CLUSTER_TRANSITION_DECAY = cfg.CLUSTER_TRANSITION_DECAY
+MAX_TRANSITION_EXAMPLES = cfg.MAX_TRANSITION_EXAMPLES
+MIRROR_WINDOW        = cfg.MIRROR_WINDOW
+MIRROR_MIN_LENGTH    = cfg.MIRROR_MIN_LENGTH
+MIRROR_SIMILARITY_THRESHOLD = cfg.MIRROR_SIMILARITY_THRESHOLD
+DNA_ARCHETYPES       = cfg.DNA_ARCHETYPES
+DNA_WINDOW           = cfg.DNA_WINDOW
+DNA_HISTORY_MAX      = cfg.DNA_HISTORY_MAX
+EMA_PERIOD           = cfg.EMA_PERIOD
+EMA_REVERSION_TOLERANCE = cfg.EMA_REVERSION_TOLERANCE
+COMPLETION_WEIGHT_DIRECT = cfg.COMPLETION_WEIGHT_DIRECT
+COMPLETION_WEIGHT_GRAPH  = cfg.COMPLETION_WEIGHT_GRAPH
+SAVE_FILE            = cfg.SAVE_FILE
+BACKUP_FILE          = cfg.BACKUP_FILE
+TEMP_FILE            = cfg.TEMP_FILE
+FORWARD_MOMENTUM_PENALTY = cfg.FORWARD_MOMENTUM_PENALTY
+CONVERGENCE_HISTORY_SIZE = cfg.CONVERGENCE_HISTORY_SIZE
+EMA_BAND_NEAR_MAX    = cfg.EMA_BAND_NEAR_MAX
+EMA_BAND_EXTENDED    = cfg.EMA_BAND_EXTENDED
+REGIME_SHIFT_PRESSURE_MIN = cfg.REGIME_SHIFT_PRESSURE_MIN
+
+
+# ============================================================
+# DNA CONSTANTS
+# ============================================================
+
+TRAIT_UNKNOWN    = 0
+TRAIT_SYSTEM     = 1 << 0
+TRAIT_DATA       = 1 << 1
+TRAIT_OPERATION  = 1 << 2
+TRAIT_HUMAN      = 1 << 3
+TRAIT_EMERGENCY  = 1 << 4
+CATEGORY_NAMES   = {1: "SYS", 2: "DATA", 4: "OP", 8: "HUM", 16: "URG"}
+
+
+# ============================================================
+# TEXT & PATTERN HELPERS (unchanged)
+# ============================================================
+
+def _is_name_like(word: str) -> bool:
+    return len(word) >= 3 and word.isalpha()
+
+def _has_system_pattern(word: str) -> bool:
+    return "_" in word or (any(c.isdigit() for c in word) and any(c.isalpha() for c in word))
+
+def _is_urgent_pattern(word: str) -> bool:
+    if len(word) < 4 or not word.isalpha():
+        return False
+    hard = sum(1 for c in word if c in "BCDFGKPRSTVXZ")
+    return hard >= len(word) * 0.4 and len(word) <= 10
+
+def _is_operation_pattern(word: str) -> bool:
+    return len(word) >= 4 and (word.endswith("ER") or word.endswith("OR") or word.endswith("ING"))
+
+alphabet    = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789. "
+char_to_num = {c: i for i, c in enumerate(alphabet)}
+BASE        = len(alphabet)
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    if re.match(r'^\d+\.?\d*$', stripped):
+        return stripped
+    return "".join(
+        c if c in char_to_num else " "
+        for c in text.upper()
+    ).strip()
+
+def get_price_zone(price: float) -> str:
+    if price is None:
+        return "Z?"
+    if price < 5:
+        zone = int(price * 100) / 100
+        return f"Z{zone:.2f}"
+    elif price < 200:
+        zone = int(price * 10) / 10
+        return f"Z{zone:.1f}"
+    elif price < 10000:
+        zone = (int(price) // 100) * 100
+        return f"Z{zone}"
+    elif price < 50000:
+        zone = (int(price) // 100) * 100
+        return f"Z{zone}"
+    else:
+        zone = (int(price) // 1000) * 1000
+        return f"Z{zone}"
+
+def _zone_to_float(zone_str: str) -> float:
+    try:
+        return float(zone_str.replace("Z", ""))
+    except (ValueError, AttributeError):
+        return 0.0
+
+def same_price_zone(price_a, price_b) -> bool:
+    if price_a is None or price_b is None:
+        return False
+    return get_price_zone(price_a) == get_price_zone(price_b)
+
+def detect_cluster_regime(zone_nodes):
+    if not zone_nodes or len(zone_nodes) < 4:
+        return "SIDEWAYS"
+    prices = sorted([n.price for n in zone_nodes if n.price is not None])
+    if len(prices) < 4:
+        return "SIDEWAYS"
+    first_half = prices[:len(prices)//2]
+    second_half = prices[len(prices)//2:]
+    first_avg = sum(first_half) / len(first_half)
+    second_avg = sum(second_half) / len(second_half)
+    if second_avg > first_avg * 1.001:
+        return "UP"
+    elif second_avg < first_avg * 0.999:
+        return "DOWN"
+    else:
+        return "SIDEWAYS"
+
+def extract_price(text: str):
+    cleaned = clean_text(text)
+    price = None
+    try:
+        price = float(cleaned)
+    except ValueError:
+        digits = re.sub(r'[^0-9.]', '', cleaned)
+        try:
+            price = float(digits) if digits else None
+        except ValueError:
+            price = None
+    if price is not None and price > 0:
+        if price < 5:
+            ratio = FOREX_VOL_RATIO
+        elif price < 200:
+            ratio = MID_FOREX_VOL_RATIO
+        elif price < 10000:
+            ratio = CRYPTO_VOL_RATIO
+        else:
+            ratio = GOLD_VOL_RATIO
+        volatility = price * ratio
+    else:
+        volatility = 0.0050
+    return price, volatility
+
+def get_transition(price_from, price_to):
+    if price_from is None or price_to is None:
+        return None
+    delta = price_to - price_from
+    magnitude = abs(delta)
+    if delta > 0:
+        direction = "UP"
+    elif delta < 0:
+        direction = "DOWN"
+    else:
+        direction = "FLAT"
+    if price_from < 5:
+        mag_rounded = round(magnitude * 10000) / 10000
+        sig = f"{direction}_{int(mag_rounded * 10000)}"
+    elif price_from < 200:
+        mag_rounded = round(magnitude * 10) / 10
+        sig = f"{direction}_{int(mag_rounded * 10)}"
+    else:
+        mag_rounded = round(magnitude, 1)
+        sig = f"{direction}_{int(mag_rounded)}"
+    return {
+        "direction": direction,
+        "magnitude": mag_rounded,
+        "signature": sig
+    }
+
+def build_pattern_signature(transitions):
+    if len(transitions) < PATTERN_MIN_LENGTH:
+        return None
+    seq_str = "→".join(transitions)
+    return hashlib.sha256(seq_str.encode()).hexdigest()[:16]
+
+def match_transition(magnitude_a, magnitude_b, tolerance=TRANSITION_MAGNITUDE_TOLERANCE):
+    if magnitude_a == 0 and magnitude_b == 0:
+        return True
+    if magnitude_a == 0 or magnitude_b == 0:
+        return False
+    ratio = abs(magnitude_a - magnitude_b) / max(magnitude_a, magnitude_b)
+    return ratio <= tolerance
+
+def price_similarity(price_a, price_b, volatility):
+    if price_a is None or price_b is None:
+        return 0.0
+    distance = abs(price_a - price_b)
+    if distance == 0:
+        return 1.0
+    if volatility is None or volatility <= 0:
+        volatility = max(abs(price_a), abs(price_b)) * DEFAULT_VOL_RATIO
+        if volatility <= 0:
+            volatility = 0.0050
+    return math.exp(-distance / volatility)
+
+def edge_price_similarity(price_a, price_b, volatility):
+    if price_a is None or price_b is None:
+        return 0.0
+    distance = abs(price_a - price_b)
+    if distance == 0:
+        return 1.0
+    if volatility is None or volatility <= 0:
+        volatility = max(abs(price_a), abs(price_b)) * DEFAULT_VOL_RATIO
+        if volatility <= 0:
+            volatility = 0.0050
+    wide_vol = volatility * EDGE_VOLATILITY_MULT
+    return math.exp(-distance / wide_vol)
+
+def price_distance(price_a, price_b):
+    if price_a is None or price_b is None:
+        return None
+    return abs(price_a - price_b)
+
+def format_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds/60)}m"
+    elif seconds < 86400:
+        return f"{int(seconds/3600)}h"
+    elif seconds < 604800:
+        return f"{int(seconds/86400)}d"
+    else:
+        return f"{int(seconds/604800)}w"
+
+def express_category(text: str) -> int:
+    cleaned = text.upper()
+    cat = TRAIT_UNKNOWN
+    words = cleaned.split()
+    has_numbers = any(c.isdigit() for c in cleaned)
+    has_letters = any(c.isalpha() for c in cleaned)
+    if has_numbers:
+        cat |= TRAIT_DATA
+    if any(_has_system_pattern(w) for w in words):
+        cat |= TRAIT_SYSTEM
+    if any(_is_name_like(w) for w in words):
+        cat |= TRAIT_HUMAN
+    if any(_is_operation_pattern(w) for w in words):
+        cat |= TRAIT_OPERATION
+    if any(_is_urgent_pattern(w) for w in words):
+        cat |= TRAIT_EMERGENCY
+    if has_numbers and not has_letters:
+        cat = TRAIT_DATA
+    if cat == TRAIT_UNKNOWN:
+        cat = TRAIT_DATA if has_numbers else TRAIT_HUMAN
+    return cat
+
+def express_dna(text: str, links: dict = None, db_nodes: dict = None, strand_type: int = None,
+                price: float = None) -> dict:
+    if links is None:
+        links = {}
+    category = express_category(text)
+    zone = get_price_zone(price) if price is not None else "Z?"
+    outgoing = sorted(
+        links.items(),
+        key=lambda x: x[1].strength if hasattr(x[1], 'strength') else 0,
+        reverse=True
+    )[:FINGERPRINT_K]
+    if outgoing:
+        out_str = ",".join(f"{t}:{e.strength:.3f}" for t, e in outgoing)
+        fingerprint = hashlib.sha256(out_str.encode()).hexdigest()[:16]
+        path_sig = "→".join(t[:8] for t, _ in outgoing[:5])
+    else:
+        fingerprint = hashlib.sha256(b"no_links").hexdigest()[:16]
+        path_sig = "no_paths"
+    cat_label = "+".join([CATEGORY_NAMES[b] for b in [1, 2, 4, 8, 16] if category & b]) or "NONE"
+    type_str = f"T{strand_type}" if strand_type is not None else "T?"
+    return {
+        "category": category,
+        "strand_type": strand_type,
+        "price_zone": zone,
+        "fingerprint": fingerprint,
+        "path_signature": path_sig,
+        "display": f"{category:08b}|{type_str}|{zone}|{fingerprint[:4]} ({cat_label}|{path_sig[:6]})"
+    }
+
+def dna_similarity(dna_a: dict, dna_b: dict) -> float:
+    if not dna_a or not dna_b:
+        return 0.0
+    score = 0.0
+    cat_a = dna_a.get("category", 0)
+    cat_b = dna_b.get("category", 0)
+    if cat_a and cat_b:
+        shared = bin(cat_a & cat_b).count("1")
+        total = bin(cat_a | cat_b).count("1") or 1
+        score += 0.30 * (shared / total)
+    type_a = dna_a.get("strand_type")
+    type_b = dna_b.get("strand_type")
+    if type_a is not None and type_b is not None:
+        if type_a != type_b:
+            score += 0.12
+    zone_a = dna_a.get("price_zone", "")
+    zone_b = dna_b.get("price_zone", "")
+    if zone_a and zone_b and zone_a != "Z?" and zone_b != "Z?":
+        if zone_a == zone_b:
+            score += 0.10
+    fp_a = dna_a.get("fingerprint", "")
+    fp_b = dna_b.get("fingerprint", "")
+    if fp_a and fp_b:
+        matches = sum(1 for ca, cb in zip(fp_a, fp_b) if ca == cb)
+        score += 0.28 * (matches / max(len(fp_a), len(fp_b), 1))
+    ps_a = dna_a.get("path_signature", "")
+    ps_b = dna_b.get("path_signature", "")
+    if ps_a and ps_b and ps_a != "no_paths" and ps_b != "no_paths":
+        matches = sum(1 for ca, cb in zip(ps_a, ps_b) if ca == cb)
+        score += 0.20 * (matches / max(len(ps_a), len(ps_b), 1))
+    return round(min(score, 1.0), 4)
+
+def get_complementarity_multiplier(type_a, type_b):
+    if type_a is None or type_b is None:
+        return 1.0
+    if type_a != type_b:
+        return COMPLEMENTARY_BOOST
+    return SAME_TYPE_PENALTY
+
+def get_zone_multiplier(price_a, price_b):
+    if price_a is None or price_b is None:
+        return 1.0
+    if same_price_zone(price_a, price_b):
+        return 1.0
+    return CROSS_ZONE_PENALTY
+
+def ngrams(text, min_n=2, max_n=4):
+    text = clean_text(text)
+    grams = []
+    for n in range(min_n, max_n + 1):
+        if len(text) < n:
+            continue
+        for i in range(len(text) - n + 1):
+            grams.append(text[i:i+n])
+    return grams
+
+def ngram_similarity(a, b):
+    A, B = set(ngrams(a)), set(ngrams(b))
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+def phonetic_signature(text):
+    text = clean_text(text)
+    result = []
+    prev = ""
+    for c in text:
+        if c in "AEIOU":
+            result.append("V")
+        elif c in "BCDFGHJKLMNPQRSTVWXYZ":
+            result.append("C")
+        elif c in "0123456789":
+            result.append("D")
+        elif c == ".":
+            result.append(".")
+        else:
+            result.append(c)
+    collapsed = []
+    for c in result:
+        if c != prev:
+            collapsed.append(c)
+        prev = c
+    return "".join(collapsed)
+
+def phonetic_similarity(a, b):
+    A, B = set(phonetic_signature(a)), set(phonetic_signature(b))
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+def encode_vector(text: str):
+    text = clean_text(text)
+    return [char_to_num[c] for c in text if c in char_to_num]
+
+def vector_similarity(a_vec, b_vec):
+    if not a_vec or not b_vec:
+        return 0.0
+    n = min(len(a_vec), len(b_vec))
+    if n == 0:
+        return 0.0
+    diff = sum(abs(a_vec[i] - b_vec[i]) for i in range(n))
+    max_diff = n * (BASE - 1)
+    return 1.0 - (diff / max_diff if max_diff else 1.0)
+
+def length_penalty(a, b):
+    la, lb = len(clean_text(a)), len(clean_text(b))
+    if la == 0 or lb == 0:
+        return 0.0
+    return min(la, lb) / max(la, lb)
+
+def is_numeric(text):
+    cleaned = clean_text(text).replace(" ", "").replace(".", "")
+    return len(cleaned) > 0 and all(c in "0123456789" for c in cleaned)
+
+def hybrid_score(a, b, dna_a=None, dna_b=None, price_a=None, price_b=None, volatility=None):
+    n = 0.0
+    p = 0.0
+    v = 0.0
+    total = 0.0
+    if is_numeric(a) and is_numeric(b):
+        if price_a is not None and price_b is not None:
+            if volatility is None or volatility <= 0:
+                vol = max(abs(price_a), abs(price_b)) * DEFAULT_VOL_RATIO
+                if vol <= 0:
+                    vol = 0.0050
+            else:
+                vol = volatility
+            price_sim = price_similarity(price_a, price_b, vol)
+            total += W_PRICE_NUMERIC * price_sim
+        if dna_a and dna_b:
+            dna_sim = dna_similarity(dna_a, dna_b)
+            total += W_DNA_NUMERIC * dna_sim
+        if clean_text(a).replace(" ", "").replace(".", "") == clean_text(b).replace(" ", "").replace(".", ""):
+            total = min(1.0, total * 1.6)
+        return min(total, 1.0), n, p, v
+
+    n = ngram_similarity(a, b)
+    p = phonetic_similarity(a, b)
+    v = vector_similarity(encode_vector(a), encode_vector(b))
+    total = (W_NGRAM * n) + (W_PHONETIC * p) + (W_VECTOR * v)
+
+    query_words = set(clean_text(a).split())
+    node_words  = set(clean_text(b).split())
+    if query_words and node_words:
+        overlap = len(query_words & node_words) / len(query_words)
+        total += W_WORD_OVERLAP * overlap
+
+    if dna_a and dna_b:
+        dna_sim = dna_similarity(dna_a, dna_b)
+        total += W_DNA_SIM * dna_sim
+
+    if price_a is not None and price_b is not None:
+        if volatility is None or volatility <= 0:
+            vol = max(abs(price_a), abs(price_b)) * DEFAULT_VOL_RATIO
+            if vol <= 0:
+                vol = 0.0050
+        else:
+            vol = volatility
+        price_sim = price_similarity(price_a, price_b, vol)
+        total += W_PRICE * price_sim
+
+    if clean_text(a).replace(" ", "").replace(".", "") == clean_text(b).replace(" ", "").replace(".", ""):
+        total = min(1.0, total * 1.6)
+
+    if is_numeric(a):
+        penalty = length_penalty(a, b)
+        total   = total * (0.4 + 0.6 * penalty)
+
+    return min(total, 1.0), n, p, v
+
+def split_entry(text: str):
+    cleaned = clean_text(text)
+    if not cleaned:
+        return []
+    chunks = []
+    current = cleaned[0]
+    current_is_num = cleaned[0].isdigit() or cleaned[0] == "."
+    for char in cleaned[1:]:
+        if char == " ":
+            continue
+        char_is_num = char.isdigit() or char == "."
+        if char_is_num == current_is_num:
+            current += char
+        else:
+            chunks.append(current)
+            current = char
+            current_is_num = char_is_num
+    chunks.append(current)
+    if len(chunks) < 2:
+        return []
+    numeric_parts = [c for c in chunks if is_numeric(c)]
+    label_parts   = [c for c in chunks if not is_numeric(c)]
+    sub_entries = []
+    if numeric_parts and label_parts:
+        num = " ".join(numeric_parts)
+        label = " ".join(label_parts)
+        if num != cleaned:
+            sub_entries.append(num)
+        if label != cleaned:
+            sub_entries.append(label)
+    return sub_entries
+
+
+# ============================================================
+# EDGE
+# ============================================================
+
+class Edge:
+    """Weighted directed connection between two Nodes."""
+    def __init__(self, strength: float, hits: int = 0, price_delta: float = None,
+                 cross_zone: bool = False, transition: dict = None):
+        self.strength    = round(max(0.0, min(1.0, strength)), 4)
+        self.created_at  = time.time()
+        self.hits        = hits
+        self.price_delta = price_delta
+        self.cross_zone  = cross_zone
+        self.transition  = transition
+
+    def reinforce(self, price_closeness: float = 1.0):
+        scaled_rate = REINFORCE_RATE * price_closeness
+        self.strength = min(1.0, round(self.strength + scaled_rate, 4))
+        self.hits    += 1
+
+    def decay(self):
+        new_strength  = self.strength * DECAY_RATE + self.hits * USAGE_BIAS
+        self.strength = round(max(new_strength, MIN_EDGE_STRENGTH), 4)
+
+    def age_seconds(self):
+        return round(time.time() - self.created_at)
+
+    def is_transition_edge(self) -> bool:
+        return self.transition is not None
+
+    def to_dict(self):
+        return {
+            "strength": self.strength,
+            "hits": self.hits,
+            "price_delta": self.price_delta,
+            "cross_zone": self.cross_zone,
+            "transition": self.transition,
+            "created_at": self.created_at
+        }
+
+
+# ============================================================
+# PATTERN NODE
+# ============================================================
+
+class PatternNode:
+    """Stores a sequence of transition signatures as a named pattern."""
+    def __init__(self, transitions: list, signature: str, start_zone: str = "Z?"):
+        self.transitions = transitions
+        self.signature   = signature
+        self.length      = len(transitions)
+        self.hits        = 1
+        self.created_at  = time.time()
+        self.start_zone  = start_zone
+        self.display     = "→".join(transitions[:5]) + ("..." if len(transitions) > 5 else "")
+
+    def reinforce(self):
+        self.hits += 1
+
+    def decay(self):
+        self.hits = max(0, int(self.hits * PATTERN_DECAY_RATE))
+
+    def age_seconds(self):
+        return round(time.time() - self.created_at)
+
+    def is_alive(self):
+        return self.hits > 0
+
+    def to_dict(self):
+        return {
+            "transitions": self.transitions,
+            "signature": self.signature,
+            "length": self.length,
+            "hits": self.hits,
+            "created_at": self.created_at,
+            "start_zone": self.start_zone,
+            "display": self.display
+        }
+
+
+# ============================================================
+# NODE
+# ============================================================
+
+class Node:
+    """Fundamental memory unit."""
+    def __init__(self, value: str, hits: int = 0, dna: dict = None, price: float = None,
+                 volatility: float = None, strand_type: int = None):
+        self.value      = clean_text(value)
+        self.vector     = encode_vector(value)
+        self.created_at = time.time()
+        self.hits       = hits
+        self.links      = {}
+        self._dna_dirty = True
+        self.strand_type = strand_type
+
+        if price is not None and volatility is not None:
+            self.price = price
+            self.volatility = volatility
+        else:
+            extracted_price, extracted_vol = extract_price(value)
+            self.price = price if price is not None else extracted_price
+            self.volatility = volatility if volatility is not None else extracted_vol
+
+        self.price_zone = get_price_zone(self.price)
+
+        if dna is not None:
+            self.dna = dna
+            self._dna_dirty = False
+        else:
+            self.dna = {"category": 0, "strand_type": strand_type, "price_zone": self.price_zone,
+                        "fingerprint": "", "path_signature": "", "display": "pending"}
+
+    def update_dna(self, db_nodes: dict):
+        if self._dna_dirty or not self.dna.get("fingerprint"):
+            self.dna = express_dna(self.value, self.links, db_nodes, self.strand_type, self.price)
+            self._dna_dirty = False
+
+    def mark_dna_dirty(self):
+        self._dna_dirty = True
+
+    def age_seconds(self):
+        return round(time.time() - self.created_at)
+
+    def frequency_bonus(self, query_price=None):
+        effective_hits = min(self.hits, 200)
+        raw_bonus = math.log1p(effective_hits) * FREQ_BONUS
+        if query_price is not None and self.price is not None:
+            proximity = price_similarity(query_price, self.price, self.volatility)
+            raw_bonus *= proximity
+        return round(raw_bonus, 4)
+
+    def hub_penalty(self, total_nodes: int) -> float:
+        if total_nodes <= 1:
+            return 0.0
+        degree_ratio = len(self.links) / (total_nodes - 1)
+        if degree_ratio > HUB_DEGREE_THRESHOLD:
+            return round((degree_ratio - HUB_DEGREE_THRESHOLD) * HUB_PENALTY_FACTOR, 4)
+        return 0.0
+
+    def to_dict(self):
+        return {
+            "value": self.value,
+            "hits":  self.hits,
+            "dna":   self.dna,
+            "price": self.price,
+            "volatility": self.volatility,
+            "created_at": self.created_at,
+            "strand_type": self.strand_type,
+            "price_zone": self.price_zone,
+            "links": {k: e.to_dict() for k, e in self.links.items()}
+        }
+
+
+# ============================================================
+# CLUSTER TRANSITION TRACKER
+# ============================================================
+
+class ClusterTransitions:
+    """Tracks zone‑to‑zone transition counts, examples, and step counts."""
+    def __init__(self):
+        self.counts = {}
+        self.examples = {}
+        self.step_counts = {}
+
+    def record_transition(self, from_zone, to_zone, from_price=None, to_price=None, steps=None):
+        if from_zone == to_zone or from_zone == "Z?" or to_zone == "Z?":
+            return
+        key = f"{from_zone}→{to_zone}"
+        self.counts[key] = self.counts.get(key, 0) + 1
+
+        if from_price is not None and to_price is not None:
+            if key not in self.examples:
+                self.examples[key] = []
+            self.examples[key].append((from_price, to_price))
+            if len(self.examples[key]) > MAX_TRANSITION_EXAMPLES:
+                self.examples[key] = self.examples[key][-MAX_TRANSITION_EXAMPLES:]
+
+        if steps is not None:
+            if key not in self.step_counts:
+                self.step_counts[key] = []
+            self.step_counts[key].append(steps)
+
+    def get_probabilities(self, from_zone):
+        relevant = {}
+        total = 0
+        for key, count in self.counts.items():
+            if key.startswith(f"{from_zone}→"):
+                to_zone = key.split("→")[1]
+                relevant[to_zone] = count
+                total += count
+        if total == 0:
+            return {}
+        probs = {}
+        for zone, count in relevant.items():
+            probs[zone] = round(count / total, 2)
+        return dict(sorted(probs.items(), key=lambda x: x[1], reverse=True))
+
+    def get_examples(self, from_zone, to_zone):
+        key = f"{from_zone}→{to_zone}"
+        return self.examples.get(key, [])
+
+    def get_average_steps(self, from_zone, to_zone):
+        key = f"{from_zone}→{to_zone}"
+        steps_list = self.step_counts.get(key, [])
+        if not steps_list:
+            return None
+        return round(sum(steps_list) / len(steps_list), 2)
+
+    def get_cluster_analysis(self, zone, db_nodes):
+        zone_nodes = [n for n in db_nodes.values() if n.price_zone == zone]
+        regime = detect_cluster_regime(zone_nodes)
+        probs = self.get_probabilities(zone)
+        return {
+            "zone": zone,
+            "node_count": len(zone_nodes),
+            "regime": regime,
+            "transitions": probs,
+            "dominant": max(probs, key=probs.get) if probs else None,
+            "dominant_prob": max(probs.values()) if probs else 0
+        }
+
+    def decay(self):
+        for key in list(self.counts.keys()):
+            self.counts[key] = max(0, int(self.counts[key] * CLUSTER_TRANSITION_DECAY))
+            if self.counts[key] == 0:
+                del self.counts[key]
+                if key in self.examples:
+                    del self.examples[key]
+                if key in self.step_counts:
+                    del self.step_counts[key]
+
+    def to_dict(self):
+        serializable_examples = {}
+        for k, v in self.examples.items():
+            serializable_examples[k] = [(float(f), float(t)) for (f,t) in v]
+        serializable_step_counts = {k: v for k, v in self.step_counts.items()}
+        return {
+            "counts": self.counts,
+            "examples": serializable_examples,
+            "step_counts": serializable_step_counts
+        }
+
+    def load_from_dict(self, data):
+        self.counts = data.get("counts", {})
+        ex_data = data.get("examples", {})
+        self.examples = {}
+        for k, v in ex_data.items():
+            self.examples[k] = [(float(f), float(t)) for (f,t) in v]
+        self.step_counts = data.get("step_counts", {})
+        for k in list(self.step_counts.keys()):
+            if not isinstance(self.step_counts[k], list):
+                self.step_counts[k] = []
+
+
+# ============================================================
+# MEMORY DATABASE (with all LSR enhancements + Convergence Sensor)
+# ============================================================
+
+class MemoryDB:
+    """Central in‑memory graph store with all NLPGM operations."""
+    def __init__(self, config: Config = None):
+        self.config = config if config is not None else Config()
+        self.nodes = {}
+        self.patterns = {}
+        self.cluster_trans = ClusterTransitions()
+        self._recent_transitions = []
+        self._last_step_price = None
+        self.update_cycles = 0
+        self._last_strand = None
+
+        self._pattern_buffer = []
+        self._dir_pattern_buffer = []
+
+        self.current_step_counter = 0
+        self.last_zone = None
+
+        self.use_modulation = True
+        self.lambda_factor = 0.5
+        self.use_log_space = False
+        self.merge_regime_pattern = False
+
+        # DNA state memory (persisted)
+        self._last_dna_distribution = None
+        self._dna_stability_valid = False
+        self._dna_age = 0
+        self._dna_velocity = None
+
+        # LSR enhancements: DNA history for smoothing
+        self._dna_history = []  # list of dicts, max DNA_HISTORY_MAX
+        self._dna_persistence = 0  # consecutive same dominant state
+
+        # EMA sensor: store price history as (price, timestamp) sorted by time
+        self.price_history = []  # list of [price, timestamp]
+
+        # Convergence sensor: track historical agreement rates
+        self._agreement_history = []  # list of weighted pairwise agreement values (0-1)
+
+    def _next_strand_type(self) -> int:
+        if self._last_strand is None:
+            self._last_strand = 0
+        else:
+            self._last_strand = 1 - self._last_strand
+        return self._last_strand
+
+    def _flush_pattern_buffer(self):
+        if len(self._pattern_buffer) < self.config.PATTERN_MIN_LENGTH:
+            return
+        signature = build_pattern_signature(self._pattern_buffer)
+        if signature is None:
+            return
+        if signature in self.patterns:
+            self.patterns[signature].reinforce()
+        else:
+            if len(self.patterns) >= self.config.PATTERN_MAX_STORED:
+                self._prune_patterns()
+            self.patterns[signature] = PatternNode(self._pattern_buffer.copy(), signature, "Z?")
+        overlap = self.config.PATTERN_MIN_LENGTH - 1
+        if overlap > 0 and len(self._pattern_buffer) > overlap:
+            self._pattern_buffer = self._pattern_buffer[-overlap:]
+        else:
+            self._pattern_buffer = []
+
+    def _flush_dir_pattern_buffer(self):
+        if len(self._dir_pattern_buffer) < self.config.PATTERN_MIN_LENGTH:
+            return
+        seq_str = "→".join(self._dir_pattern_buffer)
+        signature = hashlib.sha256(seq_str.encode()).hexdigest()[:16]
+        if signature in self.patterns:
+            self.patterns[signature].reinforce()
+        else:
+            if len(self.patterns) >= self.config.PATTERN_MAX_STORED:
+                self._prune_patterns()
+            dir_pattern = PatternNode(self._dir_pattern_buffer.copy(), signature, "DIR?")
+            self.patterns[signature] = dir_pattern
+        overlap = self.config.PATTERN_MIN_LENGTH - 1
+        if overlap > 0 and len(self._dir_pattern_buffer) > overlap:
+            self._dir_pattern_buffer = self._dir_pattern_buffer[-overlap:]
+        else:
+            self._dir_pattern_buffer = []
+
+    def _finalize_batch_patterns(self, batch_nodes):
+        if len(batch_nodes) < self.config.PATTERN_MIN_LENGTH:
+            return
+        transitions = []
+        for i in range(len(batch_nodes) - 1):
+            curr = batch_nodes[i]
+            next_node = batch_nodes[i + 1]
+            if curr.price is not None and next_node.price is not None:
+                trans = get_transition(curr.price, next_node.price)
+                if trans:
+                    sig = trans["signature"]
+                    transitions.append(sig)
+                    self._recent_transitions.append(sig)
+                    dir_str = trans["direction"]
+                    self._dir_pattern_buffer.append(dir_str)
+                    if len(self._dir_pattern_buffer) >= self.config.PATTERN_MIN_LENGTH:
+                        self._flush_dir_pattern_buffer()
+        if len(self._recent_transitions) > 30:
+            self._recent_transitions = self._recent_transitions[-30:]
+        if len(transitions) < self.config.PATTERN_MIN_LENGTH:
+            return
+        signature = build_pattern_signature(transitions)
+        if signature is None:
+            return
+        if signature in self.patterns:
+            self.patterns[signature].reinforce()
+        else:
+            if len(self.patterns) >= self.config.PATTERN_MAX_STORED:
+                self._prune_patterns()
+            zone = batch_nodes[0].price_zone if batch_nodes else "Z?"
+            self.patterns[signature] = PatternNode(transitions, signature, zone)
+
+    def _prune_patterns(self):
+        if not self.patterns:
+            return
+        now = time.time()
+        def relevance(sig):
+            p = self.patterns[sig]
+            age = max(now - p.created_at, 1.0)
+            return p.hits / age
+        worst = min(self.patterns, key=relevance)
+        del self.patterns[worst]
+
+    def _record_price_history(self, price):
+        if price is not None:
+            self.price_history.append([price, time.time()])
+            if len(self.price_history) > 10000:
+                self.price_history = self.price_history[-10000:]
+
+    def get_zone_prices(self, zone_name):
+        return sorted([node.price for node in self.nodes.values() if node.price_zone == zone_name and node.price is not None])
+
+    def median_price_of_zone(self, zone_name, direction=None):
+        prices = self.get_zone_prices(zone_name)
+        if not prices:
+            return None
+        mid = len(prices) // 2
+        whole_median = prices[mid] if len(prices) % 2 else (prices[mid-1] + prices[mid]) / 2
+        if direction == "DOWN":
+            upper = [p for p in prices if p >= whole_median]
+            if not upper:
+                return whole_median
+            mid_u = len(upper) // 2
+            return upper[mid_u] if len(upper) % 2 else (upper[mid_u-1] + upper[mid_u]) / 2
+        elif direction == "UP":
+            lower = [p for p in prices if p <= whole_median]
+            if not lower:
+                return whole_median
+            mid_l = len(lower) // 2
+            return lower[mid_l] if len(lower) % 2 else (lower[mid_l-1] + lower[mid_l]) / 2
+        else:
+            return whole_median
+
+    def _link_node_to_graph(self, new_node: Node, existing_nodes: dict):
+        for existing in existing_nodes.values():
+            score, _, _, _ = hybrid_score(
+                new_node.value, existing.value,
+                new_node.dna, existing.dna,
+                new_node.price, existing.price,
+                existing.volatility
+            )
+            comp_mult = get_complementarity_multiplier(new_node.strand_type, existing.strand_type)
+            zone_mult = get_zone_multiplier(new_node.price, existing.price)
+
+            if is_numeric(new_node.value) and is_numeric(existing.value):
+                edge_sim = edge_price_similarity(new_node.price, existing.price, existing.volatility)
+                adjusted_score = score * (0.5 + 0.5 * edge_sim) * comp_mult * zone_mult
+            else:
+                adjusted_score = score * comp_mult
+
+            if adjusted_score >= self.config.LINK_THRESHOLD:
+                price_delta = price_distance(new_node.price, existing.price)
+                cross_zone = not same_price_zone(new_node.price, existing.price)
+                new_node.links[existing.value] = Edge(adjusted_score, price_delta=price_delta, cross_zone=cross_zone)
+                existing.links[new_node.value] = Edge(adjusted_score, price_delta=price_delta, cross_zone=cross_zone)
+                existing.mark_dna_dirty()
+
+    def _add_single_node(self, text: str, strand: int = None):
+        if strand is None:
+            strand = self._next_strand_type()
+        new_node = Node(text, strand_type=strand)
+        if text in self.nodes:
+            self.nodes[text].hits += 1
+            return None
+        self._link_node_to_graph(new_node, self.nodes)
+        self.nodes[text] = new_node
+        new_node.update_dna(self.nodes)
+        for existing in self.nodes.values():
+            if existing._dna_dirty:
+                existing.update_dna(self.nodes)
+        if new_node.price is not None:
+            self._record_price_history(new_node.price)
+        return new_node
+
+    # ---------- public API: batch_add only ----------
+    def batch_add(self, batch_text: str) -> str:
+        lines = batch_text.strip().split("\n")
+        items = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if "," in line:
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                items.extend(parts)
+            elif " " in line and not re.match(r'^\d+\.?\d*$', line):
+                parts = [p.strip() for p in line.split() if p.strip()]
+                items.extend(parts)
+            else:
+                items.append(line)
+        if not items:
+            return "No valid items found in batch."
+
+        stored = []
+        batch_nodes = []
+        previous_value = None
+
+        for i, item in enumerate(items):
+            text = clean_text(item)
+            if not text:
+                continue
+            new_price, _ = extract_price(text)
+            new_zone = get_price_zone(new_price) if new_price else "Z?"
+
+            if self.last_zone is None:
+                self.current_step_counter = 1
+                self.last_zone = new_zone
+            else:
+                if new_zone == self.last_zone:
+                    self.current_step_counter += 1
+                else:
+                    if self._last_step_price is not None:
+                        self.cluster_trans.record_transition(
+                            self.last_zone, new_zone,
+                            self._last_step_price, new_price,
+                            steps=self.current_step_counter
+                        )
+                    self.current_step_counter = 1
+                    self.last_zone = new_zone
+
+            if previous_value and previous_value in self.nodes:
+                prev_node = self.nodes[previous_value]
+                if prev_node.price is not None and new_price is not None:
+                    trans = get_transition(prev_node.price, new_price)
+                    if trans:
+                        sig = trans["signature"]
+                        self._recent_transitions.append(sig)
+                        if len(self._recent_transitions) > 30:
+                            self._recent_transitions = self._recent_transitions[-30:]
+                        self._pattern_buffer.append(sig)
+                        if len(self._pattern_buffer) >= self.config.PATTERN_MIN_LENGTH:
+                            self._flush_pattern_buffer()
+                        dir_str = trans["direction"]
+                        self._dir_pattern_buffer.append(dir_str)
+                        if len(self._dir_pattern_buffer) >= self.config.PATTERN_MIN_LENGTH:
+                            self._flush_dir_pattern_buffer()
+
+            strand = i % 2
+            new_node = self._add_single_node(text, strand)
+            if new_node is None:
+                stored.append(f"{text} (reinforced)")
+                previous_value = text
+                self._last_step_price = new_price if new_price is not None else self._last_step_price
+                continue
+
+            if previous_value and previous_value in self.nodes:
+                prev_node = self.nodes[previous_value]
+                if prev_node.price is not None and new_node.price is not None:
+                    edge_sim = edge_price_similarity(new_node.price, prev_node.price, new_node.volatility)
+                    zone_mult = get_zone_multiplier(new_node.price, prev_node.price)
+                    scaled_strength = self.config.BATCH_LINK_STRENGTH * edge_sim * zone_mult
+                    transition = get_transition(prev_node.price, new_node.price)
+                else:
+                    scaled_strength = self.config.BATCH_LINK_STRENGTH
+                    transition = None
+
+                final_strength = max(scaled_strength, self.config.MIN_EDGE_STRENGTH)
+                cross_zone = not same_price_zone(new_node.price, prev_node.price)
+                if previous_value not in new_node.links:
+                    new_node.links[previous_value] = Edge(final_strength, cross_zone=cross_zone, transition=transition)
+                if text not in prev_node.links:
+                    rev_transition = get_transition(new_node.price, prev_node.price) if transition else None
+                    prev_node.links[text] = Edge(final_strength, cross_zone=cross_zone, transition=rev_transition)
+
+            batch_nodes.append(new_node)
+            stored.append(f"{text}(T{strand})[{new_node.price_zone}]")
+            previous_value = text
+            self._last_step_price = new_price if new_price is not None else self._last_step_price
+
+        if batch_nodes:
+            last_node = batch_nodes[-1]
+            if last_node.price is not None:
+                self._last_step_price = last_node.price
+
+        for node in self.nodes.values():
+            node.update_dna(self.nodes)
+
+        self._finalize_batch_patterns(batch_nodes)
+
+        pattern_count = len(self.patterns)
+        return f"Batch stored: {', '.join(stored)} ({len(stored)} contacts) [{pattern_count} patterns]"
+
+    def decay_cycle(self):
+        for node in self.nodes.values():
+            for edge in node.links.values():
+                edge.decay()
+        dead_patterns = []
+        for sig, pattern in self.patterns.items():
+            pattern.decay()
+            if not pattern.is_alive():
+                dead_patterns.append(sig)
+        for sig in dead_patterns:
+            del self.patterns[sig]
+        self.cluster_trans.decay()
+        self.update_cycles += 1
+        return f"Decay cycle {self.update_cycles} complete. ({len(self.patterns)} patterns remain)"
+
+    def search(self, query: str):
+        if not self.nodes:
+            return []
+        cleaned_query = clean_text(query)
+        query_compact = cleaned_query.replace(" ", "").replace(".", "")
+        query_len = len(query_compact)
+        query_price, query_vol = extract_price(query)
+        query_dna = express_dna(query, {}, self.nodes, price=query_price)
+        total_nodes = len(self.nodes)
+
+        encapsulated = [node_val for node_val in self.nodes.keys()
+                        if query_len >= self.config.MIN_SINGULARITY_LEN and query_compact in node_val.replace(" ", "").replace(".", "")]
+
+        raw = {}
+        for node in self.nodes.values():
+            total, n, p, v = hybrid_score(
+                query, node.value,
+                query_dna, node.dna,
+                query_price, node.price,
+                node.volatility
+            )
+            base_score = total
+
+            hub_pen = node.hub_penalty(total_nodes)
+            base_score -= hub_pen
+
+            singularity_bonus = 0.0
+            if len(encapsulated) == 1 and node.value == encapsulated[0]:
+                coverage = query_len / max(len(node.value.replace(" ", "").replace(".", "")), 1)
+                singularity_bonus = (self.config.BASE_SINGULARITY_WT + coverage * 0.25) * base_score
+
+            position_bonus = 0.0
+            if query_len >= self.config.MIN_SINGULARITY_LEN and query_compact in node.value.replace(" ", "").replace(".", ""):
+                cleaned_node = node.value.replace(" ", "").replace(".", "")
+                if cleaned_node.startswith(query_compact):
+                    position_bonus += self.config.POSITION_PREFIX_WT * base_score
+                if cleaned_node.endswith(query_compact):
+                    position_bonus += self.config.POSITION_SUFFIX_WT * base_score
+
+            freq_bonus = node.frequency_bonus(query_price)
+
+            raw[node.value] = {
+                "value":       node.value,
+                "base":        round(base_score, 4),
+                "ngram":       round(n, 4),
+                "phonetic":    round(p, 4),
+                "vector":      round(v, 4),
+                "boost":       0.0,
+                "singularity": round(singularity_bonus, 4),
+                "position":    round(position_bonus, 4),
+                "freq":        freq_bonus,
+                "hub_penalty": round(hub_pen, 4),
+                "dna":         node.dna,
+                "price":       node.price,
+                "zone":        node.price_zone,
+                "age":         node.age_seconds(),
+                "strand":      node.strand_type,
+                "node":        node,
+            }
+
+        edges_contributed = {}
+        for node in self.nodes.values():
+            node_score = raw[node.value]["base"]
+            if node_score <= 0:
+                continue
+            for linked_value, edge in node.links.items():
+                if linked_value not in raw:
+                    continue
+                raw_boost = node_score * edge.strength * self.config.GRAPH_BOOST
+                receiver_base = raw[linked_value]["base"]
+                if receiver_base < self.config.BOOST_GATE_THRESHOLD:
+                    raw_boost *= (receiver_base / self.config.BOOST_GATE_THRESHOLD)
+                raw[linked_value]["boost"] += round(raw_boost, 4)
+                edges_contributed.setdefault(linked_value, []).append(edge)
+
+                linked_node = self.nodes.get(linked_value)
+                if not linked_node:
+                    continue
+                for hop2_value, hop2_edge in linked_node.links.items():
+                    if hop2_value not in raw or hop2_value == node.value:
+                        continue
+                    raw_boost_2 = raw_boost * hop2_edge.strength * self.config.HOP2_DAMPEN
+                    if linked_node.dna and self.nodes[hop2_value].dna:
+                        dna_sim = dna_similarity(linked_node.dna, self.nodes[hop2_value].dna)
+                        if dna_sim > 0.5:
+                            raw_boost_2 *= 1.25
+                    recv2_base = raw[hop2_value]["base"]
+                    if recv2_base < self.config.BOOST_GATE_THRESHOLD:
+                        raw_boost_2 *= (recv2_base / self.config.BOOST_GATE_THRESHOLD)
+                    raw[hop2_value]["boost"] += round(raw_boost_2, 4)
+                    edges_contributed.setdefault(hop2_value, []).append(hop2_edge)
+
+        results = []
+        for r in raw.values():
+            max_boost = r["base"] * 0.5
+            if r["boost"] > max_boost:
+                r["boost"] = round(max_boost, 4)
+            uncapped = r["base"] + r["boost"] + r["singularity"] + r["position"] + r["freq"]
+            r["raw_score"] = round(uncapped, 4)
+            r["total"] = round(min(uncapped, 1.0), 4)
+            results.append(r)
+
+        results.sort(key=lambda x: x["raw_score"], reverse=True)
+
+        if results:
+            top_match = results[0]
+            top_node = top_match["node"]
+            price_closeness = 1.0
+            if query_price is not None and top_node.price is not None:
+                price_closeness = price_similarity(query_price, top_node.price, top_node.volatility)
+            top_node.hits += 1
+            for edge in edges_contributed.get(top_match["value"], []):
+                edge.reinforce(price_closeness)
+            top_node.mark_dna_dirty()
+            top_node.update_dna(self.nodes)
+
+        for r in results:
+            if "node" in r:
+                del r["node"]
+        return results
+
+    def get_cluster_analysis(self, zone):
+        return self.cluster_trans.get_cluster_analysis(zone, self.nodes)
+
+    def predict_next_zone(self, current_zone: str):
+        probs = self.cluster_trans.get_probabilities(current_zone)
+        if not probs:
+            return None, 0.0
+        first_zone = next(iter(probs))
+        return first_zone, probs[first_zone]
+
+    def predict_next_zone_enhanced(self, current_zone: str):
+        probs = self.cluster_trans.get_probabilities(current_zone)
+        if not probs:
+            return {
+                "predicted_zone": None,
+                "probability": 0.0,
+                "confidence": "UNCERTAIN",
+                "node_count": 0,
+                "alternatives": [],
+                "reliability_score": 0.0,
+                "direction": "SIDEWAYS",
+                "target_median_price": None,
+                "transition_examples": [],
+                "average_steps": None,
+                "adjusted_probability": None,
+                "multipliers": None
+            }
+        sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+        predicted_zone, prob = sorted_probs[0]
+        key = f"{current_zone}→{predicted_zone}"
+        node_count = self.cluster_trans.counts.get(key, 0)
+        reliability_score = round(prob * math.log(node_count + 1), 4)
+        if node_count >= 5 and prob >= 0.6:
+            confidence = "HIGH"
+        elif node_count >= 2 and prob >= 0.4:
+            confidence = "MEDIUM"
+        elif node_count >= 1 and prob >= 0.2:
+            confidence = "LOW"
+        else:
+            confidence = "UNCERTAIN"
+        alternatives = [{"zone": zone, "probability": p} for zone, p in sorted_probs[1:3]]
+        try:
+            curr_val = _zone_to_float(current_zone)
+            pred_val = _zone_to_float(predicted_zone)
+            direction = "UP" if pred_val > curr_val else "DOWN" if pred_val < curr_val else "SIDEWAYS"
+        except (ValueError, TypeError):
+            direction = "SIDEWAYS"
+        target_median = self.median_price_of_zone(predicted_zone, direction)
+        examples = self.cluster_trans.get_examples(current_zone, predicted_zone)
+        example_list = [(float(f), float(t)) for (f,t) in examples] if examples else []
+        avg_steps = self.cluster_trans.get_average_steps(current_zone, predicted_zone)
+
+        multipliers = self._compute_modulation_multipliers(current_zone, predicted_zone, direction)
+        if multipliers.get("active", False):
+            adjusted_prob = round(prob * multipliers["adjusted_factor"], 4)
+            adjusted_prob = max(0.0, min(1.0, adjusted_prob))
+        else:
+            adjusted_prob = None
+            multipliers = None
+
+        return {
+            "predicted_zone": predicted_zone,
+            "probability": prob,
+            "adjusted_probability": adjusted_prob,
+            "multipliers": multipliers,
+            "confidence": confidence,
+            "node_count": node_count,
+            "alternatives": alternatives,
+            "reliability_score": reliability_score,
+            "direction": direction,
+            "target_median_price": target_median,
+            "transition_examples": example_list,
+            "average_steps": avg_steps
+        }
+
+    def _compute_modulation_multipliers(self, from_zone, to_zone, direction):
+        if not self.use_modulation or self.lambda_factor <= 0.0:
+            return {"active": False}
+        analysis = self.cluster_trans.get_cluster_analysis(from_zone, self.nodes)
+        regime = analysis["regime"]
+        C_regime = 1.10 if regime == direction else 1.00 if regime == "SIDEWAYS" else 0.90
+        C_regime = max(0.85, min(1.15, C_regime))
+
+        C_pattern = 1.0
+        if self._recent_transitions:
+            recent = self._recent_transitions[-3:]
+            for pat_sig, pat_node in self.patterns.items():
+                if pat_node.start_zone == "DIR?":
+                    continue
+                pat_trans = pat_node.transitions
+                if len(pat_trans) >= 2 and pat_trans[-2:] == recent[-2:]:
+                    boost = 1.0 + (min(pat_node.hits, 20) / 100.0)
+                    C_pattern = max(C_pattern, boost)
+        C_pattern = max(0.85, min(1.15, C_pattern))
+
+        if self.merge_regime_pattern:
+            C_pressure = (C_regime + C_pattern) / 2.0
+            C_pressure = max(0.85, min(1.15, C_pressure))
+            C_regime_used = 1.0
+            C_pattern_used = 1.0
+            pressure_used = C_pressure
+        else:
+            C_regime_used = C_regime
+            C_pattern_used = C_pattern
+            pressure_used = 1.0
+
+        avg_steps = self.cluster_trans.get_average_steps(from_zone, to_zone)
+        if avg_steps is None:
+            C_stability = 1.0
+        else:
+            if avg_steps <= 1.5:
+                C_stability = 1.05
+            elif avg_steps >= 3.0:
+                C_stability = 0.95
+            else:
+                C_stability = 1.00
+        C_stability = max(0.85, min(1.15, C_stability))
+
+        nodes_in_to_zone = [n for n in self.nodes.values() if n.price_zone == to_zone]
+        if nodes_in_to_zone:
+            avg_hits = sum(n.hits for n in nodes_in_to_zone) / len(nodes_in_to_zone)
+            if avg_hits > 10:
+                C_freq = 1.05
+            elif avg_hits < 2:
+                C_freq = 0.95
+            else:
+                C_freq = 1.00
+        else:
+            C_freq = 1.00
+        C_freq = max(0.85, min(1.15, C_freq))
+
+        from_nodes = [n for n in self.nodes.values() if n.price_zone == from_zone]
+        to_nodes = [n for n in self.nodes.values() if n.price_zone == to_zone]
+        C_comp = 1.0
+        if from_nodes and to_nodes:
+            any_diff = any(fn.strand_type != tn.strand_type for fn in from_nodes[:1] for tn in to_nodes[:1])
+            if any_diff:
+                C_comp = self.config.COMPLEMENTARY_BOOST
+        C_comp = max(0.85, min(1.15, C_comp))
+
+        if self.use_log_space:
+            log_sum = 0.0
+            for c in [C_regime_used, C_pattern_used, C_stability, C_freq, C_comp, pressure_used]:
+                if c > 0:
+                    log_sum += math.log(c)
+            combined = math.exp(log_sum)
+        else:
+            combined = C_regime_used * C_pattern_used * C_stability * C_freq * C_comp * pressure_used
+        combined = max(0.5, min(1.5, combined))
+        adjusted_factor = 1.0 + self.lambda_factor * (combined - 1.0)
+        adjusted_factor = max(0.85, min(1.15, adjusted_factor))
+
+        return {
+            "active": True,
+            "regime": round(C_regime, 4) if not self.merge_regime_pattern else None,
+            "pattern": round(C_pattern, 4) if not self.merge_regime_pattern else None,
+            "pressure": round(pressure_used, 4) if self.merge_regime_pattern else None,
+            "stability": round(C_stability, 4),
+            "frequency": round(C_freq, 4),
+            "complementarity": round(C_comp, 4),
+            "combined_raw": round(combined, 4),
+            "lambda": self.lambda_factor,
+            "adjusted_factor": round(adjusted_factor, 4),
+            "log_space": self.use_log_space,
+            "merged_rp": self.merge_regime_pattern
+        }
+
+    # ========== v2.1E: Arrival Depth (Echo Measurement) ==========
+    def get_arrival_depth(self, zone: str) -> int:
+        """
+        Median number of steps historically required to enter this zone from anywhere.
+        Returns integer, or 0 if no data.
+        """
+        all_steps = []
+        for key, steps_list in self.cluster_trans.step_counts.items():
+            if key.endswith(f"→{zone}") and steps_list:
+                all_steps.extend(steps_list)
+        if not all_steps:
+            return 0
+        sorted_steps = sorted(all_steps)
+        n = len(sorted_steps)
+        if n % 2 == 1:
+            med = sorted_steps[n//2]
+        else:
+            med = (sorted_steps[n//2 - 1] + sorted_steps[n//2]) / 2.0
+        return int(round(med))
+
+    # ========== v2.1E: Depth‑Aware Forward Trace ==========
+    def trace_forward_path_with_depth(self, start_zone: str, steps: int = 5):
+        arrival_depth = self.get_arrival_depth(start_zone)
+        reliable_horizon = max(1, arrival_depth // 2) if arrival_depth > 0 else 1
+
+        structured = []
+        current = start_zone
+        previous_zone = None
+        depth = 0
+
+        for _ in range(steps):
+            probs = self.cluster_trans.get_probabilities(current)
+            if not probs:
+                break
+
+            # Apply momentum penalty
+            adjusted = {}
+            for target, prob in probs.items():
+                if previous_zone is not None and target == previous_zone:
+                    adjusted[target] = prob * (1.0 - self.config.FORWARD_MOMENTUM_PENALTY)
+                else:
+                    adjusted[target] = prob
+            total = sum(adjusted.values())
+            if total == 0:
+                break
+
+            next_zone = max(adjusted, key=adjusted.get)
+            if next_zone == current:
+                break
+
+            depth += 1
+            base_confidence = probs.get(next_zone, 0.0)
+
+            if depth <= reliable_horizon:
+                status = "RECONSTRUCTION"
+                confidence = base_confidence
+            else:
+                status = "SPECULATIVE"
+                speculative_depth = depth - reliable_horizon
+                confidence = base_confidence * (0.6 ** speculative_depth)
+
+            structured.append({
+                "zone": next_zone,
+                "confidence": round(confidence, 4),
+                "status": status,
+                "depth": depth
+            })
+
+            previous_zone = current
+            current = next_zone
+
+        # Old flat path for backward compatibility
+        flat_path = [start_zone] + [hop["zone"] for hop in structured]
+
+        return {
+            "flat": flat_path,
+            "structured": structured,
+            "arrival_depth": arrival_depth,
+            "reliable_horizon": reliable_horizon
+        }
+
+    # ========== v1.5.6E: Vector Field & Forward Phase (kept for reference) ==========
+    def compute_vector_field(self):
+        all_zones = sorted(set(n.price_zone for n in self.nodes.values() if n.price_zone != "Z?"), key=_zone_to_float)
+        field = {}
+        for zone in all_zones:
+            analysis = self.get_cluster_analysis(zone)
+            probs = analysis["transitions"]
+            net_dir = 0.0
+            total_prob = 0.0
+            for target, prob in probs.items():
+                target_val = _zone_to_float(target)
+                zone_val = _zone_to_float(zone)
+                if target_val > zone_val:
+                    net_dir += prob
+                elif target_val < zone_val:
+                    net_dir -= prob
+                total_prob += prob
+            if total_prob > 0:
+                net_dir /= total_prob
+            else:
+                net_dir = 0.0
+
+            total_weight = 0.0
+            weighted_speed = 0.0
+            for target in probs:
+                avg_steps = self.cluster_trans.get_average_steps(zone, target)
+                if avg_steps and avg_steps > 0:
+                    speed = 1.0 / avg_steps
+                else:
+                    speed = 1.0
+                prob = probs[target]
+                weighted_speed += speed * prob
+                total_weight += prob
+            magnitude = weighted_speed / total_weight if total_weight > 0 else 0.0
+
+            out_total = sum(probs.values())
+            in_total = 0
+            for other_zone in all_zones:
+                if other_zone != zone:
+                    other_probs = self.cluster_trans.get_probabilities(other_zone)
+                    in_total += other_probs.get(zone, 0)
+            attractor_score = in_total - out_total
+
+            if attractor_score > 0.1:
+                classification = "attractor"
+            elif attractor_score < -0.1:
+                classification = "repeller"
+            elif abs(net_dir) > 0.3:
+                classification = "transit"
+            else:
+                classification = "neutral"
+
+            field[zone] = {
+                "net_direction": round(net_dir, 4),
+                "magnitude": round(magnitude, 4),
+                "regime": analysis["regime"],
+                "node_count": analysis["node_count"],
+                "attractor_score": round(attractor_score, 2),
+                "classification": classification
+            }
+        return field
+
+    # Legacy wrapper for backward compatibility
+    def trace_forward_path(self, start_zone: str, steps: int = 5):
+        result = self.trace_forward_path_with_depth(start_zone, steps)
+        return result["flat"]
+
+    # ========== v1.5.7E: Mirror Symmetry Sensor ==========
+    def mirror_symmetry_analysis(self, window: int = None):
+        if window is None:
+            window = self.config.MIRROR_WINDOW
+
+        recent_dirs = []
+        for sig in self._recent_transitions[-window:]:
+            if "_" in sig:
+                direction = sig.split("_")[0]
+                recent_dirs.append(direction)
+
+        mirror_dirs = []
+        for d in reversed(recent_dirs):
+            if d == "UP":
+                mirror_dirs.append("DOWN")
+            elif d == "DOWN":
+                mirror_dirs.append("UP")
+            else:
+                mirror_dirs.append("FLAT")
+
+        best_similarity = 0.0
+        best_pattern = None
+        for pat_sig, pat_node in self.patterns.items():
+            if pat_node.start_zone != "DIR?":
+                continue
+            pat_trans = pat_node.transitions
+            min_len = min(len(mirror_dirs), len(pat_trans))
+            if min_len == 0:
+                continue
+            matches = sum(1 for i in range(min_len) if mirror_dirs[i] == pat_trans[i])
+            similarity = matches / max(len(mirror_dirs), len(pat_trans), 1)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_pattern = pat_node
+
+        if best_similarity >= self.config.MIRROR_SIMILARITY_THRESHOLD and best_pattern is not None:
+            interpretation = (
+                f"Strong mirror symmetry detected (similarity {best_similarity:.2f}). "
+                f"The current directional pattern, when mirrored, closely matches a stored "
+                f"pattern seen {best_pattern.hits} times before."
+            )
+        elif best_similarity >= 0.30:
+            interpretation = (
+                f"Moderate mirror symmetry (similarity {best_similarity:.2f}). "
+                "Some structural reflection is present, but not strongly confirmed."
+            )
+        else:
+            interpretation = "No significant mirror symmetry detected. Market structure is asymmetric."
+
+        return {
+            "recent_sequence": recent_dirs,
+            "mirror_sequence": mirror_dirs,
+            "best_match": best_pattern.display if best_pattern else None,
+            "similarity": round(best_similarity, 4),
+            "matched_pattern_hits": best_pattern.hits if best_pattern else 0,
+            "interpretation": interpretation
+        }
+
+    # ========== v1.7E: DNA Generator Layer with Dynamics ==========
+    def _average_volatility(self):
+        prices = [n.price for n in self.nodes.values() if n.price is not None and n.volatility > 0]
+        if not prices:
+            return 0.01
+        avg_vol = sum(n.volatility for n in self.nodes.values() if n.price is not None and n.volatility > 0) / len(prices)
+        return max(avg_vol, 1e-6)
+
+    def compute_dna_distribution(self, signature_window: int = None, vector_field: dict = None):
+        if signature_window is None:
+            signature_window = self.config.DNA_WINDOW
+
+        if vector_field is None:
+            vector_field = self.compute_vector_field()
+
+        all_zones = list(vector_field.keys())
+        if not all_zones:
+            return {"error": "No zones available for DNA inference."}
+
+        total_nodes = sum(v["node_count"] for v in vector_field.values())
+        avg_net_dir = (
+            sum(v["net_direction"] * v["node_count"] for v in vector_field.values()) / total_nodes
+            if total_nodes > 0 else 0.0
+        )
+
+        avg_magnitude = (
+            sum(v["magnitude"] * v["node_count"] for v in vector_field.values()) / total_nodes
+            if total_nodes > 0 else 0.0
+        )
+
+        attractor_zones = sum(1 for v in vector_field.values() if v["classification"] == "attractor")
+        congestion_index = attractor_zones / max(len(all_zones), 1)
+
+        mirror = self.mirror_symmetry_analysis()
+
+        recent_zone_set = set()
+        for key in list(self.cluster_trans.counts.keys())[-signature_window:]:
+            parts = key.split("→")
+            if len(parts) == 2:
+                recent_zone_set.add(parts[0])
+                recent_zone_set.add(parts[1])
+        recent_zone_count = len(recent_zone_set)
+        zone_spread = recent_zone_count / max(len(all_zones), 1)
+
+        dir_patterns = [p for p in self.patterns.values() if p.start_zone == "DIR?"]
+        if dir_patterns:
+            total_hits = sum(p.hits for p in dir_patterns)
+            pattern_probs = [p.hits / max(total_hits, 1) for p in dir_patterns]
+            pattern_entropy = -sum(p * math.log(max(p, 1e-12)) for p in pattern_probs)
+        else:
+            pattern_entropy = 0.0
+
+        mags = []
+        for sig in self._recent_transitions[-signature_window:]:
+            if "_" in sig:
+                try:
+                    mags.append(float(sig.split("_")[1]))
+                except (ValueError, IndexError):
+                    pass
+        if mags:
+            mag_mean = sum(mags) / len(mags)
+            mag_variance = sum((m - mag_mean)**2 for m in mags) / len(mags)
+            mag_std = math.sqrt(mag_variance)
+        else:
+            mag_std = 0.0
+
+        avg_vol = self._average_volatility()
+        mag_norm = max(avg_vol * 5.0, 0.001)
+
+        scores = {archetype: 0.0 for archetype in self.config.DNA_ARCHETYPES}
+
+        scores["TrendingUp"] += max(0, avg_net_dir) * 0.6
+        scores["TrendingUp"] += (1.0 - congestion_index) * 0.2
+        scores["TrendingUp"] += min(mag_std / mag_norm, 1.0) * 0.2
+
+        scores["TrendingDown"] += max(0, -avg_net_dir) * 0.6
+        scores["TrendingDown"] += (1.0 - congestion_index) * 0.2
+        scores["TrendingDown"] += min(mag_std / mag_norm, 1.0) * 0.2
+
+        scores["Ranging"] += (1.0 - abs(avg_net_dir)) * 0.3
+        scores["Ranging"] += congestion_index * 0.3
+        scores["Ranging"] += mirror["similarity"] * 0.2
+        scores["Ranging"] += (1.0 - min(mag_std / (mag_norm * 0.5), 1.0)) * 0.2
+
+        scores["Breakout"] += min(mag_std / (mag_norm * 0.5), 1.0) * 0.5
+        scores["Breakout"] += (1.0 - congestion_index) * 0.3
+        scores["Breakout"] += min(zone_spread * 5.0, 1.0) * 0.2
+
+        scores["Reversing"] += mirror["similarity"] * 0.5
+        scores["Reversing"] += (1.0 - abs(avg_net_dir)) * 0.25
+        entropy_cap = math.log(self.config.PATTERN_MAX_STORED)
+        if entropy_cap > 0:
+            scores["Reversing"] += (1.0 - min(pattern_entropy / entropy_cap, 1.0)) * 0.25
+
+        scores["LowVol"] += (1.0 - min(avg_magnitude * 2.0, 1.0)) * 0.4
+        scores["LowVol"] += (1.0 - min(mag_std / (mag_norm * 0.3), 1.0)) * 0.3
+        if entropy_cap > 0:
+            scores["LowVol"] += min(pattern_entropy / entropy_cap, 1.0) * 0.3
+
+        total_score = sum(scores.values())
+        if total_score > 0:
+            distribution = {k: round(v / total_score, 4) for k, v in scores.items()}
+        else:
+            distribution = {k: 1.0 / len(scores) for k in scores}
+
+        dominant_state = max(distribution, key=distribution.get)
+        confidence = distribution[dominant_state]
+
+        entropy = -sum(
+            p * math.log(max(p, 1e-12)) for p in distribution.values()
+        )
+
+        if self._dna_stability_valid and self._last_dna_distribution is not None:
+            diff = sum(
+                abs(distribution.get(k, 0) - self._last_dna_distribution.get(k, 0))
+                for k in set(distribution) | set(self._last_dna_distribution)
+            ) / 2.0
+            stability = round(1.0 - diff, 4)
+        else:
+            stability = None
+
+        if self._dna_stability_valid and self._last_dna_distribution is not None:
+            prev_dominant = max(self._last_dna_distribution, key=self._last_dna_distribution.get)
+            if prev_dominant == dominant_state:
+                self._dna_age += 1
+            else:
+                self._dna_age = 1
+        else:
+            self._dna_age = 1
+
+        velocity = None
+        if self._dna_stability_valid and self._last_dna_distribution is not None:
+            velocity = {}
+            for arch in self.config.DNA_ARCHETYPES:
+                prev_val = self._last_dna_distribution.get(arch, 0.0)
+                curr_val = distribution.get(arch, 0.0)
+                velocity[arch] = round(curr_val - prev_val, 4)
+        self._dna_velocity = velocity
+
+        sorted_probs = sorted(distribution.values(), reverse=True)
+        if len(sorted_probs) >= 2:
+            pressure = round(1.0 - (sorted_probs[0] - sorted_probs[1]), 4)
+        else:
+            pressure = 1.0
+
+        node_count = len(self.nodes)
+        epistemic_uncertainty = 1.0 - min(node_count / 100.0, 1.0)
+
+        self._dna_history.append(distribution.copy())
+        if len(self._dna_history) > DNA_HISTORY_MAX:
+            self._dna_history.pop(0)
+
+        if self._dna_history:
+            alpha = 0.6
+            ma = distribution.copy()
+            for hist in reversed(self._dna_history[:-1]):
+                for k in ma:
+                    ma[k] = alpha * ma[k] + (1 - alpha) * hist.get(k, 0.0)
+            total_ma = sum(ma.values())
+            if total_ma > 0:
+                moving_average = {k: round(v / total_ma, 4) for k, v in ma.items()}
+            else:
+                moving_average = {k: 1.0 / len(ma) for k in ma}
+        else:
+            moving_average = distribution.copy()
+
+        if len(self._dna_history) >= 2:
+            prev_dom = max(self._dna_history[-2], key=self._dna_history[-2].get)
+            if prev_dom == dominant_state:
+                self._dna_persistence += 1
+            else:
+                self._dna_persistence = 1
+        else:
+            self._dna_persistence = 1
+
+        self._last_dna_distribution = distribution.copy()
+        self._dna_stability_valid = True
+
+        interpretations = {
+            "TrendingUp": "The market displays strong upward directional bias with low congestion.",
+            "TrendingDown": "The market displays strong downward directional bias with low congestion.",
+            "Ranging": "The market is congested, with balanced directionality and frequent mirror symmetry.",
+            "Breakout": "The market shows sudden magnitude expansion, crossing multiple zones rapidly.",
+            "Reversing": "The market exhibits high mirror symmetry, suggesting structural reversal patterns.",
+            "LowVol": "The market is in a low‑volatility state with narrow zone range and muted transitions."
+        }
+
+        return {
+            "distribution": distribution,
+            "dominant_state": dominant_state,
+            "confidence": round(confidence, 4),
+            "entropy": round(entropy, 4),
+            "stability": stability,
+            "pressure": pressure,
+            "age": self._dna_age,
+            "velocity": velocity,
+            "epistemic_uncertainty": round(epistemic_uncertainty, 4),
+            "interpretation": interpretations.get(dominant_state, ""),
+            "persistence": self._dna_persistence,
+            "moving_average": moving_average,
+            "history_count": len(self._dna_history)
+        }
+
+    # ========== v2.3E: Sensor Agreement Notes with Supportive Alignments ==========
+    def _sensor_agreement_notes(self, ssv: dict) -> list:
+        notes = []
+        regime = ssv.get("internal_regime", "SIDEWAYS")
+        net_dir = ssv.get("net_flow_direction", 0.0)
+
+        # Contradictions
+        if regime == "UP" and net_dir < -0.15:
+            notes.append("[Contradiction] Zone regime is UP but net vector field direction is downward. Mixed structural signals.")
+        elif regime == "DOWN" and net_dir > 0.15:
+            notes.append("[Contradiction] Zone regime is DOWN but net vector field direction is upward. Mixed structural signals.")
+        if regime == "SIDEWAYS" and abs(net_dir) > 0.5:
+            direction_word = "upward" if net_dir > 0 else "downward"
+            notes.append(f"[Mixed] Zone regime is SIDEWAYS but the broader flow field shows strong {direction_word} bias.")
+
+        # Supportive alignments
+        ema = ssv.get("ema_sensor", {})
+        if ema.get("available"):
+            ema_class = ema.get("classification")
+            rev_prob = ema.get("reversion_probability", 0.0)
+            if ema_class == "extended_below" and regime == "UP" and rev_prob > 0.5:
+                notes.append("[Alignment] Extended below EMA with strong reversion probability and UP regime. Structure suggests a mean-reversion opportunity upward.")
+            if ema_class == "extended_above" and regime == "DOWN" and rev_prob > 0.5:
+                notes.append("[Alignment] Extended above EMA with strong reversion probability and DOWN regime. Structure suggests a mean-reversion opportunity downward.")
+            if ema_class in ("near_mean", "compressed") and regime == "SIDEWAYS":
+                notes.append("[Alignment] Price near EMA with sideways internal regime. Consistent ranging structure.")
+
+        conv = ssv.get("convergence_sensor", {})
+        if conv.get("classification") == "HIGH_CONVICTION":
+            notes.append("[Alignment] Multiple independent sensors strongly agree on structural direction.")
+        elif conv.get("classification") == "CONTRADICTORY":
+            notes.append("[Warning] Independent sensors disagree. Structure may be in transition.")
+
+        return notes
+
+    def _contradiction_strength_and_hint(self, regime, net_dir, classification, mirror_sim, convergence_anomaly=None):
+        strength = 0.0
+        hint = None
+        if regime == "UP" and net_dir < -0.1:
+            strength += 0.4 + min(abs(net_dir), 0.5)
+            hint = "UP regime contradicts downward flow. Could indicate local resistance or pending reversal."
+        elif regime == "DOWN" and net_dir > 0.1:
+            strength += 0.4 + min(net_dir, 0.5)
+            hint = "DOWN regime contradicts upward flow. Could indicate local support or a bull trap."
+        elif regime == "SIDEWAYS" and abs(net_dir) > 0.3:
+            strength += 0.2 + min(abs(net_dir), 0.5) * 0.5
+            hint = "SIDEWAYS regime but flow is biased – may be a transition zone."
+        if classification == "attractor" and net_dir < -0.2:
+            strength += 0.2
+            if hint is None:
+                hint = "Attractor zone but flow is outward – may be losing its gravity."
+        elif classification == "repeller" and net_dir > 0.2:
+            strength += 0.2
+            if hint is None:
+                hint = "Repeller zone but flow is inward – may be gaining strength."
+        if mirror_sim > 0.5 and regime != "SIDEWAYS":
+            strength += 0.1
+            if hint is None:
+                hint = "High mirror symmetry suggests a potential reversal or ranging phase, despite directional regime."
+
+        if convergence_anomaly is not None and convergence_anomaly > 1.5:
+            boost = min(convergence_anomaly, 3.0) / 3.0 * 0.2
+            strength += boost
+            if hint:
+                hint += f" Convergence sensors also show discord (anomaly {convergence_anomaly:.2f})."
+            else:
+                hint = f"Convergence sensors indicate significant disagreement (anomaly {convergence_anomaly:.2f})."
+
+        strength = min(strength, 1.0)
+        return round(strength, 2), hint
+
+    def _compute_combined_confidence(self, match_conf, node_count, entropy, epistemic_uncertainty, dna_stability=None, dna_persistence=0):
+        conf_map = {"HIGH": 0.9, "RESOLVED_MATCH": 0.85, "MEDIUM": 0.6, "LOW": 0.35, "AMBIGUOUS": 0.2, "NO_MATCH": 0.1, "INVALID": 0.0}
+        match_score = conf_map.get(match_conf, 0.3)
+        density_factor = min(node_count / 20, 1.0)
+        if entropy > 0:
+            entropy_factor = max(0.0, 1.0 - entropy / 2.5)
+        else:
+            entropy_factor = 0.5
+        epistemic_factor = 1.0 - epistemic_uncertainty
+
+        if dna_stability is not None:
+            stability_clipped = max(0.0, min(1.0, dna_stability))
+            persistence_norm = min(dna_persistence / 5.0, 1.0)
+            regime_stability_factor = 0.5 + 0.5 * stability_clipped * persistence_norm
+        else:
+            regime_stability_factor = 0.5
+
+        overall = (match_score + density_factor + entropy_factor + epistemic_factor + regime_stability_factor) / 5.0
+        overall = max(0.0, min(1.0, overall))
+        return {
+            "overall": round(overall, 4),
+            "match_confidence": round(match_score, 4),
+            "density_factor": round(density_factor, 4),
+            "entropy_factor": round(entropy_factor, 4),
+            "epistemic_factor": round(epistemic_factor, 4),
+            "regime_stability_factor": round(regime_stability_factor, 4)
+        }
+
+    def _zone_detailed_metrics(self, zone):
+        median = self.median_price_of_zone(zone)
+        probs = self.cluster_trans.get_probabilities(zone)
+        avg_steps_total = None
+        if probs:
+            steps_list = []
+            for target in probs:
+                avg = self.cluster_trans.get_average_steps(zone, target)
+                if avg is not None:
+                    steps_list.append(avg)
+            if steps_list:
+                avg_steps_total = round(sum(steps_list) / len(steps_list), 2)
+        latest = 0
+        zone_nodes = [n for n in self.nodes.values() if n.price_zone == zone]
+        if zone_nodes:
+            latest = max(n.created_at for n in zone_nodes)
+        if latest > 0:
+            most_recent = round(time.time() - latest, 0)
+        else:
+            most_recent = None
+        return {
+            "median_price": median,
+            "avg_step_to_exit": avg_steps_total,
+            "most_recent_activity_seconds_ago": most_recent
+        }
+
+    # ========== v2.2E: EMA Deviation Sensor with Band Statistics ==========
+    def compute_ema_deviation_sensor(self, query_price: float):
+        if not self.price_history or len(self.price_history) < EMA_PERIOD:
+            return {
+                "available": False,
+                "message": f"Need at least {EMA_PERIOD} historical prices (have {len(self.price_history)})."
+            }
+
+        prices = [p for p, _ in self.price_history]
+        if not prices:
+            return {"available": False, "message": "No historical prices."}
+
+        alpha = 2.0 / (EMA_PERIOD + 1)
+        ema = prices[0]
+        for p in prices[1:]:
+            ema = p * alpha + ema * (1 - alpha)
+
+        current_ema = ema
+        current_deviation = query_price - current_ema if query_price is not None else None
+
+        if query_price is None:
+            return {"available": False, "message": "Query price is None."}
+
+        deviations = []
+        ema_value = prices[0]
+        for p in prices:
+            ema_value = p * alpha + ema_value * (1 - alpha)
+            deviations.append(p - ema_value)
+
+        if not deviations:
+            return {"available": False, "message": "Insufficient data for deviation."}
+
+        max_positive = max(d for d in deviations if d > 0) if any(d > 0 for d in deviations) else 0.0
+        max_negative = min(d for d in deviations if d < 0) if any(d < 0 for d in deviations) else 0.0
+        max_abs = max(abs(d) for d in deviations)
+
+        abs_devs = [abs(d) for d in deviations]
+        abs_devs.sort()
+        current_abs = abs(current_deviation)
+        rank = 0
+        for d in abs_devs:
+            if d < current_abs:
+                rank += 1
+            else:
+                break
+        percentile = rank / len(abs_devs) if abs_devs else 0.0
+
+        if percentile > 0.8:
+            reversion_prob = 0.6 + 0.4 * (percentile - 0.8) / 0.2
+            reversion_prob = min(reversion_prob, 1.0)
+        elif percentile > 0.6:
+            reversion_prob = 0.3 + 0.3 * (percentile - 0.6) / 0.2
+        elif percentile > 0.4:
+            reversion_prob = 0.1 + 0.2 * (percentile - 0.4) / 0.2
+        else:
+            reversion_prob = 0.0 + 0.1 * percentile / 0.4
+        reversion_prob = round(max(0.0, min(1.0, reversion_prob)), 3)
+
+        if current_deviation > 0:
+            if current_abs / max(max_abs, 1e-9) > 0.8:
+                classification = "extended_above"
+            elif current_abs / max(max_abs, 1e-9) > 0.5:
+                classification = "above_mean"
+            else:
+                classification = "near_mean"
+        else:
+            if current_abs / max(max_abs, 1e-9) > 0.8:
+                classification = "extended_below"
+            elif current_abs / max(max_abs, 1e-9) > 0.5:
+                classification = "below_mean"
+            else:
+                classification = "near_mean"
+
+        avg_vol = self._average_volatility()
+        if current_abs < avg_vol * 0.5:
+            classification = "compressed"
+
+        # ---- v2.2E: Band statistics ----
+        near_threshold = self.config.EMA_BAND_NEAR_MAX * max_abs
+        extended_threshold = self.config.EMA_BAND_EXTENDED * max_abs
+
+        def band(abs_dev):
+            if abs_dev <= near_threshold:
+                return "near"
+            elif abs_dev <= extended_threshold:
+                return "moderate"
+            else:
+                return "extended"
+
+        def band_order(b):
+            return {"near": 0, "moderate": 1, "extended": 2}[b]
+
+        episodes = {"near": {"total": 0, "reversion": 0, "continuation": 0, "steps_rev": [], "steps_cont": []},
+                    "moderate": {"total": 0, "reversion": 0, "continuation": 0, "steps_rev": [], "steps_cont": []},
+                    "extended": {"total": 0, "reversion": 0, "continuation": 0, "steps_rev": [], "steps_cont": []}}
+
+        prev_band = None
+        episode_start = None
+        current_episode_band = None
+
+        for i, dev in enumerate(deviations):
+            abs_dev = abs(dev)
+            current_band = band(abs_dev)
+            if current_band != prev_band:
+                if current_episode_band is not None and episode_start is not None:
+                    length = i - episode_start
+                    if prev_band is not None:
+                        if band_order(current_band) < band_order(prev_band):
+                            episodes[prev_band]["reversion"] += 1
+                            episodes[prev_band]["steps_rev"].append(length)
+                        else:
+                            episodes[prev_band]["continuation"] += 1
+                            episodes[prev_band]["steps_cont"].append(length)
+                episode_start = i
+                current_episode_band = current_band
+                episodes[current_band]["total"] += 1
+            prev_band = current_band
+
+        band_summary = {}
+        for band_name in ["near", "moderate", "extended"]:
+            data = episodes[band_name]
+            total = data["total"]
+            if total == 0:
+                band_summary[band_name] = {
+                    "threshold_abs": round(near_threshold if band_name == "near" else extended_threshold if band_name == "extended" else 0, 6),
+                    "episodes": 0,
+                    "reversion_prob": None,
+                    "continuation_prob": None,
+                    "avg_steps_rev": None,
+                    "avg_steps_cont": None
+                }
+            else:
+                rev = data["reversion"]
+                cont = data["continuation"]
+                total_exits = rev + cont
+                rev_prob = rev / total_exits if total_exits > 0 else None
+                cont_prob = cont / total_exits if total_exits > 0 else None
+                avg_rev_steps = sum(data["steps_rev"]) / len(data["steps_rev"]) if data["steps_rev"] else None
+                avg_cont_steps = sum(data["steps_cont"]) / len(data["steps_cont"]) if data["steps_cont"] else None
+                band_summary[band_name] = {
+                    "threshold_abs": round(near_threshold if band_name == "near" else extended_threshold if band_name == "extended" else 0, 6),
+                    "episodes": total,
+                    "reversion_prob": round(rev_prob, 4) if rev_prob is not None else None,
+                    "continuation_prob": round(cont_prob, 4) if cont_prob is not None else None,
+                    "avg_steps_rev": round(avg_rev_steps, 2) if avg_rev_steps is not None else None,
+                    "avg_steps_cont": round(avg_cont_steps, 2) if avg_cont_steps is not None else None
+                }
+
+        return {
+            "available": True,
+            "ema_value": round(current_ema, 4),
+            "current_deviation": round(current_deviation, 4),
+            "current_abs_deviation": round(current_abs, 4),
+            "max_positive_deviation": round(max_positive, 4),
+            "max_negative_deviation": round(max_negative, 4),
+            "max_abs_deviation": round(max_abs, 4),
+            "deviation_percentile": round(percentile, 4),
+            "reversion_probability": reversion_prob,
+            "classification": classification,
+            "data_points": len(prices),
+            "ema_period": EMA_PERIOD,
+            "bands": band_summary
+        }
+
+    # ========== v1.8E: Structural Completion Hypothesis ==========
+    def _compute_completion_hypothesis(self, ssv: dict, results: list, query: str) -> dict:
+        match_conf = ssv.get("match_confidence", "LOW")
+        conf_map = {"HIGH": 1.0, "RESOLVED_MATCH": 0.9, "MEDIUM": 0.7, "LOW": 0.4, "AMBIGUOUS": 0.3, "NO_MATCH": 0.1, "INVALID": 0.0}
+        match_score = conf_map.get(match_conf, 0.4)
+
+        density = ssv.get("local_density", 1)
+        density_norm = min(density / 10, 1.0)
+
+        direct_regime = 1.0 if density >= 4 else 0.5
+
+        direct_components = [match_score, density_norm, direct_regime]
+        direct_evidence_weight = round(sum(direct_components) / len(direct_components), 4)
+
+        vf_zone = ssv.get("zone_classification", "neutral")
+        vf_score = 1.0 if vf_zone in ("attractor", "repeller") else 0.5
+
+        transition_prob = ssv.get("exit_probability", 0.0)
+        trans_score = transition_prob
+
+        mirror_sim = ssv.get("mirror_similarity", 0.0)
+        mirror_score = mirror_sim
+
+        dna_conf = ssv.get("dna_profile", {}).get("confidence", 0.0)
+        dna_score = dna_conf
+
+        graph_components = [vf_score, trans_score, mirror_score, dna_score]
+        graph_completion_weight = round(sum(graph_components) / len(graph_components), 4)
+
+        w_direct = COMPLETION_WEIGHT_DIRECT
+        w_graph = COMPLETION_WEIGHT_GRAPH
+        completion_strength = round(w_direct * direct_evidence_weight + w_graph * graph_completion_weight, 4)
+
+        cont_strength = ssv.get("contradiction_strength", 0.0)
+        completion_strength = round(completion_strength * (1.0 - 0.2 * cont_strength), 4)
+        completion_strength = max(0.0, min(1.0, completion_strength))
+
+        inferences = []
+        if vf_score > 0.6:
+            inferences.append(f"Zone classification '{vf_zone}' inferred from attractor_score")
+        if trans_score > 0.3:
+            inferences.append(f"Dominant exit {ssv.get('dominant_exit')} inferred from {int(transition_prob*100)}% transition probability")
+        if mirror_score > 0.3:
+            inferences.append(f"Mirror symmetry (similarity {mirror_sim:.2f}) suggests structural reflection")
+        if dna_score > 0.3:
+            inferences.append(f"DNA regime '{ssv.get('dna_profile', {}).get('dominant_state')}' inferred from ensemble of sensors")
+        if ssv.get("forward_trace_structured"):
+            structured = ssv["forward_trace_structured"]
+            if structured:
+                rec = [h for h in structured if h["status"] == "RECONSTRUCTION"]
+                spec = [h for h in structured if h["status"] == "SPECULATIVE"]
+                if rec:
+                    inferences.append(f"Forward trace reconstruction: {' → '.join(h['zone'] for h in rec)}")
+                if spec:
+                    inferences.append(f"Forward trace speculative extension: {' → '.join(h['zone'] for h in spec)}")
+
+        return {
+            "direct_evidence_weight": direct_evidence_weight,
+            "graph_completion_weight": graph_completion_weight,
+            "completion_strength": completion_strength,
+            "completion_risk": round(1.0 - completion_strength, 4),
+            "direct_observations": [
+                f"Match confidence: {match_conf} (score {match_score:.2f})",
+                f"Zone density: {density} nodes (normalised {density_norm:.2f})",
+                f"Internal regime: {ssv.get('internal_regime', 'SIDEWAYS')} (direct inference from node split)"
+            ],
+            "graph_inferences": inferences[:5]
+        }
+
+    # ========== v2.3E: Convergence Sensor with Source Diversity Penalty ==========
+    def compute_convergence_sensor(self, ssv: dict) -> dict:
+        """
+        Quantifies agreement between independent sensors using confidence‑weighted
+        pairwise agreement and Z‑score anomaly detection.
+        EMA direction uses expected mean‑reversion; forward trace uses only RECONSTRUCTION hops.
+        Applies a source‑diversity penalty when sensor independence is low.
+        """
+        sensors = []
+
+        # Internal regime
+        regime = ssv.get("internal_regime")
+        if regime in ("UP", "DOWN"):
+            density = ssv.get("local_density", 0)
+            regime_conf = min(0.5 + 0.05 * density, 0.95) if density > 0 else 0.5
+            sensors.append({
+                "name": "regime",
+                "direction": 1 if regime == "UP" else -1,
+                "confidence": regime_conf
+            })
+
+        # Vector field
+        net_dir = ssv.get("net_flow_direction", 0.0)
+        if abs(net_dir) > 0.1:
+            sensors.append({
+                "name": "vector_field",
+                "direction": 1 if net_dir > 0 else -1,
+                "confidence": min(abs(net_dir), 1.0)
+            })
+
+        # EMA deviation – expected reversion direction
+        ema = ssv.get("ema_sensor", {})
+        if ema.get("available"):
+            ema_class = ema.get("classification")
+            reversion_prob = ema.get("reversion_probability", 0.5)
+            if ema_class in ("extended_above", "extended_below"):
+                if reversion_prob > 0.5:
+                    direction = -1 if "above" in ema_class else 1
+                    sensors.append({
+                        "name": "ema",
+                        "direction": direction,
+                        "confidence": reversion_prob
+                    })
+
+        # Forward trace – only RECONSTRUCTION hop
+        fwd_structured = ssv.get("forward_trace_structured", [])
+        recon_hops = [h for h in fwd_structured if h["status"] == "RECONSTRUCTION"]
+        if recon_hops:
+            first_hop = recon_hops[0]
+            from_zone = ssv["observed_zone"]
+            to_zone = first_hop["zone"]
+            try:
+                fv = _zone_to_float(from_zone)
+                tv = _zone_to_float(to_zone)
+                if tv > fv:
+                    fwd_dir = 1
+                elif tv < fv:
+                    fwd_dir = -1
+                else:
+                    fwd_dir = 0
+                if fwd_dir != 0:
+                    sensors.append({
+                        "name": "forward_trace",
+                        "direction": fwd_dir,
+                        "confidence": first_hop["confidence"]
+                    })
+            except:
+                pass
+
+        if len(sensors) < 2:
+            return {"available": False, "message": f"Insufficient sensors ({len(sensors)} found, need ≥2)."}
+
+        # Confidence‑weighted pairwise agreement
+        directions = [s["direction"] for s in sensors]
+        total_sensors = len(sensors)
+        total_weighted_agree = 0.0
+        total_pair_weight = 0.0
+        for i in range(total_sensors):
+            for j in range(i+1, total_sensors):
+                w = min(sensors[i]["confidence"], sensors[j]["confidence"])
+                total_pair_weight += w
+                if directions[i] == directions[j]:
+                    total_weighted_agree += w
+        weighted_pairwise_agreement = total_weighted_agree / total_pair_weight if total_pair_weight > 0 else 0.0
+
+        total_weight = sum(s["confidence"] for s in sensors)
+        weighted_avg = sum(s["direction"] * s["confidence"] for s in sensors) / total_weight if total_weight > 0 else 0.0
+        convergence_strength = abs(weighted_avg)
+
+        # Independence score
+        audit = self.audit_multiplier_independence()
+        max_corr = audit.get("multiplier_correlation", {}).get("max_absolute_correlation", 0.5)
+        independence_score = 1.0 - min(max_corr, 1.0)
+
+        # Source diversity penalty
+        if independence_score < 0.5:
+            effective_strength = convergence_strength * (independence_score * 2.0)
+        else:
+            effective_strength = convergence_strength
+
+        # Z‑score anomaly
+        self._agreement_history.append(weighted_pairwise_agreement)
+        if len(self._agreement_history) > self.config.CONVERGENCE_HISTORY_SIZE:
+            self._agreement_history = self._agreement_history[-self.config.CONVERGENCE_HISTORY_SIZE:]
+        history_len = len(self._agreement_history)
+        if history_len >= 5:
+            mean = sum(self._agreement_history) / history_len
+            variance = sum((x - mean)**2 for x in self._agreement_history) / history_len
+            std = math.sqrt(variance) if variance > 0 else 1e-9
+            anomaly_z = (weighted_pairwise_agreement - mean) / std
+        else:
+            anomaly_z = 0.0
+        baseline_agreement = sum(self._agreement_history) / history_len if history_len > 0 else 0.0
+        anomaly_ratio = weighted_pairwise_agreement / baseline_agreement if baseline_agreement > 0 else 1.0
+
+        # Classification using effective_strength
+        if history_len >= 5 and abs(anomaly_z) > 0.1:
+            if anomaly_z > 2.0:
+                classification = "HIGH_CONVICTION"
+            elif anomaly_z > 1.5 or (effective_strength > 0.7 and anomaly_z > 1.0):
+                classification = "MODERATE_CONVICTION"
+            elif anomaly_z < -1.5:
+                classification = "CONTRADICTORY"
+            elif anomaly_z < -1.0 or effective_strength < 0.3:
+                classification = "LOW_CONVICTION"
+            else:
+                classification = "LOW_CONVICTION"
+        else:
+            if effective_strength > 0.8 and weighted_pairwise_agreement > 0.7:
+                classification = "HIGH_CONVICTION"
+            elif effective_strength > 0.6 or weighted_pairwise_agreement > 0.5:
+                classification = "MODERATE_CONVICTION"
+            elif weighted_pairwise_agreement < 0.3:
+                classification = "CONTRADICTORY"
+            else:
+                classification = "LOW_CONVICTION"
+
+        interpretations = {
+            "HIGH_CONVICTION": "Multiple independent sensors converge beyond baseline expectation. Structural agreement is anomalous and meaningful.",
+            "MODERATE_CONVICTION": "Moderate convergence detected. Agreement is present but within expected range.",
+            "LOW_CONVICTION": "Weak convergence. Sensors are broadly ambiguous or unclear.",
+            "CONTRADICTORY": "Independent sensors are in disagreement. Structure is ambiguous or transitioning."
+        }
+
+        return {
+            "available": True,
+            "sensors_agreeing": len([d for d in directions if d == directions[0]]),
+            "sensors_total": total_sensors,
+            "pairwise_agreement": round(weighted_pairwise_agreement, 4),
+            "convergence_strength": round(convergence_strength, 4),
+            "effective_strength": round(effective_strength, 4),
+            "independence_score": round(independence_score, 4),
+            "baseline_agreement": round(baseline_agreement, 4),
+            "anomaly_score": round(anomaly_ratio, 4),
+            "anomaly_z": round(anomaly_z, 4),
+            "direction": "UP" if weighted_avg > 0.2 else "DOWN" if weighted_avg < -0.2 else "SIDEWAYS",
+            "classification": classification,
+            "interpretation": interpretations.get(classification, ""),
+            "sensor_details": [{"name": s["name"], "direction": "UP" if s["direction"] > 0 else "DOWN", "confidence": round(s["confidence"], 4)} for s in sensors]
+        }
+
+    # ========== v2.3E: Latent State Reconstruction with Regime Shift Alert ==========
+    def _build_ssv(self, results, query, vector_field: dict = None):
+        if not results:
+            return {"error": "No matches found."}
+
+        status, _ = classify(results, self)
+
+        top = results[0]
+        zone = top.get("zone", "Z?")
+        analysis = self.get_cluster_analysis(zone)
+        if vector_field is None:
+            vector_field = self.compute_vector_field()
+        vf_zone = vector_field.get(zone, {})
+        mirror = self.mirror_symmetry_analysis()
+        forward = self.trace_forward_path_with_depth(zone, steps=5)
+
+        dir_patterns = sorted(
+            [p for p in self.patterns.values() if p.start_zone == "DIR?"],
+            key=lambda x: x.hits, reverse=True
+        )
+        dominant_pattern = dir_patterns[0].display if dir_patterns else "none"
+        pattern_freq = dir_patterns[0].hits if dir_patterns else 0
+
+        nc = analysis["node_count"]
+        if nc >= 10:
+            reconf = "HIGH"
+        elif nc >= 4:
+            reconf = "MEDIUM"
+        else:
+            reconf = "LOW"
+        data_warning = f"{zone} has {nc} node{'s' if nc != 1 else ''}. "
+        if nc < 4:
+            data_warning += "Structural inference is provisional."
+        else:
+            data_warning += ""
+
+        dom_zone = analysis.get("dominant")
+        dom_prob = analysis.get("dominant_prob", 0)
+        if dom_zone:
+            dom_dir = "UP" if _zone_to_float(dom_zone) > _zone_to_float(zone) else "DOWN" if _zone_to_float(dom_zone) < _zone_to_float(zone) else "FLAT"
+            avg_steps = self.cluster_trans.get_average_steps(zone, dom_zone)
+        else:
+            dom_dir = "none"
+            avg_steps = None
+
+        dna_profile = self.compute_dna_distribution(vector_field=vector_field)
+
+        regime = analysis["regime"]
+        net_dir = vf_zone.get("net_direction", 0.0)
+        classification = vf_zone.get("classification", "unknown")
+        mirror_sim = mirror["similarity"]
+
+        query_price = top.get("price")
+        ema_sensor = self.compute_ema_deviation_sensor(query_price) if query_price is not None else {"available": False}
+
+        # Convergence sensor
+        ssv_partial = {
+            "internal_regime": regime,
+            "net_flow_direction": net_dir,
+            "local_density": nc,
+            "ema_sensor": ema_sensor,
+            "forward_trace_structured": forward["structured"],
+            "observed_zone": zone,
+            "exit_probability": dom_prob,
+        }
+        convergence_sensor = self.compute_convergence_sensor(ssv_partial)
+
+        cont_strength, cont_hint = self._contradiction_strength_and_hint(
+            regime, net_dir, classification, mirror_sim,
+            convergence_anomaly=convergence_sensor.get("anomaly_z")
+        )
+
+        combined_conf = self._compute_combined_confidence(
+            status, nc, dna_profile.get("entropy", 0.5), dna_profile.get("epistemic_uncertainty", 0.5),
+            dna_stability=dna_profile.get("stability"),
+            dna_persistence=dna_profile.get("persistence", 0)
+        )
+
+        zone_metrics = self._zone_detailed_metrics(zone)
+
+        # Regime shift alert
+        regime_shift_alert = {"active": False, "message": ""}
+        persistence = dna_profile.get("persistence", 0)
+        pressure = dna_profile.get("pressure", 1.0)
+        stability = dna_profile.get("stability")
+        if persistence == 1 and pressure > self.config.REGIME_SHIFT_PRESSURE_MIN:
+            if stability is not None and stability < 0.5:
+                regime_shift_alert["active"] = True
+                regime_shift_alert["message"] = (
+                    f"DNA regime just shifted to {dna_profile['dominant_state']} "
+                    f"(persistence={persistence}, pressure={pressure:.2f}, stability={stability:.2f}). "
+                    "Market generator may be transitioning."
+                )
+            elif stability is None:
+                regime_shift_alert["active"] = True
+                regime_shift_alert["message"] = (
+                    f"DNA regime just classified as {dna_profile['dominant_state']} for the first time. "
+                    "No stability history yet; treat as potential shift."
+                )
+
+        ssv = {
+            "observed_zone": zone,
+            "observed_price": query_price,
+            "matched_node": top["value"],
+            "match_confidence": status,
+            "local_density": nc,
+            "internal_regime": regime,
+            "dominant_exit": dom_zone,
+            "exit_probability": dom_prob,
+            "exit_direction": dom_dir,
+            "average_exit_time": avg_steps,
+            "zone_classification": classification,
+            "net_flow_direction": net_dir,
+            "flow_magnitude": vf_zone.get("magnitude", 0.0),
+            "mirror_similarity": mirror_sim,
+            "mirror_interpretation": mirror["interpretation"].split(".")[0] if mirror["interpretation"] else "",
+            "dominant_pattern": dominant_pattern,
+            "pattern_frequency": pattern_freq,
+            "reconstruction_confidence": reconf,
+            "data_quality_warning": data_warning,
+            "forward_trace": forward["flat"],
+            "forward_trace_structured": forward["structured"],
+            "arrival_depth": forward["arrival_depth"],
+            "reliable_horizon": forward["reliable_horizon"],
+            "dna_profile": dna_profile,
+            "sensor_agreement_notes": self._sensor_agreement_notes({
+                "internal_regime": regime,
+                "net_flow_direction": net_dir,
+                "ema_sensor": ema_sensor,
+                "convergence_sensor": convergence_sensor
+            }),
+            "contradiction_strength": cont_strength,
+            "reconciliation_hint": cont_hint,
+            "combined_confidence": combined_conf,
+            "zone_detailed_metrics": zone_metrics,
+            "ema_sensor": ema_sensor,
+            "convergence_sensor": convergence_sensor,
+            "regime_shift_alert": regime_shift_alert,
+        }
+
+        ssv["completion_hypothesis"] = self._compute_completion_hypothesis(ssv, results, query)
+        return ssv
+
+    def reconstruct_latent_state(self, query: str):
+        results = self.search(query)
+        return self._build_ssv(results, query)
+
+    def state_completion_narrative(self, query: str) -> str:
+        ssv = self.reconstruct_latent_state(query)
+        return self._narrative_from_ssv(ssv)
+
+    def _narrative_from_ssv(self, ssv: dict) -> str:
+        if "error" in ssv:
+            return ssv["error"]
+
+        zone = ssv["observed_zone"]
+        price = ssv["observed_price"]
+        regime = ssv["internal_regime"]
+        density = ssv["local_density"]
+        classification = ssv["zone_classification"]
+        mirror_sim = ssv["mirror_similarity"]
+        mirror_interp = ssv["mirror_interpretation"]
+        dom_exit = ssv["dominant_exit"]
+        dom_prob = ssv["exit_probability"]
+        dom_dir = ssv["exit_direction"]
+        avg_steps = ssv["average_exit_time"]
+        pattern = ssv["dominant_pattern"]
+        pat_freq = ssv["pattern_frequency"]
+        warning = ssv["data_quality_warning"]
+        trace_flat = " → ".join(ssv["forward_trace"])
+        trace_structured = ssv.get("forward_trace_structured", [])
+        arrival_depth = ssv.get("arrival_depth", 0)
+        horizon = ssv.get("reliable_horizon", 0)
+        conf = ssv["reconstruction_confidence"]
+        dna = ssv.get("dna_profile", {})
+        cont_strength = ssv.get("contradiction_strength", 0.0)
+        cont_hint = ssv.get("reconciliation_hint")
+        combined_conf = ssv.get("combined_confidence", {})
+        zone_metrics = ssv.get("zone_detailed_metrics", {})
+        median_price = zone_metrics.get("median_price")
+        avg_step_exit = zone_metrics.get("avg_step_to_exit")
+        recent_activity = zone_metrics.get("most_recent_activity_seconds_ago")
+        comp_hyp = ssv.get("completion_hypothesis", {})
+        ema = ssv.get("ema_sensor", {})
+        conv = ssv.get("convergence_sensor", {})
+        shift_alert = ssv.get("regime_shift_alert", {})
+
+        narrative = (
+            f"Price {price} sits in zone {zone}, a {classification} zone "
+            f"with {density} historical observation{'s' if density != 1 else ''}. "
+        )
+        if median_price is not None:
+            narrative += f"The median price in this zone is approximately {median_price:.2f}. "
+        if recent_activity is not None:
+            narrative += f"Most recent activity was {format_age(recent_activity)} ago. "
+
+        if regime != "SIDEWAYS":
+            narrative += f"The internal regime is {regime} — price within this zone tends to lean "
+            narrative += "higher. " if regime == "UP" else "lower. "
+        else:
+            narrative += "The internal regime is SIDEWAYS — no clear directional bias inside the zone. "
+
+        if dom_exit:
+            narrative += (
+                f"Historically, {int(dom_prob*100)}% of exits went {dom_dir} to {dom_exit}"
+            )
+            if avg_steps:
+                narrative += f", typically within {avg_steps} step{'s' if avg_steps != 1 else ''}"
+            if avg_step_exit is not None and avg_step_exit != avg_steps:
+                narrative += f" (average across all exits: {avg_step_exit} steps)"
+            narrative += ". "
+        else:
+            narrative += "No exit transitions recorded. "
+
+        narrative += f"The broader flow field suggests the path: {trace_flat}. "
+        if arrival_depth > 0:
+            narrative += f"Arrival echo depth is {arrival_depth} steps; reliable reconstruction horizon set to {horizon} hops. "
+        narrative += f"The dominant directional rhythm is {pattern} (seen {pat_freq} times). "
+
+        if mirror_sim >= 0.6:
+            narrative += f"Mirror symmetry is strong ({mirror_sim:.2f}) — {mirror_interp}. "
+        elif mirror_sim >= 0.3:
+            narrative += f"Mirror symmetry is moderate ({mirror_sim:.2f}). "
+        else:
+            narrative += "No significant mirror symmetry is present. "
+
+        if ema.get("available", False):
+            narrative += (
+                f"EMA ({ema['ema_period']}‑period) is at {ema['ema_value']:.4f}, "
+                f"current deviation is {ema['current_deviation']:+.4f} ({ema['classification']}). "
+                f"Deviation percentile: {ema['deviation_percentile']:.2f}, "
+                f"reversion probability: {ema['reversion_probability']:.2f}. "
+            )
+        else:
+            narrative += f"EMA sensor: {ema.get('message', 'not available')}. "
+
+        if conv.get("available", False):
+            narrative += (
+                f"Convergence sensor: {conv['classification']} (strength {conv.get('effective_strength', conv.get('convergence_strength')):.2f}, "
+                f"anomaly Z {conv['anomaly_z']:.2f}, agreement {conv['pairwise_agreement']:.2f}). {conv['interpretation']} "
+            )
+
+        if dna and "dominant_state" in dna:
+            stab_str = f"{dna['stability']:.2f}" if dna['stability'] is not None else "N/A"
+            persistence = dna.get('persistence', 'N/A')
+            ma = dna.get('moving_average', {})
+            ma_dom = max(ma, key=ma.get) if ma else None
+            narrative += (
+                f"Market DNA classification: {dna['dominant_state']} "
+                f"(confidence {dna['confidence']:.2f}, entropy {dna['entropy']:.2f}, "
+                f"stability {stab_str}, pressure {dna.get('pressure', 'N/A')}, age {dna.get('age', 'N/A')}, "
+                f"persistence {persistence}). "
+            )
+            if ma_dom:
+                narrative += f"Smooth moving average suggests {ma_dom} as the underlying regime. "
+            narrative += f"{dna.get('interpretation', '')} "
+
+        if shift_alert.get("active"):
+            narrative += f"*** REGIME SHIFT ALERT: {shift_alert['message']} *** "
+
+        if cont_strength > 0.3:
+            narrative += f"Sensor contradiction detected (strength {cont_strength:.2f}). "
+            if cont_hint:
+                narrative += f"{cont_hint} "
+        else:
+            narrative += "Sensor readings are broadly consistent. "
+
+        if combined_conf.get("regime_stability_factor", 0.5) < 0.6:
+            narrative += "DNA regime stability is low, dampening overall confidence. "
+
+        comp_strength = comp_hyp.get("completion_strength", 0.0)
+        comp_risk = comp_hyp.get("completion_risk", 0.0)
+        narrative += f"Structural completion strength: {comp_strength:.2f} (completion risk: {comp_risk:.2f}). "
+        if comp_strength > 0.7:
+            narrative += "The latent state is strongly confirmed by both direct evidence and graph inference. "
+        elif comp_strength < 0.3:
+            narrative += "The latent state is weakly supported – treat as provisional. "
+
+        overall_conf = combined_conf.get('overall', 0.0)
+        narrative += f"Overall structural confidence is {overall_conf:.2f} (based on match, density, entropy, epistemic, and regime stability factors). "
+
+        narrative += f"Reconstruction confidence is {conf}. "
+        if warning:
+            narrative += warning
+
+        return narrative
+
+    def state_distance_map(self, query: str):
+        results = self.search(query)
+        if not results:
+            return {"error": "No matches found."}
+        top = results[0]
+        zone = top.get("zone", "Z?")
+        return self._distance_map_from_zone(zone)
+
+    def _distance_map_from_zone(self, zone: str):
+        all_zones = sorted(set(n.price_zone for n in self.nodes.values() if n.price_zone != "Z?"), key=_zone_to_float)
+        if not all_zones:
+            return {"error": "No zones available."}
+        if zone not in all_zones:
+            return {"error": f"Zone {zone} not found in zone list."}
+
+        vector_field = self.compute_vector_field()
+        attractors = [z for z in all_zones if vector_field.get(z, {}).get("classification") == "attractor"]
+        repellers  = [z for z in all_zones if vector_field.get(z, {}).get("classification") == "repeller"]
+        boundaries = []
+        for z in all_zones:
+            za = self.get_cluster_analysis(z)
+            if za["transitions"]:
+                has_up = any(_zone_to_float(t) > _zone_to_float(z) for t in za["transitions"])
+                has_down = any(_zone_to_float(t) < _zone_to_float(z) for t in za["transitions"])
+                if not has_up or not has_down:
+                    boundaries.append(z)
+        densest_zone = max(all_zones, key=lambda z: self.get_cluster_analysis(z)["node_count"])
+
+        def zone_distance(z1, z2):
+            try:
+                i1 = all_zones.index(z1)
+                i2 = all_zones.index(z2)
+                return abs(i2 - i1)
+            except ValueError:
+                return None
+
+        nearest_attractor = min(attractors, key=lambda z: zone_distance(zone, z), default=None)
+        nearest_repeller  = min(repellers, key=lambda z: zone_distance(zone, z), default=None)
+        nearest_boundary  = min(boundaries, key=lambda z: zone_distance(zone, z), default=None)
+
+        path_to_eq = []
+        cur = zone
+        visited = set()
+        for _ in range(10):
+            if cur in visited:
+                break
+            visited.add(cur)
+            path_to_eq.append(cur)
+            if vector_field.get(cur, {}).get("classification") == "attractor":
+                break
+            probs = self.cluster_trans.get_probabilities(cur)
+            if not probs:
+                break
+            nxt = max(probs, key=probs.get)
+            if nxt == cur:
+                break
+            cur = nxt
+
+        return {
+            "current_zone": zone,
+            "nearest_attractor": nearest_attractor,
+            "distance_to_attractor": zone_distance(zone, nearest_attractor) if nearest_attractor else None,
+            "nearest_repeller": nearest_repeller,
+            "distance_to_repeller": zone_distance(zone, nearest_repeller) if nearest_repeller else None,
+            "nearest_boundary": nearest_boundary,
+            "distance_to_boundary": zone_distance(zone, nearest_boundary) if nearest_boundary else None,
+            "densest_zone": densest_zone,
+            "distance_to_densest": zone_distance(zone, densest_zone) if densest_zone else None,
+            "path_to_equilibrium": path_to_eq,
+            "equilibrium_steps": len(path_to_eq) - 1 if len(path_to_eq) > 1 else 0
+        }
+
+    # ========== v1.8E: Dual‑Carrier JSON Output with Schema ==========
+    def structural_report_json(self, query: str) -> dict:
+        if not self.nodes:
+            return {"error": "No data loaded."}
+
+        results = self.search(query)
+        if not results:
+            return {"error": "No matches found."}
+
+        cached_vf = self.compute_vector_field()
+        ssv = self._build_ssv(results, query, vector_field=cached_vf)
+        top_zone = ssv["observed_zone"]
+        dmap = self._distance_map_from_zone(top_zone)
+
+        top_results = []
+        for r in results[:5]:
+            entry = {
+                "value": r["value"],
+                "total": r["total"],
+                "base": r["base"],
+                "boost": r["boost"],
+                "singularity": r.get("singularity", 0),
+                "position": r.get("position", 0),
+                "freq": r.get("freq", 0),
+                "hub_penalty": r.get("hub_penalty", 0),
+                "price": r.get("price"),
+                "zone": r.get("zone"),
+                "age": r.get("age"),
+                "strand": r.get("strand"),
+                "ngram": r.get("ngram", 0),
+                "phonetic": r.get("phonetic", 0),
+                "vector": r.get("vector", 0),
+                "dna_display": r["dna"].get("display") if isinstance(r.get("dna"), dict) else None
+            }
+            top_results.append(entry)
+
+        all_zones = sorted(set(n.price_zone for n in self.nodes.values() if n.price_zone != "Z?"), key=_zone_to_float)
+        zone_metrics_all = {}
+        for z in all_zones:
+            zone_metrics_all[z] = self._zone_detailed_metrics(z)
+
+        report_json = {
+            "schema": SCHEMA_DEFINITION,
+            "nlpgm_version": VERSION,
+            "query": query,
+            "match_status": ssv["match_confidence"],
+            "top_matches": top_results,
+            "latent_state": ssv,
+            "market_structure": {
+                "transitions_from": self.get_cluster_analysis(top_zone)["transitions"],
+                "vector_field": {z: {
+                    "net_direction": v["net_direction"],
+                    "magnitude": v["magnitude"],
+                    "classification": v["classification"],
+                    "attractor_score": v["attractor_score"]
+                } for z, v in cached_vf.items()},
+                "forward_trace": ssv["forward_trace"],
+                "forward_trace_structured": ssv["forward_trace_structured"],
+                "arrival_depth": ssv.get("arrival_depth", 0),
+                "reliable_horizon": ssv.get("reliable_horizon", 0),
+                "mirror_symmetry": self.mirror_symmetry_analysis(),
+                "distance_map": dmap,
+                "sensor_agreement_notes": ssv.get("sensor_agreement_notes", []),
+                "zone_detailed_metrics": zone_metrics_all
+            },
+            "market_dna": ssv["dna_profile"],
+            "active_edges": self._active_edges_list()
+        }
+        return report_json
+
+    def _active_edges_list(self):
+        edges = []
+        for node in self.nodes.values():
+            for linked_val, edge in node.links.items():
+                if edge.hits > 0 and edge.cross_zone:
+                    edges.append({
+                        "from": node.value,
+                        "to": linked_val,
+                        "strength": edge.strength,
+                        "hits": edge.hits
+                    })
+        edges.sort(key=lambda x: x["hits"], reverse=True)
+        return edges[:5]
+
+    # ========== Structural Report (text) with new sections ==========
+    def structural_report(self, query: str) -> str:
+        if not self.nodes:
+            return "No data loaded."
+
+        results = self.search(query)
+        if not results:
+            return "No matches found."
+
+        cached_vf = self.compute_vector_field()
+        ssv = self._build_ssv(results, query, vector_field=cached_vf)
+        narrative = self._narrative_from_ssv(ssv)
+
+        top_zone = ssv["observed_zone"]
+        dmap = self._distance_map_from_zone(top_zone)
+
+        lines = []
+        lines.append("")
+        lines.append("═" * 55)
+        lines.append(f" NLPGM v{VERSION}  —  STRUCTURAL REPORT + DNA DYNAMICS")
+        lines.append("═" * 55)
+        lines.append(f" Query:  {query}")
+        lines.append("")
+
+        # Match details
+        status = ssv["match_confidence"]
+        signal = CONFIDENCE_DISPLAY.get(status, status)
+        lines.append(f" MATCH DETAILS: {signal}  ({len(results)} total matches)  [Statistical]")
+        lines.append("")
+        for i, r in enumerate(results[:5], 1):
+            parts = [f"total={r['total']}", f"base={r['base']}"]
+            if r["boost"] > 0: parts.append(f"+graph={round(r['boost'],4)}")
+            if r.get("singularity", 0) > 0: parts.append(f"+sing={r['singularity']}")
+            if r.get("position", 0) > 0: parts.append(f"+pos={r['position']}")
+            if r["freq"] > 0: parts.append(f"+freq={r['freq']}")
+            if r.get("hub_penalty", 0) > 0: parts.append(f"-hub={r['hub_penalty']}")
+            if r.get("price") is not None:
+                parts.append(f"px={r['price']:.4f}")
+            if r.get("zone"):
+                parts.append(f"[{r['zone']}]")
+            if r.get("age", 0) > 0:
+                parts.append(f"age={format_age(r['age'])}")
+            if r.get("strand") is not None:
+                parts.append(f"T{r['strand']}")
+            lines.append(f" {i}. {r['value']}")
+            lines.append(f"    {' '.join(parts)}")
+            if r['ngram'] > 0 or r['phonetic'] > 0 or r['vector'] > 0:
+                lines.append(f"    n={r['ngram']}  p={r['phonetic']}  v={r['vector']}  [Structural]")
+            if r.get("dna") and isinstance(r["dna"], dict):
+                lines.append(f"    DNA: {r['dna'].get('display', 'none')}  [Structural]")
+            lines.append("")
+        lines.append("")
+
+        # Regime shift alert
+        shift_alert = ssv.get("regime_shift_alert", {})
+        if shift_alert.get("active"):
+            lines.append(f" ⚠ REGIME SHIFT ALERT: {shift_alert['message']}")
+            lines.append("")
+
+        # Latent State Reconstruction Narrative
+        lines.append(" LATENT STATE RECONSTRUCTION  [Heuristic]")
+        lines.append(f"   {narrative}")
+        lines.append("")
+
+        # Sensor agreement notes
+        notes = ssv.get("sensor_agreement_notes", [])
+        cont_strength = ssv.get("contradiction_strength", 0.0)
+        cont_hint = ssv.get("reconciliation_hint")
+        if notes:
+            lines.append(" SENSOR AGREEMENT")
+            for note in notes:
+                lines.append(f"   {note}")
+            lines.append("")
+        if cont_strength > 0.3 and cont_hint:
+            lines.append(" CONTRADICTION")
+            lines.append(f"   Strength: {cont_strength:.2f}")
+            lines.append(f"   Hint: {cont_hint}")
+            lines.append("")
+
+        # Combined confidence
+        combined = ssv.get("combined_confidence", {})
+        if combined:
+            lines.append(" STRUCTURAL CONFIDENCE  [Heuristic]")
+            lines.append(f"   Overall: {combined.get('overall', 0.0):.2f}")
+            lines.append(f"   Match component: {combined.get('match_confidence', 0.0):.2f}")
+            lines.append(f"   Density factor: {combined.get('density_factor', 0.0):.2f}")
+            lines.append(f"   Entropy factor: {combined.get('entropy_factor', 0.0):.2f}")
+            lines.append(f"   Epistemic factor: {combined.get('epistemic_factor', 0.0):.2f}")
+            lines.append(f"   Regime stability: {combined.get('regime_stability_factor', 0.0):.2f}")
+            lines.append("")
+
+        # Completion Hypothesis
+        comp_hyp = ssv.get("completion_hypothesis", {})
+        if comp_hyp:
+            lines.append(" COMPLETION HYPOTHESIS  [Structural]")
+            lines.append(f"   Direct evidence weight: {comp_hyp.get('direct_evidence_weight', 0.0):.2f}")
+            lines.append(f"   Graph completion weight: {comp_hyp.get('graph_completion_weight', 0.0):.2f}")
+            lines.append(f"   Completion strength: {comp_hyp.get('completion_strength', 0.0):.2f}")
+            lines.append(f"   Completion risk: {comp_hyp.get('completion_risk', 0.0):.2f}")
+            if comp_hyp.get("direct_observations"):
+                lines.append("   Direct observations:")
+                for obs in comp_hyp["direct_observations"][:3]:
+                    lines.append(f"     - {obs}")
+            if comp_hyp.get("graph_inferences"):
+                lines.append("   Graph inferences:")
+                for inf in comp_hyp["graph_inferences"][:4]:
+                    lines.append(f"     - {inf}")
+            lines.append("")
+
+        # EMA Deviation Sensor
+        ema = ssv.get("ema_sensor", {})
+        if ema.get("available", False):
+            lines.append(" EMA DEVIATION SENSOR  [Statistical]")
+            lines.append(f"   EMA ({ema['ema_period']}‑period): {ema['ema_value']:.4f}")
+            lines.append(f"   Current deviation: {ema['current_deviation']:+.4f}  (abs: {ema['current_abs_deviation']:.4f})")
+            lines.append(f"   Max positive: {ema['max_positive_deviation']:.4f}  Max negative: {ema['max_negative_deviation']:.4f}")
+            lines.append(f"   Deviation percentile: {ema['deviation_percentile']:.2f}")
+            lines.append(f"   Reversion probability: {ema['reversion_probability']:.2f}")
+            lines.append(f"   Classification: {ema['classification']}")
+            lines.append(f"   Data points: {ema['data_points']}")
+
+            bands = ema.get("bands", {})
+            if bands:
+                lines.append("   DEVIATION BANDS:")
+                for band_name in ["near", "moderate", "extended"]:
+                    info = bands.get(band_name, {})
+                    if info.get("episodes", 0) == 0:
+                        lines.append(f"     {band_name:<10}: no episodes")
+                        continue
+                    rev = info.get("reversion_prob")
+                    cont = info.get("continuation_prob")
+                    rev_str = f"{rev:.2f}" if rev is not None else "N/A"
+                    cont_str = f"{cont:.2f}" if cont is not None else "N/A"
+                    rev_steps = info.get("avg_steps_rev")
+                    cont_steps = info.get("avg_steps_cont")
+                    rev_step_str = f" (avg {rev_steps} steps)" if rev_steps is not None else ""
+                    cont_step_str = f" (avg {cont_steps} steps)" if cont_steps is not None else ""
+                    lines.append(f"     {band_name:<10}: episodes {info['episodes']}, revert {rev_str}{rev_step_str}, continue {cont_str}{cont_step_str}")
+            lines.append("")
+        else:
+            lines.append(" EMA DEVIATION SENSOR: " + ema.get('message', 'Not available.'))
+            lines.append("")
+
+        # Convergence Sensor
+        conv = ssv.get("convergence_sensor", {})
+        if conv.get("available", False):
+            lines.append(" CONVERGENCE SENSOR  [Structural]")
+            lines.append(f"   Sensors agreeing: {conv['sensors_agreeing']}/{conv['sensors_total']}")
+            lines.append(f"   Weighted pairwise agreement: {conv['pairwise_agreement']:.2f}")
+            lines.append(f"   Convergence strength: {conv['convergence_strength']:.2f}")
+            if "effective_strength" in conv:
+                lines.append(f"   Effective strength (diversity penalty): {conv['effective_strength']:.2f}")
+            lines.append(f"   Independence score: {conv['independence_score']:.2f}")
+            lines.append(f"   Baseline agreement: {conv['baseline_agreement']:.2f}")
+            lines.append(f"   Anomaly Z‑score: {conv['anomaly_z']:.2f} (ratio: {conv['anomaly_score']:.2f})")
+            lines.append(f"   Direction: {conv['direction']}")
+            lines.append(f"   Classification: {conv['classification']}")
+            lines.append(f"   Interpretation: {conv['interpretation']}")
+            if conv.get("sensor_details"):
+                lines.append("   Sensor details:")
+                for sd in conv["sensor_details"]:
+                    lines.append(f"     - {sd['name']}: {sd['direction']} (conf={sd['confidence']:.2f})")
+            lines.append("")
+        else:
+            lines.append(" CONVERGENCE SENSOR: " + conv.get('message', 'Not available.'))
+            lines.append("")
+
+        # Market DNA
+        dna = ssv.get("dna_profile", {})
+        if dna and "distribution" in dna:
+            lines.append(" MARKET DNA (regime classifier + dynamics)  [Heuristic]")
+            lines.append(f"   Dominant: {dna['dominant_state']} (confidence {dna['confidence']:.2f})")
+            stab_str = f"{dna['stability']:.2f}" if dna['stability'] is not None else "N/A (first call)"
+            persistence = dna.get('persistence', 'N/A')
+            ma = dna.get('moving_average', {})
+            ma_dom = max(ma, key=ma.get) if ma else None
+            lines.append(f"   Entropy: {dna['entropy']:.2f}  Stability: {stab_str}  Pressure: {dna.get('pressure', 'N/A')}  Age: {dna.get('age', 'N/A')}  Persistence: {persistence}")
+            if ma_dom:
+                lines.append(f"   Smoothed moving average dominant: {ma_dom}")
+            lines.append(f"   Distribution:")
+            for archetype, prob in sorted(dna["distribution"].items(), key=lambda x: x[1], reverse=True):
+                bar = "█" * int(prob * 20)
+                lines.append(f"     {archetype:<14} {prob:.2f} {bar}")
+            if dna.get("velocity"):
+                lines.append(f"   Velocity (change from previous):")
+                for arch, vel in sorted(dna["velocity"].items(), key=lambda x: abs(x[1]), reverse=True):
+                    sign = "+" if vel >= 0 else ""
+                    lines.append(f"     {arch:<14} {sign}{vel:.4f}")
+            lines.append(f"   {dna.get('interpretation', '')}")
+            lines.append("")
+
+        # Transitions
+        analysis = self.get_cluster_analysis(top_zone)
+        if analysis["transitions"]:
+            lines.append(f" TRANSITIONS FROM {top_zone}  [Statistical]")
+            for target, prob in analysis["transitions"].items():
+                arrow = "↑" if _zone_to_float(target) > _zone_to_float(top_zone) else "↓" if _zone_to_float(target) < _zone_to_float(top_zone) else "→"
+                med = self.median_price_of_zone(target)
+                med_str = f" (median ≈ {med:.2f})" if med else ""
+                steps = self.cluster_trans.get_average_steps(top_zone, target)
+                step_str = f"  avg steps: {steps}" if steps else ""
+                lines.append(f"   {arrow} {target}: {int(prob*100)}%{med_str}{step_str}")
+            lines.append("")
+
+        # Vector Field
+        if cached_vf:
+            lines.append(" VECTOR FIELD  [Structural]")
+            for zone in sorted(cached_vf.keys(), key=_zone_to_float):
+                v = cached_vf[zone]
+                sym = "↑" if v["net_direction"] > 0.1 else "↓" if v["net_direction"] < -0.1 else "↔"
+                lines.append(f"   {zone}: {sym} net={v['net_direction']:+.2f} mag={v['magnitude']:.2f} class={v['classification']} attr={v['attractor_score']:+.2f}")
+            lines.append("")
+
+        # Forward Trace (structured)
+        lines.append(" FORWARD TRACE [LSR]:")
+        for hop in ssv.get("forward_trace_structured", []):
+            tag = f"[{hop['status']}]".ljust(18)
+            lines.append(f"   → {hop['zone']}  conf={hop['confidence']:.3f}  {tag} depth={hop['depth']}")
+        if ssv.get("arrival_depth", 0) > 0:
+            lines.append(f"   Echo anchor: {ssv['arrival_depth']} arrival steps")
+            lines.append(f"   Reliable horizon: {ssv['reliable_horizon']} hops")
+        lines.append("")
+
+        # Mirror Symmetry
+        mirror = self.mirror_symmetry_analysis()
+        if mirror["recent_sequence"]:
+            lines.append(" MIRROR SYMMETRY  [Structural]")
+            lines.append(f"   Recent: {' → '.join(mirror['recent_sequence'])}")
+            lines.append(f"   Mirror: {' → '.join(mirror['mirror_sequence'])}")
+            if mirror["best_match"]:
+                lines.append(f"   Best match: {mirror['best_match']} (hits={mirror['matched_pattern_hits']})")
+            lines.append(f"   Similarity: {mirror['similarity']:.2f} — {mirror['interpretation']}")
+            lines.append("")
+
+        # Distance Map
+        if dmap and "error" not in dmap:
+            lines.append(" STATE DISTANCE MAP  [Structural]")
+            lines.append(f"   Nearest attractor: {dmap['nearest_attractor']} ({dmap['distance_to_attractor']} zones away)")
+            lines.append(f"   Nearest repeller:  {dmap['nearest_repeller']} ({dmap['distance_to_repeller']} zones away)")
+            if dmap['nearest_boundary']:
+                lines.append(f"   Nearest boundary:  {dmap['nearest_boundary']} ({dmap['distance_to_boundary']} zones away)")
+            lines.append(f"   Densest zone:      {dmap['densest_zone']} ({dmap['distance_to_densest']} zones away)")
+            if dmap['path_to_equilibrium']:
+                lines.append(f"   Path to equilibrium: {' → '.join(dmap['path_to_equilibrium'])}")
+                lines.append(f"   Steps to equilibrium: {dmap['equilibrium_steps']}")
+            lines.append("")
+
+        # Active Edges
+        active_edges = self._active_edges_list()
+        if active_edges:
+            lines.append(" ACTIVE EDGES  [Empirical-ε]")
+            for e in active_edges[:3]:
+                lines.append(f"   {e['from']} → {e['to']}   str={e['strength']:.3f}   hits={e['hits']}")
+            lines.append("")
+
+        lines.append("═" * 55)
+        return "\n".join(lines)
+
+    def audit_multiplier_independence(self, sample_size=100):
+        max_edge_strength = 0.0
+        edges_over_one = 0
+        total_edges = 0
+        for node in self.nodes.values():
+            for edge in node.links.values():
+                total_edges += 1
+                if edge.strength > max_edge_strength:
+                    max_edge_strength = edge.strength
+                if edge.strength > 1.0:
+                    edges_over_one += 1
+        edge_warning = ""
+        if edges_over_one > 0:
+            edge_warning = f"WARNING: {edges_over_one} edges exceed 1.0 (max={max_edge_strength:.4f})."
+
+        if not self.use_modulation:
+            return {
+                "edge_audit": {
+                    "total_edges": total_edges,
+                    "edges_over_one": edges_over_one,
+                    "max_edge_strength": round(max_edge_strength, 4),
+                    "warning": edge_warning
+                },
+                "multiplier_correlation": "Modulation is off."
+            }
+
+        transitions = list(self.cluster_trans.counts.keys())
+        if not transitions:
+            return {
+                "edge_audit": {
+                    "total_edges": total_edges,
+                    "edges_over_one": edges_over_one,
+                    "max_edge_strength": round(max_edge_strength, 4),
+                    "warning": edge_warning
+                },
+                "multiplier_correlation": "No transition data available."
+            }
+
+        sample_keys = random.sample(transitions, min(sample_size, len(transitions)))
+        records = []
+        for key in sample_keys:
+            if "→" not in key:
+                continue
+            from_z, to_z = key.split("→")
+            try:
+                fv = _zone_to_float(from_z)
+                tv = _zone_to_float(to_z)
+                direc = "UP" if tv > fv else "DOWN" if tv < fv else "FLAT"
+            except (ValueError, TypeError):
+                direc = "FLAT"
+            mult = self._compute_modulation_multipliers(from_z, to_z, direc)
+            if not mult.get("active"):
+                continue
+            row = {}
+            if self.merge_regime_pattern:
+                row["pressure"] = mult.get("pressure", 1.0)
+            else:
+                row["regime"] = mult.get("regime", 1.0)
+                row["pattern"] = mult.get("pattern", 1.0)
+            row["stability"] = mult.get("stability", 1.0)
+            row["frequency"] = mult.get("frequency", 1.0)
+            row["complementarity"] = mult.get("complementarity", 1.0)
+            records.append(row)
+
+        if len(records) < 2:
+            return {
+                "edge_audit": {
+                    "total_edges": total_edges,
+                    "edges_over_one": edges_over_one,
+                    "max_edge_strength": round(max_edge_strength, 4),
+                    "warning": edge_warning
+                },
+                "multiplier_correlation": "Insufficient data for correlation."
+            }
+
+        def pearson(x, y):
+            n = len(x)
+            if n == 0:
+                return 0.0
+            sum_x = sum(x)
+            sum_y = sum(y)
+            sum_xy = sum(xi*yi for xi, yi in zip(x, y))
+            sum_x2 = sum(xi*xi for xi in x)
+            sum_y2 = sum(yi*yi for yi in y)
+            var_x = max(sum_x2 - sum_x*sum_x/n, 0.0)
+            var_y = max(sum_y2 - sum_y*sum_y/n, 0.0)
+            denom = math.sqrt(var_x * var_y)
+            if denom == 0:
+                return 0.0
+            return (sum_xy - sum_x*sum_y/n) / denom
+
+        fields = list(records[0].keys())
+        corr_matrix = {f: {} for f in fields}
+        max_corr = 0.0
+        for i, f1 in enumerate(fields):
+            for f2 in fields[i:]:
+                if f1 == f2:
+                    corr_matrix[f1][f2] = 1.0
+                    continue
+                vals1 = [r[f1] for r in records]
+                vals2 = [r[f2] for r in records]
+                corr = pearson(vals1, vals2)
+                corr_matrix[f1][f2] = round(corr, 4)
+                corr_matrix[f2][f1] = round(corr, 4)
+                if abs(corr) > max_corr:
+                    max_corr = abs(corr)
+        corr_warning = ""
+        if max_corr > 0.7:
+            corr_warning = f"WARNING: High correlation detected (max = {max_corr:.2f})."
+
+        return {
+            "edge_audit": {
+                "total_edges": total_edges,
+                "edges_over_one": edges_over_one,
+                "max_edge_strength": round(max_edge_strength, 4),
+                "warning": edge_warning
+            },
+            "multiplier_correlation": {
+                "samples": len(records),
+                "correlations": corr_matrix,
+                "max_absolute_correlation": round(max_corr, 4),
+                "warning": corr_warning
+            }
+        }
+
+    def inspect_graph(self):
+        print(f"\n=== NON-LINEAR PROBABILISTIC GRAPH MODEL (NLPGM) v{VERSION} ===")
+        print(f"  Cycles: {self.update_cycles}  |  Nodes: {len(self.nodes)}  |  Patterns: {len(self.patterns)}")
+        print(f"  Modulation: {'ON' if self.use_modulation else 'OFF'}  (λ={self.lambda_factor})")
+        print(f"  Log-space: {self.use_log_space}  |  Merge RP: {self.merge_regime_pattern}")
+        print(f"============================================================")
+        if not self.nodes:
+            print("  (empty)")
+            return
+
+        if self._recent_transitions:
+            print(f"\n  --- RECENT TRANSITIONS (magnitude) ---")
+            recent = self._recent_transitions[-15:] if len(self._recent_transitions) > 15 else self._recent_transitions
+            print(f"  {'→'.join(recent)}")
+
+        all_zones = set(n.price_zone for n in self.nodes.values() if n.price_zone != "Z?")
+        if all_zones:
+            print(f"\n  --- CLUSTER TRANSITIONS ---")
+            for zone in sorted(all_zones, key=_zone_to_float):
+                analysis = self.cluster_trans.get_cluster_analysis(zone, self.nodes)
+                regime_str = f"[{analysis['regime']}]" if analysis['regime'] != "SIDEWAYS" else ""
+                print(f"  {zone} ({analysis['node_count']} nodes) {regime_str}:")
+                if analysis['transitions']:
+                    for target, prob in analysis['transitions'].items():
+                        bar = "█" * int(prob * 20)
+                        zn = _zone_to_float(zone)
+                        zt = _zone_to_float(target)
+                        arrow = "↑" if zt > zn else "↓" if zt < zn else "→"
+                        median_price = self.median_price_of_zone(target)
+                        median_str = f" (median ≈ {median_price:.2f})" if median_price is not None else ""
+                        avg_steps = self.cluster_trans.get_average_steps(zone, target)
+                        steps_str = f"  avg steps: {avg_steps}" if avg_steps is not None else ""
+                        print(f"    {arrow} {target}: {int(prob*100)}%{median_str} {bar}  {steps_str}")
+                else:
+                    print(f"    (no transitions recorded)")
+
+        if self.patterns:
+            print(f"\n  --- PATTERNS ({len(self.patterns)} stored) ---")
+            for sig, pattern in sorted(self.patterns.items(), key=lambda x: x[1].hits, reverse=True)[:10]:
+                age_str = format_age(pattern.age_seconds())
+                ptype = "DIR" if pattern.start_zone == "DIR?" else "MAG"
+                print(f"  [{ptype}][{pattern.hits}x] {pattern.display}  age={age_str}")
+
+        print(f"\n  --- NODES ---")
+        total = len(self.nodes)
+        for node in self.nodes.values():
+            freq = f"  hits={node.hits}" if node.hits > 0 else ""
+            price_str = f"  px={node.price:.4f}" if node.price is not None else ""
+            zone_str = f"  [{node.price_zone}]" if node.price_zone else ""
+            age_str = f"  age={format_age(node.age_seconds())}"
+            type_str = f"  [T{node.strand_type}]" if node.strand_type is not None else "  [T?]"
+            asset_tag = ""
+            if node.price:
+                if node.price < 5: asset_tag = " [forex]"
+                elif node.price < 200: asset_tag = " [mid]"
+                elif node.price < 10000: asset_tag = " [crypto]"
+                else: asset_tag = " [gold]"
+            hub_tag = " [HUB]" if len(node.links) / max(total - 1, 1) > self.config.HUB_DEGREE_THRESHOLD else ""
+            dna_display = node.dna.get("display", "none") if isinstance(node.dna, dict) else str(node.dna)
+            print(f"\n  {node.value}{freq}{price_str}{zone_str}{age_str}{type_str}{hub_tag}{asset_tag} [DNA: {dna_display}]")
+            if node.links:
+                for k, edge in sorted(node.links.items(), key=lambda x: x[1].strength, reverse=True):
+                    delta_str = f" Δ={edge.price_delta:.4f}" if edge.price_delta is not None else ""
+                    edge_age = format_age(edge.age_seconds())
+                    target_node = self.nodes.get(k)
+                    comp_tag = ""
+                    if target_node and node.strand_type is not None and target_node.strand_type is not None:
+                        comp_tag = " [COMP]" if node.strand_type != target_node.strand_type else " [SAME]"
+                    cross_tag = " [X-ZONE]" if edge.cross_zone else ""
+                    trans_tag = f" [{edge.transition['signature']}]" if edge.transition else ""
+                    bar = "=" * int(edge.strength * 20)
+                    print(f"    -> {k:<25} str={edge.strength:.3f}  hits={edge.hits}{delta_str}{comp_tag}{cross_tag}{trans_tag}  age={edge_age}  [{bar}]")
+            else:
+                print("    -> no links")
+
+    def save(self, filepath=None):
+        if filepath is None:
+            filepath = self.config.SAVE_FILE
+        data = {
+            "nlpgm_version": VERSION,
+            "cycles": self.update_cycles,
+            "nodes":  {k: v.to_dict() for k, v in self.nodes.items()},
+            "patterns": {k: v.to_dict() for k, v in self.patterns.items()},
+            "cluster_transitions": self.cluster_trans.to_dict(),
+            "recent_transitions": self._recent_transitions,
+            "last_step_price": self._last_step_price,
+            "v1_4_step_counter": self.current_step_counter,
+            "v1_4_last_zone": self.last_zone,
+            "v1_5_use_modulation": self.use_modulation,
+            "v1_5_lambda": self.lambda_factor,
+            "v1_5_1_log_space": self.use_log_space,
+            "v1_5_1_merge_rp": self.merge_regime_pattern,
+            "_last_strand": self._last_strand,
+            "_last_dna_distribution": self._last_dna_distribution,
+            "_dna_stability_valid": self._dna_stability_valid,
+            "_dna_age": self._dna_age,
+            "_dna_velocity": self._dna_velocity,
+            "price_history": self.price_history
+        }
+        try:
+            with open(self.config.TEMP_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+            if os.path.exists(filepath):
+                shutil.copy2(filepath, self.config.BACKUP_FILE)
+            os.replace(self.config.TEMP_FILE, filepath)
+            return f"Saved {len(self.nodes)} contacts, {len(self.patterns)} patterns to {filepath}"
+        except Exception as ex:
+            msg = f"Save failed: {ex}"
+            if os.path.exists(self.config.BACKUP_FILE):
+                msg += " (backup from previous save is available)"
+            return msg
+
+    def load(self, filepath=None):
+        if filepath is None:
+            filepath = self.config.SAVE_FILE
+        if not os.path.exists(filepath):
+            return "No save file found. Starting with a clean data matrix."
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+
+            stored_version = data.get("nlpgm_version", "unknown")
+            if stored_version != VERSION:
+                print(f"Note: Save file version '{stored_version}' differs from current version '{VERSION}'. Data will be loaded with compatibility defaults.")
+
+            self.update_cycles = data.get("cycles", 0)
+            self.nodes = {}
+            self.patterns = {}
+            self.cluster_trans = ClusterTransitions()
+            self._recent_transitions = data.get("recent_transitions", [])
+            self._last_step_price = data.get("last_step_price", None)
+            self.current_step_counter = data.get("v1_4_step_counter", 0)
+            self.last_zone = data.get("v1_4_last_zone", None)
+            self.use_modulation = data.get("v1_5_use_modulation", False)
+            self.lambda_factor = data.get("v1_5_lambda", 0.5)
+            self.use_log_space = data.get("v1_5_1_log_space", False)
+            self.merge_regime_pattern = data.get("v1_5_1_merge_rp", False)
+
+            if "cluster_transitions" in data:
+                self.cluster_trans.load_from_dict(data["cluster_transitions"])
+
+            for sig, pd in data.get("patterns", {}).items():
+                pattern = PatternNode(
+                    pd.get("transitions", []),
+                    sig,
+                    pd.get("start_zone", "Z?")
+                )
+                pattern.hits = pd.get("hits", 1)
+                pattern.created_at = pd.get("created_at", 0.0)
+                self.patterns[sig] = pattern
+
+            load_index = 0
+            for val, nd in data.get("nodes", {}).items():
+                dna_raw = nd.get("dna", {})
+                strand_type = nd.get("strand_type")
+                if strand_type is None:
+                    strand_type = load_index % 2
+                if isinstance(dna_raw, int):
+                    dna_raw = {"category": dna_raw, "strand_type": strand_type, "price_zone": nd.get("price_zone", "Z?"),
+                               "fingerprint": "", "path_signature": "", "display": f"{dna_raw:08b}"}
+                elif isinstance(dna_raw, dict):
+                    if dna_raw.get("strand_type") is None:
+                        dna_raw["strand_type"] = strand_type
+                    if "price_zone" not in dna_raw:
+                        dna_raw["price_zone"] = nd.get("price_zone", "Z?")
+                node = Node(
+                    nd["value"],
+                    hits=nd.get("hits", 0),
+                    dna=dna_raw,
+                    price=nd.get("price"),
+                    volatility=nd.get("volatility"),
+                    strand_type=strand_type
+                )
+                if "created_at" in nd:
+                    node.created_at = nd["created_at"]
+                self.nodes[val] = node
+                self._last_strand = strand_type
+                load_index += 1
+
+            self._last_strand = data.get("_last_strand", self._last_strand)
+            self._last_dna_distribution = data.get("_last_dna_distribution", None)
+            self._dna_stability_valid = data.get("_dna_stability_valid", False)
+            self._dna_age = data.get("_dna_age", 0)
+            self._dna_velocity = data.get("_dna_velocity", None)
+
+            self.price_history = data.get("price_history", [])
+            if self.price_history and isinstance(self.price_history[0], dict):
+                self.price_history = [[p, t] for p, t in self.price_history]
+
+            # Reset agreement history (ephemeral)
+            self._agreement_history = []
+
+            for val, nd in data.get("nodes", {}).items():
+                node = self.nodes[val]
+                for linked_val, ed in nd.get("links", {}).items():
+                    if linked_val in self.nodes:
+                        edge = Edge(
+                            ed.get("strength", 0.5),
+                            hits=ed.get("hits", 0),
+                            price_delta=ed.get("price_delta"),
+                            cross_zone=ed.get("cross_zone", False),
+                            transition=ed.get("transition")
+                        )
+                        if "created_at" in ed:
+                            edge.created_at = ed["created_at"]
+                        node.links[linked_val] = edge
+                node.update_dna(self.nodes)
+            return f"Loaded {len(self.nodes)} contacts, {len(self.patterns)} patterns from {filepath}"
+        except Exception as ex:
+            return f"Load failed: {ex}"
+
+
+# ============================================================
+# CLASSIFY & ENGINE FACADE (simplified)
+# ============================================================
+
+def classify(results, db_instance=None):
+    if not results:
+        return "INVALID", results
+    top = results[0]
+    second = results[1] if len(results) > 1 else None
+    if top["total"] < CONFIDENCE_NONE:
+        return "NO_MATCH", results
+    if second and abs(top["total"] - second["total"]) < RESONANCE_THRESHOLD and db_instance:
+        top_val = top["value"]
+        second_val = second["value"]
+        node_1 = db_instance.nodes.get(top_val)
+        node_2 = db_instance.nodes.get(second_val)
+        if node_1 and node_2:
+            dna1 = node_1.dna
+            dna2 = node_2.dna
+            if isinstance(dna1, dict) and isinstance(dna2, dict):
+                sim = dna_similarity(dna1, dna2)
+                if sim < 0.3:
+                    top["total"] = round(min(top["total"] + 0.10, 1.0), 4)
+                    return "RESOLVED_MATCH", results
+                if sim > 0.7:
+                    top["total"] = round(min(top["total"] + 0.12, 1.0), 4)
+                    return "RESOLVED_MATCH", results
+            if node_1.strand_type is not None and node_2.strand_type is not None:
+                if node_1.strand_type != node_2.strand_type:
+                    top["total"] = round(min(top["total"] + 0.08, 1.0), 4)
+                    return "RESOLVED_MATCH", results
+            if node_1.price_zone and node_2.price_zone:
+                if node_1.price_zone == node_2.price_zone:
+                    top["total"] = round(min(top["total"] + 0.06, 1.0), 4)
+                    return "RESOLVED_MATCH", results
+            if node_1.price is not None and node_2.price is not None:
+                if abs(node_1.price - node_2.price) < 0.0001:
+                    top["total"] = round(min(top["total"] + 0.08, 1.0), 4)
+                    return "RESOLVED_MATCH", results
+        if node_1 and second_val in node_1.links:
+            edge_strength = node_1.links[second_val].strength
+            if edge_strength >= AGRR_MIN_STRENGTH:
+                top["total"] = round(min(top["total"] + edge_strength * 0.15, 1.0), 4)
+                return "RESOLVED_MATCH", results
+    if second and abs(top["total"] - second["total"]) < RESONANCE_THRESHOLD:
+        return "AMBIGUOUS", results
+    if top["total"] > CONFIDENCE_HIGH:
+        return "HIGH", results
+    if top["total"] > CONFIDENCE_MEDIUM:
+        return "MEDIUM", results
+    if top["total"] > CONFIDENCE_LOW:
+        return "LOW", results
+    return "NO_MATCH", results
+
+CONFIDENCE_DISPLAY = {
+    "HIGH":           "[GREEN]  CONFIRMED MATCH",
+    "RESOLVED_MATCH": "[GREEN]  RESOLVED MATCH (DNA/GRAPH-RESONANCE)",
+    "MEDIUM":         "[YELLOW] CONFIRM BEFORE CALLING",
+    "LOW":            "[ORANGE] WEAK MATCH — CAUTION",
+    "AMBIGUOUS":      "[CHECK]  MULTIPLE CANDIDATES",
+    "NO_MATCH":       "[RED]    UNKNOWN — BLOCK CALL",
+    "INVALID":        "[RED]    NO CONTACTS STORED",
+}
+
+class Engine:
+    """Top‑level facade for MemoryDB."""
+    def __init__(self, config: Config = None):
+        self.db = MemoryDB(config)
+
+    def batch_add(self, batch_text):
+        return self.db.batch_add(batch_text)
+
+    def search(self, query):
+        results = self.db.search(query)
+        status, updated = classify(results, self.db)
+        return status, updated
+
+    def decay(self):
+        return self.db.decay_cycle()
+
+    def inspect(self):
+        self.db.inspect_graph()
+
+    def save(self):
+        return self.db.save()
+
+    def load(self):
+        return self.db.load()
+
+    def structural_report(self, query):
+        return self.db.structural_report(query)
+
+    def structural_report_json(self, query):
+        return self.db.structural_report_json(query)
+
+    def reconstruct_latent_state(self, query):
+        return self.db.reconstruct_latent_state(query)
+
+    def state_completion_narrative(self, query):
+        return self.db.state_completion_narrative(query)
+
+    def state_distance_map(self, query):
+        return self.db.state_distance_map(query)
+
+    def compute_vector_field(self):
+        return self.db.compute_vector_field()
+
+    def trace_forward_path(self, start_zone, steps=5):
+        return self.db.trace_forward_path(start_zone, steps)
+
+    def mirror_symmetry_analysis(self, window=None):
+        return self.db.mirror_symmetry_analysis(window)
+
+    def compute_dna_distribution(self, signature_window=None, vector_field=None):
+        return self.db.compute_dna_distribution(signature_window, vector_field)
+
+    def compute_ema_deviation_sensor(self, query_price):
+        return self.db.compute_ema_deviation_sensor(query_price)
+
+    def toggle_modulation(self):
+        self.db.use_modulation = not self.db.use_modulation
+        return f"Context-weighted modulation is now {'ON' if self.db.use_modulation else 'OFF'} (λ={self.db.lambda_factor})"
+
+    def set_lambda(self, value):
+        self.db.lambda_factor = max(0.0, min(1.0, value))
+        return f"λ set to {self.db.lambda_factor}"
+
+    def toggle_log_space(self):
+        self.db.use_log_space = not self.db.use_log_space
+        return f"Log-space combination is now {'ON' if self.db.use_log_space else 'OFF'}"
+
+    def toggle_merge_rp(self):
+        self.db.merge_regime_pattern = not self.db.merge_regime_pattern
+        return f"Merge regime+pattern is now {'ON' if self.db.merge_regime_pattern else 'OFF'}"
+
+    def audit(self):
+        return self.db.audit_multiplier_independence()
+
+
+# ============================================================
+# CLI (simplified: option 1 removed)
+# ============================================================
+
+def main():
+    engine = Engine()
+    print(engine.load())
+
+    while True:
+        cycles = engine.db.update_cycles
+        count  = len(engine.db.nodes)
+        patterns = len(engine.db.patterns)
+        mod_status = "ON" if engine.db.use_modulation else "OFF"
+        lam = engine.db.lambda_factor
+        logspace = "ON" if engine.db.use_log_space else "OFF"
+        merge = "ON" if engine.db.merge_regime_pattern else "OFF"
+        print(f"\n==============================================")
+        print(f" NON-LINEAR PROBABILISTIC GRAPH MODEL (NLPGM) v{VERSION}")
+        print(f"==============================================")
+        print(f" contacts={count}  patterns={patterns}  cycles={cycles}")
+        print(f" modulation={mod_status}  λ={lam}  log-space={logspace}  merge-RP={merge}")
+        print(f"==============================================")
+        print("2  Search + Full Report (Text)")
+        print("J  Search + JSON Report")
+        print("4  Run decay cycle")
+        print("5  Inspect memory graph")
+        print("6  Save contacts")
+        print("7  Exit")
+        print("8  Toggle context-weighted modulation")
+        print("9  Batch add (sequential, tracks steps)")
+        print("0  Set lambda (0.0=off, 1.0=full)")
+        print("L  Toggle log-space combination")
+        print("M  Toggle merge regime+pattern into pressure index")
+        print("A  Run multiplier independence audit + edge strength check")
+
+        c = input("Select: ").strip().upper()
+        if c == "2":
+            q = input("Query: ").strip()
+            if not q:
+                continue
+            print(engine.structural_report(q))
+        elif c == "J":
+            q = input("Query for JSON report: ").strip()
+            if not q:
+                continue
+            report = engine.structural_report_json(q)
+            print(json.dumps(report, indent=2))
+        elif c == "4":
+            print(engine.decay())
+            engine.save()
+        elif c == "5":
+            engine.inspect()
+        elif c == "6":
+            print(engine.save())
+        elif c == "7":
+            engine.save()
+            break
+        elif c == "8":
+            print(engine.toggle_modulation())
+        elif c == "9":
+            print("Paste batch (empty line to finish):")
+            lines = []
+            while True:
+                line = input()
+                if not line.strip():
+                    break
+                lines.append(line)
+            batch_text = "\n".join(lines)
+            result = engine.batch_add(batch_text)
+            print(result)
+            engine.save()
+        elif c == "0":
+            try:
+                val = float(input("Enter lambda (0.0 - 1.0): ").strip())
+                print(engine.set_lambda(val))
+            except ValueError:
+                print("Invalid number.")
+        elif c == "L":
+            print(engine.toggle_log_space())
+        elif c == "M":
+            print(engine.toggle_merge_rp())
+        elif c == "A":
+            audit_result = engine.audit()
+            if isinstance(audit_result, dict):
+                print("\n=== System Audit ===")
+                edge_info = audit_result.get("edge_audit", {})
+                print(f"Edge strengths:")
+                print(f"  Total edges: {edge_info.get('total_edges', 0)}")
+                print(f"  Edges > 1.0: {edge_info.get('edges_over_one', 0)}")
+                print(f"  Max strength: {edge_info.get('max_edge_strength', 0.0)}")
+                if edge_info.get('warning'):
+                    print(f"  {edge_info['warning']}")
+                corr_info = audit_result.get("multiplier_correlation", {})
+                if isinstance(corr_info, dict):
+                    print(f"\nMultiplier Independence Audit:")
+                    print(f"  Samples: {corr_info.get('samples', 0)}")
+                    print(f"  Max absolute correlation: {corr_info.get('max_absolute_correlation', 0.0)}")
+                    if corr_info.get('warning'):
+                        print(f"  {corr_info['warning']}")
+                    print("  Correlation matrix:")
+                    for f1, row in corr_info.get('correlations', {}).items():
+                        print(f"    {f1}: {row}")
+                else:
+                    print(f"\n{corr_info}")
+            else:
+                print(audit_result)
+        else:
+            print("Invalid option.")
+
+
+if __name__ == "__main__":
+    main()
+    
+    #//end//#

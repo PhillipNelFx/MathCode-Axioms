@@ -2,13 +2,18 @@
 """
 Non-Linear Probabilistic Graph Model (NLPGM) v2.3E-Lean+CIS+++NMD+Phase2
 Latent State Reconstruction Engine with Contradiction Insight Sensor,
-NMD hypothesis-space observer, and strict B/R/L separation.
+NMD hypothesis-space observer, strict B/R/L separation, and
+probabilistic forward trace (branching preserved, learning aware).
 
 Single-file lean build. All LSR mechanisms intact.
 NMD is a read‑only meta‑observer; it never influences the reconstruction.
 Phase 2 adds WHY vectors (Ω) on every transition and a separate
 Learning operator (L) that reconciles epistemic deltas into edge weights
 without contaminating the reconstruction (R).
+
+Forward Trace now correctly preserves the full zone probability
+distribution at each hop rather than collapsing to a greedy path.
+Branch points are explicitly labelled, and learning skips ambiguous hops.
 """
 
 import time, math, json, os, shutil, random, hashlib, re
@@ -102,9 +107,13 @@ class Config:
     NMD_ENTROPY_LOW:     float = 0.4
     NMD_ENTROPY_HIGH:    float = 0.7
     # Phase 2 – Reconciliation operator coefficients
-    L_ALPHA:  float = 0.5   # frequency weight
-    L_BETA:   float = 0.3   # confidence gain weight
-    L_GAMMA:  float = 0.2   # contradiction penalty
+    L_ALPHA:  float = 0.5
+    L_BETA:   float = 0.3
+    L_GAMMA:  float = 0.2
+    # Forward trace – probability threshold for RECONSTRUCTION label
+    FWD_RECON_PROB_THRESHOLD: float = 0.4
+    # Branch detection – spread threshold for ambiguity
+    FWD_BRANCH_SPREAD_THRESHOLD: float = 0.15
     SAVE_FILE:   str = "contacts.json"
     BACKUP_FILE: str = "contacts.json.bak"
     TEMP_FILE:   str = "contacts.json.tmp"
@@ -707,35 +716,27 @@ class MemoryDB:
             results.append(r)
         results.sort(key=lambda x:x["raw_score"],reverse=True)
         # NOTE: no hits increment, no edge reinforcement here anymore.
-        # Node objects remain in results for L phase; caller must clean them.
         return results
 
     def _learn_from_query(self, results):
-        """Apply Hebbian reinforcement from the top search result.
-           This is the L-phase operator for query learning."""
         if not results:
             return
         top = results[0]
         tn = top.get("node")
         if tn is None:
             return
-        qp = tn.price  # query price approximated by top match's price
+        qp = tn.price
         pc = p_sim(qp, tn.price, tn.volatility) if (qp and tn.price) else 1.0
         tn.hits += 1
-        # edge reinforcement: ec is not stored; we need the edges that contributed boost.
-        # We'll recompute ec from the raw results? Too heavy. Instead we store ec during search.
-        # For now, we skip edge reinforcement in this first Phase 2 version to keep it clean.
-        # The important part is that search() no longer mutates.
         tn.mark_dirty()
         tn.refresh_dna(self.nodes)
-        # clean node references
         for r in results:
             r.pop("node", None)
 
     def _cluster(self, zone):
         return self.ct.cluster_analysis(zone,self.nodes)
 
-    # ─── LSR CORE (unchanged) ───
+    # ─── LSR CORE ───
 
     def get_arrival_depth(self, zone):
         all_steps=[]
@@ -745,25 +746,72 @@ class MemoryDB:
         s=sorted(all_steps); n=len(s)
         return int(round(s[n//2] if n%2 else (s[n//2-1]+s[n//2])/2))
 
+    # ── PROBABILISTIC FORWARD TRACE (BRANCHING PRESERVED, LEARNING AWARE) ──
     def trace_forward(self, start_zone, steps=5):
-        ad=self.get_arrival_depth(start_zone)
-        rh=max(1,ad//2) if ad>0 else 1
-        structured=[]; cur=start_zone; prev=None; depth=0
+        """Returns a probability distribution over zones at each hop,
+           a sampled representative path with ambiguity flags, and the full distributions."""
+        ad = self.get_arrival_depth(start_zone)
+        rh = max(1, ad // 2) if ad > 0 else 1
+
+        distributions = []
+        current_dist = {start_zone: 1.0}
+        distributions.append(dict(current_dist))
+
         for _ in range(steps):
-            pr=self.ct.probs(cur)
-            if not pr: break
-            adj={t:p*(1-cfg.FORWARD_MOMENTUM_PENALTY) if t==prev else p for t,p in pr.items()}
-            tot=sum(adj.values())
-            if not tot: break
-            nxt=max(adj,key=adj.get)
-            if nxt==cur: break
-            depth+=1
-            bc=pr.get(nxt,0.0)
-            if depth<=rh: status,conf="RECONSTRUCTION",bc
-            else:         status,conf="SPECULATIVE",bc*(0.6**(depth-rh))
-            structured.append({"zone":nxt,"confidence":round(conf,4),"status":status,"depth":depth})
-            prev,cur=cur,nxt
-        return {"flat":[start_zone]+[h["zone"] for h in structured],"structured":structured,"arrival_depth":ad,"reliable_horizon":rh}
+            next_dist = {}
+            for zone, prob in current_dist.items():
+                probs = self.ct.probs(zone)
+                if not probs:
+                    next_dist[zone] = next_dist.get(zone, 0.0) + prob
+                    continue
+                for nxt, p in probs.items():
+                    if nxt == zone:
+                        continue
+                    next_dist[nxt] = next_dist.get(nxt, 0.0) + prob * p
+            total_mass = sum(next_dist.values())
+            if total_mass <= 0:
+                break
+            for z in next_dist:
+                next_dist[z] = round(next_dist[z] / total_mass, 4)
+            distributions.append(dict(next_dist))
+            current_dist = next_dist
+
+        # Build a sampled path for backward compatibility, with ambiguity flags
+        structured = []
+        flat = [start_zone]
+        for i in range(1, len(distributions)):
+            dist = distributions[i]
+            if not dist:
+                break
+            max_prob = max(dist.values())
+            top_zones = [z for z, p in dist.items() if p == max_prob]
+            # Determine if this hop is ambiguous (spread < threshold)
+            second_prob = 0.0
+            if len(top_zones) < len(dist):
+                second_prob = max(p for z, p in dist.items() if z not in top_zones)
+            elif len(top_zones) > 1:
+                second_prob = max_prob  # tie
+            ambiguous = (max_prob - second_prob) < cfg.FWD_BRANCH_SPREAD_THRESHOLD and len(dist) > 1
+
+            chosen = top_zones[0]  # arbitrary among ties (for path continuity)
+            prob = dist[chosen]
+            status = "RECONSTRUCTION" if prob >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
+            structured.append({
+                "zone": chosen,
+                "confidence": prob,
+                "status": status,
+                "depth": i,
+                "ambiguous": ambiguous
+            })
+            flat.append(chosen)
+
+        return {
+            "flat": flat,
+            "structured": structured,
+            "arrival_depth": ad,
+            "reliable_horizon": rh,  # informational, not used for status
+            "distributions": distributions
+        }
 
     def vector_field(self):
         all_zones=sorted(set(n.price_zone for n in self.nodes.values() if n.price_zone!="Z?"),key=_zone_val)
@@ -948,13 +996,27 @@ class MemoryDB:
             ec,rp=ema.get("classification"),ema.get("reversion_probability",0.5)
             if ec in ("extended_above","extended_below") and rp>0.5:
                 sensors.append({"name":"ema","direction":-1 if "above" in ec else 1,"confidence":rp})
-        fwd=[h for h in ssv.get("fwd_structured",[]) if h["status"]=="RECONSTRUCTION"]
-        if fwd:
-            try:
-                fv,tv=_zone_val(ssv["observed_zone"]),_zone_val(fwd[0]["zone"])
-                fd=1 if tv>fv else -1 if tv<fv else 0
-                if fd: sensors.append({"name":"forward_trace","direction":fd,"confidence":fwd[0]["confidence"]})
-            except: pass
+        # Forward trace sensor: expectation over hop‑1 distribution
+        fwd_dist = ssv.get("fwd_distributions", [])
+        if len(fwd_dist) >= 2:
+            hop1 = fwd_dist[1]
+            start_zone = ssv.get("observed_zone", "")
+            expected_dir = 0.0
+            total_prob = 0.0
+            for z, p in hop1.items():
+                try:
+                    dir_sign = 1 if _zone_val(z) > _zone_val(start_zone) else -1 if _zone_val(z) < _zone_val(start_zone) else 0
+                except:
+                    dir_sign = 0
+                expected_dir += p * dir_sign
+                total_prob += p
+            if total_prob > 0:
+                expected_dir /= total_prob
+            fwd_dir = 1 if expected_dir > 0.15 else -1 if expected_dir < -0.15 else 0
+            fwd_confidence = min(abs(expected_dir), 1.0)
+            if fwd_dir != 0:
+                sensors.append({"name":"forward_trace","direction":fwd_dir,"confidence":round(fwd_confidence, 4)})
+        # CIS sensor integration (unchanged)
         cis = ssv.get("cis_sensor", {})
         if cis.get("active") and cis.get("mode") == "historical_resolution" and cis.get("direction"):
             sensors.append({"name":"cis","direction":1 if cis["direction"]=="UP" else -1 if cis["direction"]=="DOWN" else 0,
@@ -1059,6 +1121,7 @@ class MemoryDB:
         if ms2>0.3: inferences.append(f"Mirror symmetry {ms2:.2f}")
         if ds>0.3:  inferences.append(f"DNA {ssv.get('dna_profile',{}).get('dominant_state')}")
         fts=ssv.get("fwd_structured",[])
+        # status strings now use "RECONSTRUCTION"/"SPECULATIVE" (full form)
         rec=[h for h in fts if h["status"]=="RECONSTRUCTION"]
         spe=[h for h in fts if h["status"]=="SPECULATIVE"]
         if rec:  inferences.append(f"Reconstruction: {' → '.join(h['zone'] for h in rec)}")
@@ -1352,44 +1415,37 @@ class MemoryDB:
                 "probs": {k: round(v, 4) for k, v in probs.items()},
                 "avg_reorg": round(avg_reorg, 2)}
 
-    # ── PHASE 2: WHY vectors and L operator ──
+    # ── PHASE 2: WHY vectors and L operator (skips ambiguous hops) ──
 
-    def _compute_why_vectors(self, ssv, fwd_flat):
-        """Generate WHY vectors (Ω) for each hop in the forward trace.
-           Each vector contains epistemic deltas and context."""
+    def _compute_why_vectors(self, ssv, fwd_structured):
         why = []
-        if len(fwd_flat) < 2:
+        if len(fwd_structured) < 1:
             return why
-        # get global metrics once
         dna = self.dna_distribution()
-        global_entropy = dna.get("entropy", 0.5)
         global_contradiction = ssv.get("contradiction_strength", 0.0)
-        global_confidence = ssv["combined_confidence"]["overall"]
         vf = self.vector_field()
-        for i in range(len(fwd_flat)-1):
-            z_from = fwd_flat[i]
-            z_to = fwd_flat[i+1]
-            # compute lightweight state for target zone
+        # start zone is observed zone
+        prev_zone = ssv["observed_zone"]
+        for hop in fwd_structured:
+            z_to = hop["zone"]
+            ambiguous = hop.get("ambiguous", False)
+            if ambiguous:
+                # skip learning at this branch point to avoid biasing epistemic weights
+                prev_zone = z_to
+                continue
             an_to = self._cluster(z_to)
             regime_to = an_to["regime"]
             density_to = an_to["node_count"]
             vf_to = vf.get(z_to, {})
             nd_to = vf_to.get("net_direction", 0.0)
             cls_to = vf_to.get("classification", "neutral")
-            # approximate contradiction at target zone using a simplified call
-            # (we don't have full SSV for z_to, but we can compute its contradiction from regime/nd/class)
             cs_to, _ = self._contradiction(regime_to, nd_to, cls_to, ssv.get("mirror_similarity", 0.0))
-            # entropy approximation: use global DNA entropy (zone-level entropy not available)
-            entropy_delta = 0.0
             contradiction_delta = round(cs_to - global_contradiction, 4)
-            # confidence delta: we can't compute full combined confidence for z_to easily,
-            # so we approximate using density and regime stability (simplified)
-            # For now, set confidence delta = 0 (to be enhanced later)
             confidence_delta = 0.0
             why.append({
-                "from": z_from,
+                "from": prev_zone,
                 "to": z_to,
-                "delta_entropy": entropy_delta,
+                "delta_entropy": 0.0,
                 "delta_contradiction": contradiction_delta,
                 "delta_confidence": confidence_delta,
                 "context": {
@@ -1399,18 +1455,16 @@ class MemoryDB:
                     "classification": cls_to
                 }
             })
+            prev_zone = z_to
         return why
 
     def L_reconcile(self, r_output):
-        """Learning operator: consume WHY vectors and update edges."""
         why_vectors = r_output.get("why_vectors", [])
         if not why_vectors:
             return
         for wv in why_vectors:
             z_from = wv["from"]
             z_to = wv["to"]
-            # find the edge between nodes that belong to these zones
-            # We iterate over nodes in the from zone and their links to find an edge pointing to a node in to zone.
             edge = None
             from_nodes = [n for n in self.nodes.values() if n.price_zone == z_from]
             for fn in from_nodes:
@@ -1421,23 +1475,19 @@ class MemoryDB:
                 if edge:
                     break
             if edge is None:
-                # no existing edge; skip (could create a lightweight placeholder, but for now ignore)
                 continue
-            # update running means
             edge.epistemic_count += 1
             n = edge.epistemic_count
-            # Welford
             edge.mu_entropy += (wv["delta_entropy"] - edge.mu_entropy) / n
             edge.mu_contradiction += (wv["delta_contradiction"] - edge.mu_contradiction) / n
             edge.mu_confidence += (wv["delta_confidence"] - edge.mu_confidence) / n
-            # recompute epistemic weight
-            freq_norm = math.tanh(n / 10.0)  # squash frequency
+            freq_norm = math.tanh(n / 10.0)
             edge.epistemic_weight = round(
                 cfg.L_ALPHA * freq_norm +
                 cfg.L_BETA * max(0, edge.mu_confidence) -
                 cfg.L_GAMMA * abs(edge.mu_contradiction), 4)
 
-    # ── build_ssv (unchanged except component spread) ──
+    # ── build_ssv (unchanged except fwd_distributions) ──
 
     def build_ssv(self, results, query, vf=None):
         if not results: return {"error":"No matches found"}
@@ -1461,7 +1511,8 @@ class MemoryDB:
         mir_sim=mir["similarity"]; qp=top.get("price")
         ema=self.ema_sensor(qp) if qp else {"available":False}
         ssv_partial={"internal_regime":regime,"net_flow_direction":nd,"local_density":nc,
-                     "ema_sensor":ema,"fwd_structured":fwd["structured"],"observed_zone":zone,"exit_probability":dom_p}
+                     "ema_sensor":ema,"fwd_distributions":fwd["distributions"],
+                     "observed_zone":zone,"exit_probability":dom_p}
         conv=self.convergence_sensor(ssv_partial)
         cs,ch=self._contradiction(regime,nd,cls,mir_sim,conv.get("anomaly_z"))
         cc=self._combined_conf(status,nc,dna.get("entropy",0.5),dna.get("epistemic",0.5),
@@ -1494,6 +1545,7 @@ class MemoryDB:
              "dominant_exit":dom_z,"exit_probability":dom_p,"exit_direction":dom_dir,"avg_exit_time":avg_st,
              "zone_classification":cls,"net_flow_direction":nd,"flow_magnitude":vfz.get("magnitude",0.0),
              "mirror_similarity":mir_sim,"fwd_flat":fwd["flat"],"fwd_structured":fwd["structured"],
+             "fwd_distributions":fwd["distributions"],
              "arrival_depth":fwd["arrival_depth"],"reliable_horizon":fwd["reliable_horizon"],
              "dna_profile":dna,
              "contradiction_strength":cs,"reconciliation_hint":ch,"combined_confidence":cc,
@@ -1512,7 +1564,6 @@ class MemoryDB:
             ssv["convergence_sensor"] = conv2
         ssv["sensor_notes"] = self._sensor_notes(ssv)
 
-        # Schedule episodes
         if zone:
             if self._cis_trigger(ssv):
                 snap = self._cis_snapshot(ssv)
@@ -1541,16 +1592,13 @@ class MemoryDB:
         return ssv
 
     def reconstruct(self, query):
-        """B→R→L pipeline: search (clean), build SSV, compute WHY vectors, learn."""
         results = self.search(query)
         if not results:
             return {"error": "No matches found"}
         ssv = self.build_ssv(results, query)
-        # R output (trajectory + WHY vectors)
-        fwd_flat = ssv.get("fwd_flat", [])
-        why = self._compute_why_vectors(ssv, fwd_flat)
+        why = self._compute_why_vectors(ssv, ssv.get("fwd_structured", []))
         r_output = {
-            "trajectory": fwd_flat,
+            "trajectory": ssv.get("fwd_flat", []),
             "why_vectors": why,
             "snapshot": {
                 "entropy": ssv["dna_profile"].get("entropy", 0),
@@ -1559,7 +1607,6 @@ class MemoryDB:
             }
         }
         self.last_r_output = r_output
-        # L phase: query reinforcement + epistemic reconciliation
         self._learn_from_query(results)
         self.L_reconcile(r_output)
         return ssv
@@ -1590,12 +1637,9 @@ class MemoryDB:
 
     def structural_report(self, query):
         if not self.nodes: return "  No data loaded."
-        # Use the standard pipeline; R and L are now inside reconstruct()
         ssv = self.reconstruct(query)
         if "error" in ssv:
             return f"  {ssv['error']}"
-        # Get the raw search results again for display? We need them for match scores and NMD.
-        # We can store them in ssv? For now, we'll rerun search (clean, read-only) to get results.
         results = self.search(query)
         vf=self.vector_field()
         dmap=self.distance_map(ssv["observed_zone"])
@@ -1643,13 +1687,35 @@ class MemoryDB:
         row("Avg exit time",f"{ssv['avg_exit_time']} steps" if ssv.get("avg_exit_time") else "N/A")
         row("Recon confidence",ssv["reconstruction_confidence"])
         L.append("")
-        ad=ssv["arrival_depth"]; rh=ssv["reliable_horizon"]
-        L.append(f"  FORWARD TRACE  (echo depth={ad}  horizon={rh})")
-        for hop in ssv["fwd_structured"]:
-            tag="RECON  " if hop["status"]=="RECONSTRUCTION" else "SPEC   "
-            bar="█"*int(hop["confidence"]*20)
-            L.append(f"  {'→':>4} {hop['zone']:<12} [{tag}] conf={hop['confidence']:.3f}  {bar}")
-        if not ssv["fwd_structured"]: L.append("    (insufficient transition history)")
+
+        # Forward trace display (branching, all hops)
+        L.append(f"  FORWARD TRACE  (arrival depth={ssv['arrival_depth']}, horizon={ssv['reliable_horizon']} [informational])")
+        dists = ssv.get("fwd_distributions", [])
+        for i in range(1, len(dists)):
+            hop_dist = dists[i]
+            if not hop_dist:
+                break
+            # sort by probability descending
+            sorted_items = sorted(hop_dist.items(), key=lambda x: x[1], reverse=True)
+            max_prob = sorted_items[0][1]
+            second_prob = sorted_items[1][1] if len(sorted_items) > 1 else 0.0
+            spread = max_prob - second_prob
+            # Branch point detection: spread < threshold and more than one candidate
+            if len(sorted_items) > 1 and spread < cfg.FWD_BRANCH_SPREAD_THRESHOLD:
+                L.append(f"  ⚠  HOP {i} BRANCH POINT (spread={spread:.3f})")
+                for z, p in sorted_items:
+                    st = "RECONSTRUCTION" if p >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
+                    bar = "█"*int(p*20)
+                    L.append(f"     → {z:<12} prob={p:.3f}  [{st}] {bar}")
+            else:
+                # single dominant path
+                z = sorted_items[0][0]
+                p = sorted_items[0][1]
+                st = "RECONSTRUCTION" if p >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
+                bar = "█"*int(p*20)
+                L.append(f"  {'→':>4} {z:<12} [{st}] conf={p:.3f}  {bar}")
+        if not dists or len(dists) <= 1:
+            L.append("    (insufficient transition history)")
 
         sec("SENSORS")
         ema=ssv["ema_sensor"]
@@ -1806,8 +1872,7 @@ class MemoryDB:
         L.append(f"  Dominant: {ssv['dominant_pattern']}  ({ssv['pattern_freq']}x)")
         L.append(f"  Total stored: {len(self.patterns)}")
 
-        # ── EPISTEMIC EDGES (if any have been reconciled) ──
-        # find top 3 edges by epistemic_weight
+        # ── EPISTEMIC EDGES ──
         top_edges = []
         for n in self.nodes.values():
             for lv, e in n.links.items():
@@ -1925,7 +1990,6 @@ class MemoryDB:
                     if lv in self.nodes:
                         e=Edge(ed.get("strength",0.5),hits=ed.get("hits",0),price_delta=ed.get("price_delta"),
                                cross_zone=ed.get("cross_zone",False),transition=ed.get("transition"))
-                        # load epistemic fields if present
                         for k in ("epistemic_count","mu_entropy","mu_contradiction","mu_confidence","epistemic_weight"):
                             if k in ed:
                                 setattr(e, k, ed[k])
@@ -1963,7 +2027,7 @@ def classify(results, db=None):
 
 
 # ─────────────────────────────────────────────
-# CLI (unchanged, added E command)
+# CLI (unchanged)
 # ─────────────────────────────────────────────
 
 def _menu():
@@ -2061,6 +2125,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-          #end#
-          
+          #//end//#

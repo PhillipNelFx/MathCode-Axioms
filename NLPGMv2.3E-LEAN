@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Non-Linear Probabilistic Graph Model (NLPGM) v2.3E-Lean+CIS+++NMD+Phase2
+Non‑Linear Probabilistic Graph Model V2.3EL
 Latent State Reconstruction Engine with Contradiction Insight Sensor,
-NMD hypothesis-space observer, strict B/R/L separation, and
+NMD hypothesis‑space observer, strict B/R/L separation, and
 probabilistic forward trace (branching preserved, learning aware).
-
-Single-file lean build. All LSR mechanisms intact.
+Single‑file lean build. All LSR mechanisms intact.
 NMD is a read‑only meta‑observer; it never influences the reconstruction.
 Phase 2 adds WHY vectors (Ω) on every transition and a separate
 Learning operator (L) that reconciles epistemic deltas into edge weights
@@ -14,12 +13,18 @@ without contaminating the reconstruction (R).
 Forward Trace now correctly preserves the full zone probability
 distribution at each hop rather than collapsing to a greedy path.
 Branch points are explicitly labelled, and learning skips ambiguous hops.
+
+Mathcode‑aligned refinements (v4.4.4 → V2.3EL):
+  • DNA vacuum state labelled VACUUM (cat=0 → identity)
+  • 3‑flag pre‑filter in DNA similarity (primary SYS/DATA/OP)
+  • T13 optimal forward‑trace horizon (dynamic stop)
+  • Axiom‑traceable scale tags in report
 """
 
 import time, math, json, os, shutil, random, hashlib, re
 from dataclasses import dataclass
 
-VERSION = "2.3E-Lean+CIS+++NMD+Phase2"
+VERSION = "V2.3EL"
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -114,6 +119,8 @@ class Config:
     FWD_RECON_PROB_THRESHOLD: float = 0.4
     # Branch detection – spread threshold for ambiguity
     FWD_BRANCH_SPREAD_THRESHOLD: float = 0.15
+    # T13 optimal horizon – stop forward trace when max prob drops below this
+    FWD_MARGINAL_GAIN_MIN: float = 0.15
     SAVE_FILE:   str = "contacts.json"
     BACKUP_FILE: str = "contacts.json.bak"
     TEMP_FILE:   str = "contacts.json.tmp"
@@ -219,7 +226,7 @@ def detect_regime(zone_nodes):
     fa, sa = sum(prices[:h])/h, sum(prices[h:])/h
     return "UP" if sa>fa*1.001 else "DOWN" if sa<fa*0.999 else "SIDEWAYS"
 
-# ── DNA helpers ── (unchanged)
+# ── DNA helpers (vacuum label added) ──
 
 def _expr_cat(text):
     u = text.upper(); words = u.split()
@@ -244,15 +251,25 @@ def express_dna(text, links=None, strand=None, price=None):
         fp  = hashlib.sha256(b"no_links").hexdigest()[:16]
         ps  = "no_paths"
     cats = "+".join(n for b,n in [(1,"SYS"),(2,"DAT"),(4,"OP"),(8,"HUM"),(16,"URG")] if cat&b) or "?"
+    if cat == 0:
+        disp = "00000000|VACUUM"
+    else:
+        disp = f"{cat:08b}|T{strand}|{zone}|{fp[:4]}({cats})"
     return {"category":cat,"strand_type":strand,"price_zone":zone,"fingerprint":fp,"path_signature":ps,
-            "display":f"{cat:08b}|T{strand}|{zone}|{fp[:4]}({cats})"}
+            "display": disp}
 
 def dna_sim(a, b):
     if not a or not b: return 0.0
     s = 0.0
     ca,cb = a.get("category",0), b.get("category",0)
     if ca and cb:
-        s += 0.30*(bin(ca&cb).count("1")/max(bin(ca|cb).count("1"),1))
+        # 3‑flag pre‑filter: if no primary flags shared, skip full Jaccard
+        primary_mask = 1 | 2 | 4   # SYS, DATA, OP
+        if (ca & primary_mask) & (cb & primary_mask) == 0:
+            # no primary overlap → category contribution is zero
+            pass
+        else:
+            s += 0.30*(bin(ca&cb).count("1")/max(bin(ca|cb).count("1"),1))
     ta,tb = a.get("strand_type"), b.get("strand_type")
     if ta is not None and tb is not None and ta!=tb: s += 0.12
     za,zb = a.get("price_zone",""), b.get("price_zone","")
@@ -715,7 +732,6 @@ class MemoryDB:
             r["raw_score"]=round(unc,4); r["total"]=round(min(unc,1.0),4)
             results.append(r)
         results.sort(key=lambda x:x["raw_score"],reverse=True)
-        # NOTE: no hits increment, no edge reinforcement here anymore.
         return results
 
     def _learn_from_query(self, results):
@@ -746,10 +762,10 @@ class MemoryDB:
         s=sorted(all_steps); n=len(s)
         return int(round(s[n//2] if n%2 else (s[n//2-1]+s[n//2])/2))
 
-    # ── PROBABILISTIC FORWARD TRACE (BRANCHING PRESERVED, LEARNING AWARE) ──
+    # ── PROBABILISTIC FORWARD TRACE (with T13 optimal stopping) ──
     def trace_forward(self, start_zone, steps=5):
-        """Returns a probability distribution over zones at each hop,
-           a sampled representative path with ambiguity flags, and the full distributions."""
+        """Returns probability distributions, with dynamic early stopping
+        when the maximum probability in any hop drops below threshold."""
         ad = self.get_arrival_depth(start_zone)
         rh = max(1, ad // 2) if ad > 0 else 1
 
@@ -773,6 +789,11 @@ class MemoryDB:
                 break
             for z in next_dist:
                 next_dist[z] = round(next_dist[z] / total_mass, 4)
+            # T13 optimal stop: if max probability < marginal gain threshold, halt
+            if max(next_dist.values()) < cfg.FWD_MARGINAL_GAIN_MIN:
+                # still record this last distribution for completeness
+                distributions.append(dict(next_dist))
+                break
             distributions.append(dict(next_dist))
             current_dist = next_dist
 
@@ -785,15 +806,14 @@ class MemoryDB:
                 break
             max_prob = max(dist.values())
             top_zones = [z for z, p in dist.items() if p == max_prob]
-            # Determine if this hop is ambiguous (spread < threshold)
             second_prob = 0.0
             if len(top_zones) < len(dist):
                 second_prob = max(p for z, p in dist.items() if z not in top_zones)
             elif len(top_zones) > 1:
-                second_prob = max_prob  # tie
+                second_prob = max_prob
             ambiguous = (max_prob - second_prob) < cfg.FWD_BRANCH_SPREAD_THRESHOLD and len(dist) > 1
 
-            chosen = top_zones[0]  # arbitrary among ties (for path continuity)
+            chosen = top_zones[0]
             prob = dist[chosen]
             status = "RECONSTRUCTION" if prob >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
             structured.append({
@@ -809,7 +829,7 @@ class MemoryDB:
             "flat": flat,
             "structured": structured,
             "arrival_depth": ad,
-            "reliable_horizon": rh,  # informational, not used for status
+            "reliable_horizon": rh,
             "distributions": distributions
         }
 
@@ -996,7 +1016,6 @@ class MemoryDB:
             ec,rp=ema.get("classification"),ema.get("reversion_probability",0.5)
             if ec in ("extended_above","extended_below") and rp>0.5:
                 sensors.append({"name":"ema","direction":-1 if "above" in ec else 1,"confidence":rp})
-        # Forward trace sensor: expectation over hop‑1 distribution
         fwd_dist = ssv.get("fwd_distributions", [])
         if len(fwd_dist) >= 2:
             hop1 = fwd_dist[1]
@@ -1016,7 +1035,6 @@ class MemoryDB:
             fwd_confidence = min(abs(expected_dir), 1.0)
             if fwd_dir != 0:
                 sensors.append({"name":"forward_trace","direction":fwd_dir,"confidence":round(fwd_confidence, 4)})
-        # CIS sensor integration (unchanged)
         cis = ssv.get("cis_sensor", {})
         if cis.get("active") and cis.get("mode") == "historical_resolution" and cis.get("direction"):
             sensors.append({"name":"cis","direction":1 if cis["direction"]=="UP" else -1 if cis["direction"]=="DOWN" else 0,
@@ -1121,7 +1139,6 @@ class MemoryDB:
         if ms2>0.3: inferences.append(f"Mirror symmetry {ms2:.2f}")
         if ds>0.3:  inferences.append(f"DNA {ssv.get('dna_profile',{}).get('dominant_state')}")
         fts=ssv.get("fwd_structured",[])
-        # status strings now use "RECONSTRUCTION"/"SPECULATIVE" (full form)
         rec=[h for h in fts if h["status"]=="RECONSTRUCTION"]
         spe=[h for h in fts if h["status"]=="SPECULATIVE"]
         if rec:  inferences.append(f"Reconstruction: {' → '.join(h['zone'] for h in rec)}")
@@ -1424,13 +1441,11 @@ class MemoryDB:
         dna = self.dna_distribution()
         global_contradiction = ssv.get("contradiction_strength", 0.0)
         vf = self.vector_field()
-        # start zone is observed zone
         prev_zone = ssv["observed_zone"]
         for hop in fwd_structured:
             z_to = hop["zone"]
             ambiguous = hop.get("ambiguous", False)
             if ambiguous:
-                # skip learning at this branch point to avoid biasing epistemic weights
                 prev_zone = z_to
                 continue
             an_to = self._cluster(z_to)
@@ -1650,7 +1665,7 @@ class MemoryDB:
 
         def rule(c="─"): L.append(" "+c*W)
         def hdr(t): L.append(f" ╔{'═'*(W)}╗"); L.append(f" ║  {t:<{W-2}}║"); L.append(f" ╚{'═'*(W)}╝")
-        def sec(t): L.append(""); rule(); L.append(f"  {t}"); rule()
+        def sec(t): L.append(""); rule(); L.append(f"  {t} [Axiomatic]"); rule()
         def row(k,v,w=20): L.append(f"  {k:<{w}} {v}")
 
         hdr(f"NLPGM {VERSION}  ·  LATENT STATE RECONSTRUCTION")
@@ -1688,19 +1703,16 @@ class MemoryDB:
         row("Recon confidence",ssv["reconstruction_confidence"])
         L.append("")
 
-        # Forward trace display (branching, all hops)
         L.append(f"  FORWARD TRACE  (arrival depth={ssv['arrival_depth']}, horizon={ssv['reliable_horizon']} [informational])")
         dists = ssv.get("fwd_distributions", [])
         for i in range(1, len(dists)):
             hop_dist = dists[i]
             if not hop_dist:
                 break
-            # sort by probability descending
             sorted_items = sorted(hop_dist.items(), key=lambda x: x[1], reverse=True)
             max_prob = sorted_items[0][1]
             second_prob = sorted_items[1][1] if len(sorted_items) > 1 else 0.0
             spread = max_prob - second_prob
-            # Branch point detection: spread < threshold and more than one candidate
             if len(sorted_items) > 1 and spread < cfg.FWD_BRANCH_SPREAD_THRESHOLD:
                 L.append(f"  ⚠  HOP {i} BRANCH POINT (spread={spread:.3f})")
                 for z, p in sorted_items:
@@ -1708,7 +1720,6 @@ class MemoryDB:
                     bar = "█"*int(p*20)
                     L.append(f"     → {z:<12} prob={p:.3f}  [{st}] {bar}")
             else:
-                # single dominant path
                 z = sorted_items[0][0]
                 p = sorted_items[0][1]
                 st = "RECONSTRUCTION" if p >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
@@ -2125,4 +2136,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-          #//end//#
+
+                #/end/#

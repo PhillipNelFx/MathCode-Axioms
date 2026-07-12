@@ -1,0 +1,1826 @@
+#!/usr/bin/env python3
+"""
+Visual‑LSR (V_LSR) v0.2 — Hierarchical Structural DNA + Shadow Overlap Sensor
+Empty memory – you build your own prototypes.
+
+Enhancements v0.2:
+  • Shadow‑Guided Tie‑Breaker: uses the passive shadow sensor to resolve close structural ties.
+  • All original code and sensor remain untouched – only decision logic improved.
+
+Enhancements original:
+  • Dual input modes (manual / stroke)
+  • Multi‑scale fingerprint: 11‑bit mask, spectral, geometry, path, regional, node‑profile EMD
+  • Passive shadow‑overlap sensor – displayed alongside recognition, does not affect scoring
+  • Backward‑compatible prototype storage
+  • All original LSR pipeline intact
+
+Controls:
+  Toggle "Stroke Mode" checkbox to switch.
+  
+  Manual mode:
+      Left‑click        place a node
+      Drag node‑to‑node draw an edge
+      Right‑click       delete a node (and its edges)
+      Middle‑click      clear the entire canvas
+
+  Stroke mode:
+      Drag              draw a stroke (released → vectorized and added)
+      Right‑click       delete a node
+      Middle‑click      clear the entire canvas
+
+  Global:
+      Save as Prototype – name the current drawing
+      Reconstruct       run LSR pipeline on current drawing
+      Auto‑Connect toggle – (manual mode only) link new node to 2 nearest neighbours
+"""
+
+import tkinter as tk
+from tkinter import simpledialog, messagebox, Listbox
+import math, json, os, random
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+# ─────────────────────────────────────────────
+# CONFIGURABLE CONSTANTS
+# ─────────────────────────────────────────────
+GRID_SIZE   = 60
+DOT_RADIUS  = 4
+CANVAS_SIZE = 600
+CELL_SIZE   = CANVAS_SIZE // GRID_SIZE
+
+# 11‑bit Mersenne DNA definitions
+DNA_HAS_LOOP               = 1
+DNA_HAS_DIAGONAL           = 2
+DNA_HAS_JUNCTION           = 4
+DNA_HAS_SYMMETRY           = 8
+DNA_HAS_CENTRAL_NODE       = 16
+DNA_IS_TREE                = 32
+DNA_IS_SPARSE              = 64
+DNA_HAS_PENDANT            = 128
+DNA_MULTI_COMPONENT        = 256
+DNA_HIGH_QUADRANT_VARIANCE = 512
+DNA_MULTI_HUB              = 1024
+
+# Weights for the multi‑scale scoring (shadow not included)
+W_MASK        = 0.15
+W_SPECTRAL    = 0.15
+W_GEOMETRY    = 0.15
+W_PATH        = 0.10
+W_REGIONAL    = 0.20
+W_NODE_PROFILE = 0.25
+
+# Confidence weights (multi‑factor)
+CONF_EDGE      = 0.35
+CONF_NODE      = 0.20
+CONF_SPATIAL   = 0.15
+CONF_FEATURE   = 0.30
+
+# --- TUNED CONSTANTS ---
+EDGE_TOLERANCE = 0.05
+CENTRAL_NODE_RADIUS = 0.15
+SYMMETRY_THRESHOLD  = 0.6
+SPARSE_RATIO        = 0.8
+QUADRANT_VARIANCE_THRESHOLD = 2.5
+MULTI_HUB_THRESHOLD = 2
+# -----------------------
+
+AUTO_CONNECT_MAX_DIST = 80
+CONNECTIVITY_DIM = 24
+
+PROTO_FILE = "visual_prototypes.json"
+
+STROKE_MAX_POINTS = 5000
+CURVATURE_WINDOW  = 5
+CORNER_ANGLE_THRESH = 60
+SIMPLIFY_EPSILON   = 5
+SNAP_ENDPOINT_DIST = DOT_RADIUS * 3
+
+N_SPECTRAL_EIGEN = 8
+
+# Shadow sensor parameter (TIGHTENED)
+SHADOW_DILATION = 0.05   # dilation radius as fraction of bbox diagonal
+
+# ─────────────────────────────────────────────
+# EARTH MOVER’S DISTANCE (1D)
+# ─────────────────────────────────────────────
+def emd_distance(a, b):
+    n = len(a)
+    emd = flow = 0.0
+    for i in range(n):
+        diff = a[i] - b[i]
+        flow += diff
+        emd += abs(flow)
+    return emd / n if n else 0.0
+
+def cosine_similarity(a, b):
+    dot = sum(ai*bi for ai,bi in zip(a,b))
+    na = math.sqrt(sum(ai*ai for ai in a))
+    nb = math.sqrt(sum(bi*bi for bi in b))
+    if na==0 or nb==0: return 0.0
+    return dot/(na*nb)
+
+# ─────────────────────────────────────────────
+# CONTOUR DATASTRUCTURE & STROKE‑TO‑CONTOUR
+# ─────────────────────────────────────────────
+@dataclass
+class ContourPoint:
+    x: float
+    y: float
+    tangent: float = 0.0
+    curvature: float = 0.0
+    arclength: float = 0.0
+    point_type: str = "smooth"
+
+def stroke_to_contour(raw_points: List[Tuple[float, float]]) -> List[ContourPoint]:
+    if len(raw_points) < 2:
+        return []
+
+    cumulative = [0.0]
+    for i in range(1, len(raw_points)):
+        dx = raw_points[i][0] - raw_points[i-1][0]
+        dy = raw_points[i][1] - raw_points[i-1][1]
+        cumulative.append(cumulative[-1] + math.hypot(dx, dy))
+    total_len = cumulative[-1] or 1.0
+
+    corner_idx = set()
+    corner_idx.add(0)
+    corner_idx.add(len(raw_points)-1)
+    for i in range(1, len(raw_points)-1):
+        j_back = max(0, i - CURVATURE_WINDOW)
+        j_fwd  = min(len(raw_points)-1, i + CURVATURE_WINDOW)
+        if j_back == i or j_fwd == i:
+            continue
+        dx1 = raw_points[i][0] - raw_points[j_back][0]
+        dy1 = raw_points[i][1] - raw_points[j_back][1]
+        dx2 = raw_points[j_fwd][0] - raw_points[i][0]
+        dy2 = raw_points[j_fwd][1] - raw_points[i][1]
+        norm1 = math.hypot(dx1, dy1)
+        norm2 = math.hypot(dx2, dy2)
+        if norm1 < 1e-6 or norm2 < 1e-6:
+            continue
+        dot = (dx1*dx2 + dy1*dy2) / (norm1 * norm2)
+        dot = max(-1.0, min(1.0, dot))
+        angle = math.degrees(math.acos(dot))
+        if angle >= CORNER_ANGLE_THRESH:
+            corner_idx.add(i)
+
+    def rdp(points, epsilon):
+        if len(points) < 3:
+            return points
+        dmax = 0.0
+        index = 0
+        end = len(points)-1
+        for i in range(1, end):
+            d = _perpendicular_distance(points[i], points[0], points[end])
+            if d > dmax:
+                index = i
+                dmax = d
+        if dmax > epsilon:
+            left = rdp(points[:index+1], epsilon)
+            right = rdp(points[index:], epsilon)
+            return left[:-1] + right
+        else:
+            return [points[0], points[-1]]
+
+    def _perpendicular_distance(pt, line_start, line_end):
+        x0, y0 = pt
+        x1, y1 = line_start
+        x2, y2 = line_end
+        num = abs((y2-y1)*x0 - (x2-x1)*y0 + x2*y1 - y2*x1)
+        den = math.hypot(y2-y1, x2-x1)
+        return num / den if den else 0.0
+
+    corner_list = sorted(corner_idx)
+    simplified_points = []
+    for k in range(len(corner_list)-1):
+        seg_start = corner_list[k]
+        seg_end   = corner_list[k+1]
+        segment = raw_points[seg_start:seg_end+1]
+        seg_simpl = rdp(segment, SIMPLIFY_EPSILON)
+        if simplified_points and seg_simpl[0] == simplified_points[-1]:
+            simplified_points.extend(seg_simpl[1:])
+        else:
+            simplified_points.extend(seg_simpl)
+    if len(simplified_points) < 2:
+        simplified_points = [raw_points[0], raw_points[-1]]
+
+    arc = [0.0]
+    for i in range(1, len(simplified_points)):
+        dx = simplified_points[i][0] - simplified_points[i-1][0]
+        dy = simplified_points[i][1] - simplified_points[i-1][1]
+        arc.append(arc[-1] + math.hypot(dx, dy))
+    tot = arc[-1] or 1.0
+
+    contour = []
+    for i, pt in enumerate(simplified_points):
+        x, y = pt
+        if i == 0:
+            dx = simplified_points[1][0] - x
+            dy = simplified_points[1][1] - y
+            tangent = math.atan2(dy, dx)
+        elif i == len(simplified_points)-1:
+            dx = x - simplified_points[i-1][0]
+            dy = y - simplified_points[i-1][1]
+            tangent = math.atan2(dy, dx)
+        else:
+            dx1 = x - simplified_points[i-1][0]
+            dy1 = y - simplified_points[i-1][1]
+            dx2 = simplified_points[i+1][0] - x
+            dy2 = simplified_points[i+1][1] - y
+            a1 = math.atan2(dy1, dx1)
+            a2 = math.atan2(dy2, dx2)
+            avg_x = math.cos(a1) + math.cos(a2)
+            avg_y = math.sin(a1) + math.sin(a2)
+            tangent = math.atan2(avg_y, avg_x)
+        if i == 0 or i == len(simplified_points)-1:
+            curvature = 0.0
+        else:
+            dx_back = x - simplified_points[i-1][0]
+            dy_back = y - simplified_points[i-1][1]
+            dx_fwd = simplified_points[i+1][0] - x
+            dy_fwd = simplified_points[i+1][1] - y
+            a_back = math.atan2(dy_back, dx_back)
+            a_fwd  = math.atan2(dy_fwd, dx_fwd)
+            da = a_fwd - a_back
+            while da > math.pi: da -= 2*math.pi
+            while da < -math.pi: da += 2*math.pi
+            dist = (math.hypot(dx_back, dy_back) + math.hypot(dx_fwd, dy_fwd)) / 2
+            curvature = da / max(dist, 1e-6)
+        al_ratio = arc[i] / tot
+        if i == 0 or i == len(simplified_points)-1:
+            ptype = "endpoint"
+        elif any(abs(simplified_points[i][0] - raw_points[c][0]) < 1 and
+                 abs(simplified_points[i][1] - raw_points[c][1]) < 1
+                 for c in corner_idx):
+            ptype = "corner"
+        else:
+            ptype = "smooth"
+        contour.append(ContourPoint(x, y, tangent, curvature, al_ratio, ptype))
+    return contour
+
+def contour_to_graph(contour: List[ContourPoint],
+                     existing_graph: 'Graph' = None) -> 'Graph':
+    graph = Graph()
+    if existing_graph is not None:
+        for n in existing_graph.nodes:
+            graph.add_node(*n)
+            if n in existing_graph.node_metadata:
+                graph.node_metadata[n] = existing_graph.node_metadata[n].copy()
+        for e in existing_graph.edges:
+            a, b = list(e)
+            graph.add_edge(a[0], a[1], b[0], b[1])
+
+    if not contour:
+        return graph
+
+    nodes = []
+    for i, cp in enumerate(contour):
+        node = (cp.x, cp.y)
+        if existing_graph and i in (0, len(contour)-1):
+            best_node = None
+            best_dist = SNAP_ENDPOINT_DIST
+            for n in existing_graph.nodes:
+                d = math.hypot(cp.x - n[0], cp.y - n[1])
+                if d < best_dist:
+                    best_dist = d
+                    best_node = n
+            if best_node:
+                nodes.append(best_node)
+                continue
+
+        graph.add_node(*node)
+        graph.node_metadata[node] = {
+            'tangent': cp.tangent,
+            'curvature': cp.curvature,
+            'arclength': cp.arclength,
+            'type': cp.point_type
+        }
+        nodes.append(node)
+
+    for i in range(len(nodes)-1):
+        graph.add_edge(nodes[i][0], nodes[i][1], nodes[i+1][0], nodes[i+1][1])
+
+    return graph
+
+# ─────────────────────────────────────────────
+# 1. GRAPH DATA STRUCTURE (original + fingerprint + shadow sensor)
+# ─────────────────────────────────────────────
+class Graph:
+    def __init__(self):
+        self.nodes = set()
+        self.edges = set()
+        self.node_metadata = {}
+        self._normalized_cache = None
+        self._pca_data = None
+
+    def add_node(self, x, y):
+        self.nodes.add((x, y))
+        self._invalidate_cache()
+
+    def add_edge(self, x1, y1, x2, y2):
+        if (x1, y1) == (x2, y2): return
+        self.add_node(x1, y1)
+        self.add_node(x2, y2)
+        self.edges.add(frozenset({(x1, y1), (x2, y2)}))
+        self._invalidate_cache()
+
+    def remove_node(self, x, y):
+        n = (x, y)
+        self.nodes.discard(n)
+        self.edges = {e for e in self.edges if n not in e}
+        self.node_metadata.pop(n, None)
+        self._invalidate_cache()
+
+    def clear(self):
+        self.nodes.clear()
+        self.edges.clear()
+        self.node_metadata.clear()
+        self._invalidate_cache()
+
+    def _invalidate_cache(self):
+        self._normalized_cache = None
+        self._pca_data = None
+
+    def _compute_pca(self):
+        if self._pca_data is not None:
+            return self._pca_data
+        if not self.nodes:
+            self._pca_data = (0.0, False, False, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0)
+            return self._pca_data
+
+        xs = [n[0] for n in self.nodes]
+        ys = [n[1] for n in self.nodes]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+
+        cov_xx = sum((x - cx) ** 2 for x in xs) / len(xs)
+        cov_yy = sum((y - cy) ** 2 for y in ys) / len(ys)
+        cov_xy = sum((x - cx) * (y - cy) for x, y in zip(xs, ys)) / len(xs)
+
+        trace = cov_xx + cov_yy
+        det = cov_xx * cov_yy - cov_xy * cov_xy
+        lambda1 = trace / 2 + math.sqrt(max(0, trace * trace / 4 - det))
+
+        if abs(cov_xy) < 1e-9:
+            vx, vy = (1.0, 0.0) if cov_xx >= cov_yy else (0.0, 1.0)
+        else:
+            vx = cov_xy
+            vy = lambda1 - cov_xx
+            norm = math.hypot(vx, vy)
+            vx /= norm
+            vy /= norm
+
+        if vx < 0 or (vx == 0 and vy < 0):
+            vx, vy = -vx, -vy
+
+        angle = math.atan2(vy, vx)
+        rotated = []
+        for (x, y) in self.nodes:
+            rx = (x - cx) * math.cos(-angle) - (y - cy) * math.sin(-angle)
+            ry = (x - cx) * math.sin(-angle) + (y - cy) * math.cos(-angle)
+            rotated.append((rx, ry))
+
+        rxs = [p[0] for p in rotated]
+        rys = [p[1] for p in rotated]
+        skew_x = sum(rx ** 3 for rx in rxs)
+        skew_y = sum(ry ** 3 for ry in rys)
+
+        flip_x = skew_x < 0
+        flip_y = skew_y < 0
+
+        if flip_x:
+            rxs = [-rx for rx in rxs]
+        if flip_y:
+            rys = [-ry for ry in rys]
+
+        min_rx, max_rx = min(rxs), max(rxs)
+        min_ry, max_ry = min(rys), max(rys)
+        scale = max(max_rx - min_rx, max_ry - min_ry, 1)
+
+        self._pca_data = (angle, flip_x, flip_y, min_rx, max_rx, min_ry, max_ry, scale, cx, cy)
+        return self._pca_data
+
+    def normalised(self):
+        if self._normalized_cache is not None:
+            return self._normalized_cache
+        if not self.nodes:
+            self._normalized_cache = Graph()
+            return self._normalized_cache
+
+        angle, flip_x, flip_y, min_rx, max_rx, min_ry, max_ry, scale, cx, cy = self._compute_pca()
+        ng = Graph()
+
+        for (x, y) in self.nodes:
+            rx = (x - cx) * math.cos(-angle) - (y - cy) * math.sin(-angle)
+            ry = (x - cx) * math.sin(-angle) + (y - cy) * math.cos(-angle)
+            if flip_x: rx = -rx
+            if flip_y: ry = -ry
+            nx = (rx - min_rx) / scale
+            ny = (ry - min_ry) / scale
+            ng.add_node(nx, ny)
+            if (x, y) in self.node_metadata:
+                ng.node_metadata[(nx, ny)] = self.node_metadata[(x, y)]
+
+        for e in self.edges:
+            (x1, y1), (x2, y2) = e
+            rx1 = (x1 - cx) * math.cos(-angle) - (y1 - cy) * math.sin(-angle)
+            ry1 = (x1 - cx) * math.sin(-angle) + (y1 - cy) * math.cos(-angle)
+            rx2 = (x2 - cx) * math.cos(-angle) - (y2 - cy) * math.sin(-angle)
+            ry2 = (x2 - cx) * math.sin(-angle) + (y2 - cy) * math.cos(-angle)
+            if flip_x:
+                rx1, rx2 = -rx1, -rx2
+            if flip_y:
+                ry1, ry2 = -ry1, -ry2
+            nx1 = (rx1 - min_rx) / scale
+            ny1 = (ry1 - min_ry) / scale
+            nx2 = (rx2 - min_rx) / scale
+            ny2 = (ry2 - min_ry) / scale
+            ng.add_edge(nx1, ny1, nx2, ny2)
+
+        self._normalized_cache = ng
+        return ng
+
+    def denormalize_point(self, nx, ny):
+        if not self.nodes:
+            return nx, ny
+        angle, flip_x, flip_y, min_rx, max_rx, min_ry, max_ry, scale, cx, cy = self._compute_pca()
+        rx = nx * scale + min_rx
+        ry = ny * scale + min_ry
+        if flip_y:
+            ry = -ry
+        if flip_x:
+            rx = -rx
+        ox = rx * math.cos(angle) - ry * math.sin(angle) + cx
+        oy = rx * math.sin(angle) + ry * math.cos(angle) + cy
+        return ox, oy
+
+    # ── graph properties (unchanged) ──
+    def degree(self, node):
+        return sum(1 for e in self.edges if node in e)
+
+    def connected_components(self):
+        visited = set()
+        comps = []
+        for n in self.nodes:
+            if n not in visited:
+                stack = [n]
+                comp = set()
+                while stack:
+                    v = stack.pop()
+                    if v in visited:
+                        continue
+                    visited.add(v)
+                    comp.add(v)
+                    for e in self.edges:
+                        if v in e:
+                            other = next(iter(e - {v}))
+                            if other not in visited:
+                                stack.append(other)
+                comps.append(comp)
+        return comps
+
+    def component_count(self):
+        return len(self.connected_components())
+
+    def _adjacency_list(self):
+        adj = {n: set() for n in self.nodes}
+        for e in self.edges:
+            a, b = e
+            adj[a].add(b)
+            adj[b].add(a)
+        return adj
+
+    def has_cycle(self):
+        visited = set()
+        for start in self.nodes:
+            if start in visited:
+                continue
+            stack = [(start, None)]
+            parent = {}
+            while stack:
+                v, p = stack.pop()
+                if v in visited:
+                    continue
+                visited.add(v)
+                parent[v] = p
+                for e in self.edges:
+                    if v in e:
+                        other = next(iter(e - {v}))
+                        if other == p:
+                            continue
+                        if other in visited:
+                            return True
+                        stack.append((other, v))
+        return False
+
+    def has_diagonal(self):
+        for (x1, y1), (x2, y2) in self._edge_pairs():
+            if x1 != x2 and y1 != y2:
+                return True
+        return False
+
+    def has_junction(self):
+        return any(self.degree(n) >= 3 for n in self.nodes)
+
+    def hub_count(self):
+        return sum(1 for n in self.nodes if self.degree(n) >= 3)
+
+    def symmetry_score(self):
+        if not self.nodes:
+            return 0.0
+        xs = [n[0] for n in self.nodes]
+        mid_x = (min(xs) + max(xs)) / 2
+        left = {n for n in self.nodes if n[0] < mid_x}
+        right = {n for n in self.nodes if n[0] > mid_x}
+        if not left or not right:
+            return 0.0
+        mirrored = {(mid_x + (mid_x - x), y) for (x, y) in left}
+        return len(mirrored & right) / max(len(mirrored), len(right))
+
+    def _edge_pairs(self):
+        for e in self.edges:
+            yield tuple(e)
+
+    def has_central_node(self):
+        if not self.nodes:
+            return False
+        xs = [n[0] for n in self.nodes]
+        ys = [n[1] for n in self.nodes]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        return any(math.hypot(n[0] - cx, n[1] - cy) < CENTRAL_NODE_RADIUS for n in self.nodes)
+
+    def is_tree(self):
+        return (len(self.edges) == len(self.nodes) - 1
+                and not self.has_cycle()
+                and len(self.connected_components()) == 1)
+
+    def is_sparse(self):
+        return len(self.edges) < SPARSE_RATIO * len(self.nodes)
+
+    def has_pendant(self):
+        return any(self.degree(n) == 1 for n in self.nodes)
+
+    def quadrant_density_variance(self):
+        if not self.nodes:
+            return 1.0
+        xs = [n[0] for n in self.nodes]
+        ys = [n[1] for n in self.nodes]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        mid_x = (min_x + max_x) / 2
+        mid_y = (min_y + max_y) / 2
+        quads = [0, 0, 0, 0]
+        for x, y in zip(xs, ys):
+            if x < mid_x:
+                if y < mid_y:
+                    quads[0] += 1
+                else:
+                    quads[1] += 1
+            else:
+                if y < mid_y:
+                    quads[2] += 1
+                else:
+                    quads[3] += 1
+        max_q = max(quads)
+        min_q = max(1, min(quads))
+        return max_q / min_q
+
+    def _infer_metadata_for_node(self, node):
+        deg = self.degree(node)
+        angles = []
+        for e in self.edges:
+            if node in e:
+                other = next(iter(e - {node}))
+                dx = other[0] - node[0]
+                dy = other[1] - node[1]
+                angles.append(math.atan2(dy, dx))
+        if not angles:
+            return {'tangent': 0.0, 'curvature': 0.0, 'arclength': 0.0, 'type': 'smooth'}
+        avg_x = sum(math.cos(a) for a in angles)
+        avg_y = sum(math.sin(a) for a in angles)
+        tangent = math.atan2(avg_y, avg_x)
+        curvature = 0.0
+        if deg == 2:
+            a1, a2 = angles
+            da = a2 - a1
+            while da > math.pi: da -= 2*math.pi
+            while da < -math.pi: da += 2*math.pi
+            lens = []
+            for e in self.edges:
+                if node in e:
+                    other = next(iter(e - {node}))
+                    lens.append(math.hypot(other[0]-node[0], other[1]-node[1]))
+            avg_len = sum(lens) / len(lens) if lens else 1.0
+            curvature = da / avg_len
+        arclength = 0.0
+        if deg == 1:
+            ptype = 'endpoint'
+        elif deg == 2 and abs(curvature) > 0.5:
+            ptype = 'corner'
+        elif deg >= 3:
+            ptype = 'junction'
+        else:
+            ptype = 'smooth'
+        return {'tangent': tangent, 'curvature': curvature, 'arclength': arclength, 'type': ptype}
+
+    def node_profiles(self):
+        if not self.nodes:
+            return []
+        xs = [n[0] for n in self.nodes]
+        ys = [n[1] for n in self.nodes]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        profiles = []
+        for n in self.nodes:
+            meta = self.node_metadata.get(n)
+            if meta is None:
+                meta = self._infer_metadata_for_node(n)
+                self.node_metadata[n] = meta
+
+            d = self.degree(n)
+            dist = math.hypot(n[0] - cx, n[1] - cy)
+
+            angles = []
+            for e in self.edges:
+                if n in e:
+                    other = next(iter(e - {n}))
+                    angles.append(math.atan2(other[1] - n[1], other[0] - n[0]))
+            angle_bins = [0] * 8
+            for a in angles:
+                a = (a + 2 * math.pi) % (2 * math.pi)
+                idx = int(a / (math.pi / 4)) % 8
+                angle_bins[idx] += 1
+            total = len(angles) or 1
+            angle_bins = [x / total for x in angle_bins]
+
+            tangent = meta['tangent']
+            t_angle = (tangent + 2 * math.pi) % (2 * math.pi)
+            t_bins = [0] * 8
+            t_idx = int(t_angle / (math.pi / 4)) % 8
+            t_bins[t_idx] = 1.0
+
+            curv = max(-1.0, min(1.0, meta['curvature'] * 0.5))
+            al = meta['arclength']
+
+            type_onehot = [0, 0, 0, 0]
+            ptype = meta['type']
+            if ptype == 'endpoint':
+                type_onehot[0] = 1
+            elif ptype == 'corner':
+                type_onehot[1] = 1
+            elif ptype == 'smooth':
+                type_onehot[2] = 1
+            elif ptype == 'junction':
+                type_onehot[3] = 1
+
+            vec = [d / 4.0, dist] + angle_bins + t_bins + [curv, al] + type_onehot
+            profiles.append((n, vec))
+        return profiles
+
+    def shape_descriptors(self):
+        norm = self.normalised()
+        n = len(norm.nodes)
+        if n == 0:
+            return [0.0, 0.0, 0.0]
+        xs = [n[0] for n in norm.nodes]
+        ys = [n[1] for n in norm.nodes]
+        width = max(xs) - min(xs) + 1e-9
+        height = max(ys) - min(ys) + 1e-9
+        aspect = min(width, height) / max(width, height)
+        pts = sorted(norm.nodes)
+        if len(pts) <= 2:
+            hull_ratio = 1.0
+        else:
+            upper = []
+            for p in pts:
+                while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                    upper.pop()
+                upper.append(p)
+            lower = []
+            for p in reversed(pts):
+                while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                    lower.pop()
+                lower.append(p)
+            hull = set(upper[:-1] + lower[:-1])
+            hull_ratio = len(hull) / n
+        corners = 0
+        for node in norm.nodes:
+            if norm.degree(node) == 2:
+                neighbors = []
+                for e in norm.edges:
+                    if node in e:
+                        other = next(iter(e - {node}))
+                        neighbors.append(other)
+                if len(neighbors) == 2:
+                    v1 = (neighbors[0][0] - node[0], neighbors[0][1] - node[1])
+                    v2 = (neighbors[1][0] - node[0], neighbors[1][1] - node[1])
+                    dot = v1[0] * v2[0] + v1[1] * v2[1]
+                    norm1 = math.hypot(*v1)
+                    norm2 = math.hypot(*v2)
+                    if norm1 * norm2:
+                        cosang = max(-1, min(1, dot / (norm1 * norm2)))
+                        angle = math.acos(cosang)
+                        if angle > math.radians(45):
+                            corners += 1
+        corner_ratio = corners / max(n, 1)
+        return [hull_ratio, aspect, corner_ratio]
+
+    def to_dict(self):
+        nodes_list = []
+        for n in self.nodes:
+            meta = self.node_metadata.get(n, {})
+            nodes_list.append({"x": n[0], "y": n[1], "meta": meta})
+        return {"nodes": nodes_list, "edges": [list(e) for e in self.edges]}
+
+    @staticmethod
+    def from_dict(d):
+        g = Graph()
+        for nd in d["nodes"]:
+            x, y = nd["x"], nd["y"]
+            g.add_node(x, y)
+            if "meta" in nd:
+                g.node_metadata[(x, y)] = nd["meta"]
+        for e in d["edges"]:
+            g.add_edge(e[0][0], e[0][1], e[1][0], e[1][1])
+        return g
+
+    # -----------------------------------------------------------------
+    # FINGERPRINT EXTRACTION METHODS (unchanged)
+    # -----------------------------------------------------------------
+    def _laplacian_matrix(self, normalized=False):
+        nodes = sorted(self.nodes)
+        n = len(nodes)
+        if n == 0:
+            return [], nodes
+        idx = {node: i for i, node in enumerate(nodes)}
+        L = [[0.0]*n for _ in range(n)]
+        for i, node in enumerate(nodes):
+            d = self.degree(node)
+            L[i][i] = d
+            for e in self.edges:
+                if node in e:
+                    other = next(iter(e - {node}))
+                    j = idx[other]
+                    L[i][j] = -1
+        if normalized:
+            for i in range(n):
+                if L[i][i] > 0:
+                    factor = 1.0 / math.sqrt(L[i][i])
+                    for j in range(n):
+                        L[i][j] *= factor
+                    for j in range(n):
+                        L[j][i] *= factor
+        return L, nodes
+
+    def _power_iteration_eigen(self, A, max_iter=100, tol=1e-6):
+        n = len(A)
+        v = [random.random() for _ in range(n)]
+        norm = math.sqrt(sum(x*x for x in v))
+        v = [x/norm for x in v]
+        for _ in range(max_iter):
+            w = [sum(A[i][j]*v[j] for j in range(n)) for i in range(n)]
+            lam = sum(v[i]*w[i] for i in range(n))
+            norm = math.sqrt(sum(x*x for x in w))
+            if norm < 1e-12:
+                break
+            v_new = [x/norm for x in w]
+            diff = math.sqrt(sum((v_new[i]-v[i])**2 for i in range(n)))
+            v = v_new
+            if diff < tol:
+                break
+        return lam, v
+
+    def spectral_fingerprint(self, k=N_SPECTRAL_EIGEN):
+        n = len(self.nodes)
+        if n < 2:
+            return [0.0]*k
+        L, nodes = self._laplacian_matrix(normalized=True)
+        if not L:
+            return [0.0]*k
+        evals = []
+        A = [row[:] for row in L]
+        for _ in range(min(k, n)):
+            lam, v = self._power_iteration_eigen(A)
+            evals.append(lam)
+            for i in range(n):
+                for j in range(n):
+                    A[i][j] -= lam * v[i] * v[j]
+        while len(evals) < k:
+            evals.append(0.0)
+        max_ev = max(evals) if evals else 1.0
+        if max_ev == 0: max_ev = 1.0
+        return [ev / max_ev for ev in evals]
+
+    def geometry_fingerprint(self):
+        norm = self.normalised()
+        n = len(norm.nodes)
+        if n == 0:
+            return [0.0]*17
+        lengths = []
+        angles = []
+        for (x1,y1),(x2,y2) in norm._edge_pairs():
+            dx, dy = x2-x1, y2-y1
+            lengths.append(math.hypot(dx, dy))
+            angles.append(math.atan2(dy, dx))
+        len_bins = [0]*8
+        max_len = max(lengths) if lengths else 1.0
+        for l in lengths:
+            idx = min(int(l/max_len * 7.999), 7)
+            len_bins[idx] += 1
+        total = len(lengths) or 1
+        len_bins = [x/total for x in len_bins]
+        ang_bins = [0]*8
+        for a in angles:
+            a = (a + 2*math.pi) % (2*math.pi)
+            idx = int(a / (math.pi/4)) % 8
+            ang_bins[idx] += 1
+        ang_bins = [x/total for x in ang_bins]
+        sdesc = norm.shape_descriptors()
+        aspect = sdesc[1] if len(sdesc)>1 else 0.0
+        return len_bins + ang_bins + [aspect]
+
+    def path_fingerprint(self):
+        comps = self.connected_components()
+        if not comps:
+            return [0.0, 0.0, 0.0]
+        diameters = []
+        avg_paths = []
+        for comp in comps:
+            nodes = list(comp)
+            n = len(nodes)
+            if n < 2:
+                continue
+            max_dist = 0
+            total_dist = 0
+            for start in nodes:
+                dist = {node: float('inf') for node in comp}
+                dist[start] = 0
+                queue = [start]
+                while queue:
+                    v = queue.pop(0)
+                    for e in self.edges:
+                        if v in e:
+                            other = next(iter(e - {v}))
+                            if other in comp and dist[other] == float('inf'):
+                                dist[other] = dist[v] + 1
+                                queue.append(other)
+                d_max = max(dist.values())
+                total = sum(dist.values())
+                max_dist = max(max_dist, d_max)
+                total_dist += total
+            diameters.append(max_dist)
+            num_pairs = n*(n-1)/2
+            avg_paths.append(total_dist / (2*num_pairs) if num_pairs>0 else 0)
+        overall_diameter = max(diameters) if diameters else 1
+        overall_avg_path = sum(avg_paths)/len(avg_paths) if avg_paths else 0
+        n_nodes = len(self.nodes)
+        branching = len(self.edges) / n_nodes if n_nodes else 0
+        diam_norm = min(overall_diameter / max(n_nodes,1), 1.0)
+        avg_norm  = min(overall_avg_path / max(n_nodes,1), 1.0)
+        branch_norm = min(branching / 3.0, 1.0)
+        return [diam_norm, avg_norm, branch_norm]
+
+    def regional_profile_fingerprint(self):
+        profiles = [vec for _, vec in self.node_profiles()]
+        if not profiles:
+            return [0.0]*46
+        mean_vec = [sum(col)/len(profiles) for col in zip(*profiles)]
+        std_vec = [math.sqrt(sum((x-m)**2 for x in col)/len(profiles)) for col,m in zip(zip(*profiles), mean_vec)]
+        return mean_vec + std_vec
+
+    def compute_structural_fingerprint(self) -> Dict:
+        return {
+            'dna_mask': compute_dna_mask(self),
+            'dna_vec': compute_dna_vec(self),
+            'spectral': self.spectral_fingerprint(),
+            'geometry': self.geometry_fingerprint(),
+            'path': self.path_fingerprint(),
+            'regional': self.regional_profile_fingerprint(),
+        }
+
+    # -----------------------------------------------------------------
+    # SHADOW SENSOR HELPERS
+    # -----------------------------------------------------------------
+    def boundary_points(self) -> List[Tuple[float, float]]:
+        """
+        Return an ordered list of points representing the outer boundary.
+        If the graph is a single connected component, traverse edges to form a loop.
+        For multiple components, use convex hull of all nodes.
+        """
+        if not self.nodes:
+            return []
+        comps = self.connected_components()
+        if len(comps) == 1:
+            # Try to extract a single loop (if graph is 2‑regular)
+            # Otherwise fall back to convex hull
+            nodes_set = comps[0]
+            # Check if every node has degree 2 (single cycle) or degree ≤2 (path/cycle)
+            degrees = {n: self.degree(n) for n in nodes_set}
+            if all(d == 2 for d in degrees.values()):
+                # It's a single cycle, extract by walking
+                start = next(iter(nodes_set))
+                path = []
+                current = start
+                prev = None
+                while True:
+                    path.append(current)
+                    neighbors = []
+                    for e in self.edges:
+                        if current in e:
+                            other = next(iter(e - {current}))
+                            neighbors.append(other)
+                    # choose the neighbor that is not prev
+                    next_node = neighbors[0] if neighbors[0] != prev else (neighbors[1] if len(neighbors)>1 else None)
+                    if next_node is None:
+                        break
+                    prev, current = current, next_node
+                    if current == start:
+                        path.append(start)
+                        break
+                return path
+            elif all(d <= 2 for d in degrees.values()):
+                # It's a path or collection of paths – build boundary by ordering nodes
+                # Find endpoint(s) and walk
+                endpoints = [n for n, d in degrees.items() if d == 1]
+                if endpoints:
+                    start = endpoints[0]
+                    path = []
+                    current = start
+                    prev = None
+                    while True:
+                        path.append(current)
+                        neighbors = []
+                        for e in self.edges:
+                            if current in e:
+                                other = next(iter(e - {current}))
+                                neighbors.append(other)
+                        next_node = None
+                        for nb in neighbors:
+                            if nb != prev:
+                                next_node = nb
+                                break
+                        if next_node is None:
+                            break
+                        prev, current = current, next_node
+                    # If there's a second component? not relevant
+                    return path
+                else:
+                    # isolated nodes – just return hull
+                    pass
+        # Default: convex hull of all nodes
+        pts = list(self.nodes)
+        if len(pts) <= 2:
+            return pts
+        # sort points for Graham scan
+        def cross(o, a, b):
+            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+        pts = sorted(pts)
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        return lower[:-1] + upper[:-1]
+
+# ─────────────────────────────────────────────
+# DNA helpers (unchanged)
+# ─────────────────────────────────────────────
+def compute_dna_mask(graph):
+    norm = graph.normalised()
+    mask = 0
+    if norm.has_cycle(): mask |= DNA_HAS_LOOP
+    if norm.has_diagonal(): mask |= DNA_HAS_DIAGONAL
+    if norm.has_junction(): mask |= DNA_HAS_JUNCTION
+    if norm.symmetry_score() > SYMMETRY_THRESHOLD: mask |= DNA_HAS_SYMMETRY
+    if norm.has_central_node(): mask |= DNA_HAS_CENTRAL_NODE
+    if norm.is_tree(): mask |= DNA_IS_TREE
+    if norm.is_sparse(): mask |= DNA_IS_SPARSE
+    if norm.has_pendant(): mask |= DNA_HAS_PENDANT
+    if norm.component_count() >= 2: mask |= DNA_MULTI_COMPONENT
+    if norm.quadrant_density_variance() >= QUADRANT_VARIANCE_THRESHOLD: mask |= DNA_HIGH_QUADRANT_VARIANCE
+    if norm.hub_count() >= MULTI_HUB_THRESHOLD: mask |= DNA_MULTI_HUB
+    return mask
+
+def compute_dna_vec(graph):
+    norm = graph.normalised()
+    n_nodes = len(norm.nodes)
+    n_edges = len(norm.edges)
+    avg_deg = (2 * n_edges / n_nodes) if n_nodes else 0
+    comps = norm.component_count()
+    sym = norm.symmetry_score()
+    max_deg = max((norm.degree(n) for n in norm.nodes), default=0)
+    lengths = []
+    for (x1,y1),(x2,y2) in norm._edge_pairs():
+        dx, dy = x2-x1, y2-y1
+        lengths.append(math.hypot(dx, dy))
+    avg_len = sum(lengths)/len(lengths) if lengths else 0
+    len_var = sum((l-avg_len)**2 for l in lengths)/len(lengths) if lengths else 0
+    return [n_nodes, n_edges, avg_deg, comps, sym, max_deg, avg_len, len_var]
+
+def compute_dna(graph):
+    return compute_dna_mask(graph), compute_dna_vec(graph)
+
+def connectivity_features(graph):
+    norm = graph.normalised()
+    n = len(norm.nodes)
+    if n == 0:
+        return [0.0] * CONNECTIVITY_DIM
+
+    degrees = [norm.degree(node) for node in norm.nodes]
+    deg_bins = [0] * 6
+    for d in degrees:
+        deg_bins[min(d, 5)] += 1
+    deg_bins = [x / n for x in deg_bins]
+
+    lengths = []
+    angles = []
+    for (x1, y1), (x2, y2) in norm._edge_pairs():
+        dx, dy = x2 - x1, y2 - y1
+        lengths.append(math.hypot(dx, dy))
+        angles.append(math.atan2(dy, dx))
+    len_bins = [0] * 3
+    for l in lengths:
+        if l < 0.3: len_bins[0] += 1
+        elif l < 0.7: len_bins[1] += 1
+        else: len_bins[2] += 1
+    total_edges = len(lengths) or 1
+    len_bins = [x / total_edges for x in len_bins]
+
+    ang_bins = [0] * 8
+    for a in angles:
+        a = (a + 2 * math.pi) % (2 * math.pi)
+        idx = int(a / (math.pi / 4)) % 8
+        ang_bins[idx] += 1
+    ang_bins = [x / total_edges for x in ang_bins]
+
+    xs = [n[0] for n in norm.nodes]
+    ys = [n[1] for n in norm.nodes]
+    cx = sum(xs) / n
+    cy = sum(ys) / n
+    dists = [math.hypot(x - cx, y - cy) for x, y in zip(xs, ys)]
+    rad_bins = [0] * 3
+    max_dist = max(dists) or 1
+    for d in dists:
+        if d < 0.3 * max_dist: rad_bins[0] += 1
+        elif d < 0.7 * max_dist: rad_bins[1] += 1
+        else: rad_bins[2] += 1
+    rad_bins = [x / n for x in rad_bins]
+
+    adj = norm._adjacency_list()
+    tri_total = 0
+    for node in norm.nodes:
+        neighbors = list(adj[node])
+        for i in range(len(neighbors)):
+            for j in range(i + 1, len(neighbors)):
+                if neighbors[j] in adj[neighbors[i]]:
+                    tri_total += 1
+    avg_tri = tri_total / n if n else 0
+
+    comp_count = norm.component_count()
+    quad_var = norm.quadrant_density_variance()
+    hubs = norm.hub_count()
+
+    comp_norm = min(comp_count / 5.0, 1.0)
+    hub_norm = min(hubs / 5.0, 1.0)
+    quad_norm = min(quad_var / 10.0, 1.0)
+
+    result = (deg_bins + len_bins + ang_bins + rad_bins + [avg_tri]
+              + [comp_norm, quad_norm, hub_norm])
+    return result
+
+def node_profile_similarity(graph_a, graph_b):
+    prof_a = graph_a.node_profiles()
+    prof_b = graph_b.node_profiles()
+    if not prof_a or not prof_b:
+        return 0.0
+
+    n_a, n_b = len(prof_a), len(prof_b)
+    sim_matrix = []
+    for _, vec_a in prof_a:
+        row = []
+        for _, vec_b in prof_b:
+            sim = 1.0 - emd_distance(vec_a, vec_b)
+            row.append(sim)
+        sim_matrix.append(row)
+
+    forward = sum(max(row) for row in sim_matrix) / n_a
+    backward = sum(max(sim_matrix[r][c] for r in range(n_a)) for c in range(n_b)) / n_b
+    if forward + backward == 0:
+        return 0.0
+    return 2 * forward * backward / (forward + backward)
+
+# ─────────────────────────────────────────────
+# FINGERPRINT COMPARISON (unchanged)
+# ─────────────────────────────────────────────
+def compare_fingerprints(fp1, fp2) -> float:
+    score = 0.0
+    m1 = fp1.get('dna_mask', 0)
+    m2 = fp2.get('dna_mask', 0)
+    if m1 | m2:
+        mask_sim = bin(m1 & m2).count('1') / bin(m1 | m2).count('1')
+    else:
+        mask_sim = 1.0
+    score += W_MASK * mask_sim
+
+    sp1 = fp1.get('spectral', [])
+    sp2 = fp2.get('spectral', [])
+    if sp1 and sp2:
+        score += W_SPECTRAL * cosine_similarity(sp1, sp2)
+
+    geom1 = fp1.get('geometry', [])
+    geom2 = fp2.get('geometry', [])
+    if len(geom1) >= 16 and len(geom2) >= 16:
+        len_sim = 1.0 - emd_distance(geom1[:8], geom2[:8])
+        ang_sim = 1.0 - emd_distance(geom1[8:16], geom2[8:16])
+        aspect1 = geom1[16] if len(geom1)>16 else 0
+        aspect2 = geom2[16] if len(geom2)>16 else 0
+        aspect_sim = 1.0 - min(abs(aspect1-aspect2), 1.0)
+        geom_score = (len_sim + ang_sim + aspect_sim) / 3.0
+        score += W_GEOMETRY * geom_score
+
+    path1 = fp1.get('path', [])
+    path2 = fp2.get('path', [])
+    if path1 and path2:
+        score += W_PATH * cosine_similarity(path1, path2)
+
+    reg1 = fp1.get('regional', [])
+    reg2 = fp2.get('regional', [])
+    if reg1 and reg2:
+        score += W_REGIONAL * cosine_similarity(reg1, reg2)
+
+    return score
+
+# ─────────────────────────────────────────────
+# SHADOW OVERLAP SENSOR - UPGRADED EDGE-BASED VERSION
+# ─────────────────────────────────────────────
+def point_to_segment_distance(p, a, b):
+    """Minimum distance from point p to segment ab."""
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    dx = bx - ax
+    dy = by - ay
+    if dx == 0 and dy == 0:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx*dx + dy*dy)
+    t = max(0, min(1, t))
+    nearest_x = ax + t * dx
+    nearest_y = ay + t * dy
+    return math.hypot(px - nearest_x, py - nearest_y)
+
+def is_point_in_shadow(pt, proto_boundary, dilation_radius):
+    """Check if pt is within dilation_radius of any segment of proto_boundary."""
+    for i in range(len(proto_boundary)-1):
+        a = proto_boundary[i]
+        b = proto_boundary[i+1]
+        if point_to_segment_distance(pt, a, b) <= dilation_radius:
+            return True
+    # also check the closing segment if boundary is closed
+    if len(proto_boundary) >= 3:
+        if point_to_segment_distance(pt, proto_boundary[-1], proto_boundary[0]) <= dilation_radius:
+            return True
+    return False
+
+def is_line_in_shadow(p1, p2, proto_boundary, dilation_radius):
+    """Check if ANY point on the line segment p1-p2 falls into the shadow."""
+    # Sample 11 points along the edge
+    for t in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+        px = p1[0] + (p2[0] - p1[0]) * t
+        py = p1[1] + (p2[1] - p1[1]) * t
+        if is_point_in_shadow((px, py), proto_boundary, dilation_radius):
+            return True
+    return False
+
+def compute_shadow_overlap(user_graph: Graph, proto_graph: Graph, dilation_fraction=SHADOW_DILATION):
+    """
+    Symmetric shadow overlap fraction - UPGRADED TO EDGE OVERLAP.
+    Computes the fraction of user edges that fall within the dilated prototype shadow,
+    and vice versa, then returns harmonic mean.
+    """
+    user_bnd = user_graph.boundary_points()
+    if not user_bnd or not user_graph.edges or not proto_graph.edges:
+        return 0.0
+
+    # Compute dilation radius based on user's bounding box diagonal
+    xs = [p[0] for p in user_bnd]
+    ys = [p[1] for p in user_bnd]
+    diag = math.hypot(max(xs)-min(xs), max(ys)-min(ys))
+    radius = diag * dilation_fraction
+
+    # Forward: User edges inside prototype shadow
+    proto_bnd = proto_graph.boundary_points()
+    forward_count = 0
+    for (u1, u2) in user_graph.edges:
+        if is_line_in_shadow(u1, u2, proto_bnd, radius):
+            forward_count += 1
+    forward_ov = forward_count / len(user_graph.edges)
+
+    # Backward: Prototype edges inside user shadow
+    backward_count = 0
+    for (p1, p2) in proto_graph.edges:
+        if is_line_in_shadow(p1, p2, user_bnd, radius):
+            backward_count += 1
+    backward_ov = backward_count / len(proto_graph.edges)
+
+    # Harmonic mean
+    if forward_ov + backward_ov == 0:
+        return 0.0
+    return 2 * forward_ov * backward_ov / (forward_ov + backward_ov)
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# STRUCTURAL MEMORY (updated to store fingerprints)
+# ─────────────────────────────────────────────
+class StructuralMemory:
+    def __init__(self):
+        self.entries = []
+
+    def add(self, name, graph):
+        norm = graph.normalised()
+        fingerprint = norm.compute_structural_fingerprint()
+        mask, vec = compute_dna(norm)
+        cvec = connectivity_features(norm)
+        sdesc = norm.shape_descriptors()
+        entry = {
+            "name": name,
+            "graph": norm,
+            "mask": mask,
+            "vector": vec,
+            "conn_vec": cvec,
+            "shape_desc": sdesc,
+            "fingerprint": fingerprint
+        }
+        self.entries.append(entry)
+
+    def query(self, graph, top_k=5):
+        norm = graph.normalised()
+        query_fp = norm.compute_structural_fingerprint()
+        scored = []
+        for e in self.entries:
+            if "fingerprint" in e:
+                fp_score = compare_fingerprints(query_fp, e["fingerprint"])
+                node_sim = node_profile_similarity(norm, e["graph"])
+                total = fp_score + W_NODE_PROFILE * node_sim
+                scored.append((total, e))
+            else:
+                # Fallback to original scoring
+                q_mask, q_vec = compute_dna(norm)
+                q_conn = connectivity_features(norm)
+                q_sdesc = norm.shape_descriptors()
+                mask_sim = (bin(q_mask & e["mask"]).count("1")
+                            / max(1, bin(q_mask | e["mask"]).count("1")))
+                vec_sim = cosine_similarity(q_vec, e["vector"])
+                conn_emd = emd_distance(q_conn, e["conn_vec"])
+                conn_sim = 1.0 - conn_emd
+                node_sim = node_profile_similarity(norm, e["graph"])
+                shape_sim = cosine_similarity(q_sdesc, e.get("shape_desc", [0,0,0]))
+                score = (W_DNA_MASK * mask_sim + W_DNA_VEC * vec_sim +
+                         W_CONNECTIVITY * conn_sim + W_NODE_PROFILE * node_sim +
+                         W_SHAPE_DESC * shape_sim)
+                scored.append((score, e))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[:top_k]
+
+    def remove(self, name):
+        self.entries = [e for e in self.entries if e["name"] != name]
+
+    def save(self, path=PROTO_FILE):
+        data = []
+        for e in self.entries:
+            fp = e.get("fingerprint", {})
+            data.append({
+                "name": e["name"],
+                "graph": e["graph"].to_dict(),
+                "mask": e["mask"],
+                "vector": e["vector"],
+                "conn_vec": e["conn_vec"],
+                "shape_desc": e["shape_desc"],
+                "fingerprint": fp
+            })
+        try:
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            return True, f"Saved {len(data)} prototypes."
+        except Exception as ex:
+            return False, str(ex)
+
+    def load(self, path=PROTO_FILE):
+        if not os.path.exists(path):
+            return False, "File not found."
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.entries.clear()
+            for d in data:
+                g = Graph.from_dict(d["graph"])
+                entry = {
+                    "name": d["name"],
+                    "graph": g,
+                    "mask": d["mask"],
+                    "vector": d["vector"],
+                    "conn_vec": d.get("conn_vec", [0]*CONNECTIVITY_DIM),
+                    "shape_desc": d.get("shape_desc", [0,0,0]),
+                }
+                if "fingerprint" in d:
+                    entry["fingerprint"] = d["fingerprint"]
+                self.entries.append(entry)
+            return True, f"Loaded {len(self.entries)} prototypes."
+        except Exception as ex:
+            return False, str(ex)
+
+# ─────────────────────────────────────────────
+# RECONSTRUCTION & CONFIDENCE (unchanged)
+# ─────────────────────────────────────────────
+def reconstruct(user_graph, prototype, tolerance=EDGE_TOLERANCE):
+    missing = []
+    matched = 0
+    user_edge_list = list(user_graph.edges)
+    for proto_edge in prototype.edges:
+        (px1, py1), (px2, py2) = proto_edge
+        found = False
+        for ue in user_edge_list:
+            (ux1, uy1), (ux2, uy2) = ue
+            d1 = max(math.hypot(px1 - ux1, py1 - uy1),
+                     math.hypot(px2 - ux2, py2 - uy2))
+            d2 = max(math.hypot(px1 - ux2, py1 - uy2),
+                     math.hypot(px2 - ux1, py2 - uy1))
+            if min(d1, d2) < tolerance:
+                found = True
+                break
+        if found:
+            matched += 1
+        else:
+            missing.append(proto_edge)
+    conf = matched / max(len(prototype.edges), 1)
+    return missing, conf
+
+def compute_confidence(user_norm, proto_norm, similarity_score):
+    _, edge_conf = reconstruct(user_norm, proto_norm)
+    node_ratio = (min(len(user_norm.nodes), len(proto_norm.nodes))
+                  / max(len(user_norm.nodes), len(proto_norm.nodes), 1))
+    total_dist = 0.0
+    for un in user_norm.nodes:
+        best = min(math.hypot(un[0] - pn[0], un[1] - pn[1]) for pn in proto_norm.nodes)
+        total_dist += best
+    avg_dist = total_dist / max(len(user_norm.nodes), 1)
+    spatial_conf = max(0.0, 1.0 - avg_dist / 0.5)
+    return (CONF_EDGE * edge_conf
+            + CONF_NODE * node_ratio
+            + CONF_SPATIAL * spatial_conf
+            + CONF_FEATURE * similarity_score)
+
+def nmd_entropy(scores):
+    if len(scores) < 2:
+        return 0.0, "low"
+    total = sum(scores)
+    if total == 0:
+        return 0.0, "low"
+    probs = [s / total for s in scores]
+    raw = -sum(p * math.log(p) for p in probs if p > 0)
+    norm = raw / math.log(len(probs))
+    label = "low" if norm < 0.4 else ("medium" if norm < 0.7 else "high")
+    return round(norm, 4), label
+
+# ─────────────────────────────────────────────
+# GUI (VisualLSRApp) — now with shadow tie‑breaking
+# ─────────────────────────────────────────────
+class VisualLSRApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Visual‑LSR (V_LSR) — Hierarchical DNA + Shadow Sensor")
+
+        left_frame = tk.Frame(root, width=180, bg="#222")
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(5, 0), pady=5)
+        left_frame.pack_propagate(False)
+
+        tk.Label(left_frame, text="Memory", fg="white", bg="#222",
+                 font=("Arial", 12, "bold")).pack(pady=5)
+        self.proto_listbox = Listbox(left_frame, bg="#333", fg="white",
+                                     selectbackground="#555")
+        self.proto_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+        tk.Button(left_frame, text="Delete Selected",
+                  command=self.delete_prototype).pack(pady=2)
+        tk.Button(left_frame, text="Load from Disk",
+                  command=self.load_prototypes).pack(pady=2)
+
+        right_frame = tk.Frame(root)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True,
+                         padx=(0, 5), pady=5)
+
+        self.canvas = tk.Canvas(right_frame, width=CANVAS_SIZE, height=CANVAS_SIZE,
+                                bg="black")
+        self.canvas.pack(side=tk.TOP)
+
+        info_frame = tk.Frame(right_frame, bg="black")
+        info_frame.pack(side=tk.TOP, fill=tk.X, pady=(5, 0))
+
+        self.recog_label = tk.Label(info_frame, text="Draw & click Reconstruct",
+                                    font=("Arial", 16, "bold"), fg="yellow", bg="black")
+        self.recog_label.pack()
+        self.alt_label = tk.Label(info_frame, text="", font=("Arial", 10),
+                                  fg="gray", bg="black")
+        self.alt_label.pack()
+        # Shadow sensor label
+        self.shadow_label = tk.Label(info_frame, text="", font=("Arial", 10, "italic"),
+                                     fg="light green", bg="black")
+        self.shadow_label.pack()
+
+        ctrl = tk.Frame(right_frame)
+        ctrl.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Button(ctrl, text="Save as Prototype",
+                  command=self.save_prototype).pack(side=tk.LEFT, padx=5, pady=5)
+        tk.Button(ctrl, text="Clear Canvas",
+                  command=self.clear_canvas).pack(side=tk.LEFT, padx=5)
+        tk.Button(ctrl, text="Reconstruct",
+                  command=self.run_pipeline).pack(side=tk.LEFT, padx=5)
+
+        self.stroke_mode_var = tk.BooleanVar(value=False)
+        self.stroke_btn = tk.Checkbutton(ctrl, text="Stroke Mode",
+                                         variable=self.stroke_mode_var,
+                                         command=self._on_mode_toggle,
+                                         fg="white", bg="black", selectcolor="gray")
+        self.stroke_btn.pack(side=tk.LEFT, padx=5)
+
+        self.auto_connect_var = tk.BooleanVar(value=False)
+        self.auto_btn = tk.Checkbutton(ctrl, text="Auto‑Connect",
+                                       variable=self.auto_connect_var,
+                                       fg="white", bg="black", selectcolor="gray")
+        self.auto_btn.pack(side=tk.LEFT, padx=5)
+
+        self.status_label = tk.Label(ctrl, text="Manual: Left=node, Drag=edge, Right=delete",
+                                     fg="white", bg="black")
+        self.status_label.pack(side=tk.RIGHT, padx=5)
+
+        self.graph = Graph()
+        self.node_items = {}
+        self.edge_items = set()
+        self.overlay_items = []
+
+        self.stroke_points = []
+        self.stroke_line_id = None
+
+        self.drag_start = None
+        self.active_line = None
+
+        self.memory = StructuralMemory()
+        self.load_prototypes(silent=True)
+        self._update_memory_list()
+
+        self.canvas.bind("<Button-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Button-2>", lambda e: self.clear_canvas())
+        self.canvas.bind("<Button-3>", self.on_right_click)
+
+    def snap(self, coord):
+        return round(coord / CELL_SIZE) * CELL_SIZE
+
+    def draw_node(self, x, y):
+        r = DOT_RADIUS
+        item = self.canvas.create_oval(x - r, y - r, x + r, y + r,
+                                       fill="white", outline="gray")
+        self.node_items[(x, y)] = item
+
+    def draw_user_edge(self, x1, y1, x2, y2):
+        line = self.canvas.create_line(x1, y1, x2, y2, fill="white", width=2)
+        self.edge_items.add(line)
+
+    def clear_overlays(self):
+        for item in self.overlay_items:
+            self.canvas.delete(item)
+        self.overlay_items.clear()
+
+    def redraw_all(self):
+        self.canvas.delete("all")
+        self.node_items.clear()
+        self.edge_items.clear()
+        self.overlay_items.clear()
+        for n in self.graph.nodes:
+            self.draw_node(*n)
+        for e in self.graph.edges:
+            (x1, y1), (x2, y2) = e
+            self.draw_user_edge(x1, y1, x2, y2)
+
+    def find_closest_node(self, mx, my):
+        best, best_d = None, float("inf")
+        for n in self.graph.nodes:
+            d = math.hypot(n[0] - mx, n[1] - my)
+            if d < best_d:
+                best_d = d
+                best = n
+        return best, best_d
+
+    def _update_memory_list(self):
+        self.proto_listbox.delete(0, tk.END)
+        for e in self.memory.entries:
+            self.proto_listbox.insert(tk.END, e["name"])
+        self.status_label.config(
+            text=f"Memory: {len(self.memory.entries)} prototypes")
+
+    def delete_prototype(self):
+        sel = self.proto_listbox.curselection()
+        if sel:
+            name = self.proto_listbox.get(sel[0])
+            self.memory.remove(name)
+            ok, msg = self.memory.save()
+            if ok:
+                self._update_memory_list()
+                self.run_pipeline()
+            else:
+                messagebox.showerror("Save Error", msg)
+
+    def save_prototype(self):
+        name = simpledialog.askstring("Prototype Name", "Name:")
+        if not name:
+            return
+        self.memory.add(name, self.graph)
+        ok, msg = self.memory.save()
+        if ok:
+            self._update_memory_list()
+            messagebox.showinfo("Saved", msg)
+        else:
+            messagebox.showerror("Save Error", msg)
+
+    def load_prototypes(self, silent=False):
+        ok, msg = self.memory.load()
+        self._update_memory_list()
+        if not silent:
+            if ok:
+                messagebox.showinfo("Loaded", msg)
+            else:
+                messagebox.showwarning("Load Warning", msg)
+
+    def clear_canvas(self):
+        self.graph.clear()
+        self.stroke_points.clear()
+        if self.stroke_line_id:
+            self.canvas.delete(self.stroke_line_id)
+            self.stroke_line_id = None
+        self.redraw_all()
+        self.recog_label.config(text="Draw & click Reconstruct")
+        self.alt_label.config(text="")
+        self.shadow_label.config(text="")
+
+    def auto_connect_nodes(self, new_node):
+        if len(self.graph.nodes) < 2:
+            return
+        others = [n for n in self.graph.nodes if n != new_node]
+        if not others:
+            return
+        others.sort(key=lambda n: math.hypot(n[0] - new_node[0], n[1] - new_node[1]))
+        for target in others[:2]:
+            dist = math.hypot(new_node[0] - target[0], new_node[1] - target[1])
+            if dist > AUTO_CONNECT_MAX_DIST:
+                continue
+            if frozenset({new_node, target}) not in self.graph.edges:
+                self.graph.add_edge(new_node[0], new_node[1], target[0], target[1])
+                self.draw_user_edge(new_node[0], new_node[1], target[0], target[1])
+
+    def _on_mode_toggle(self):
+        if self.stroke_mode_var.get():
+            self.status_label.config(text="Stroke: Drag to draw, Right=delete")
+            self.auto_btn.pack_forget()
+        else:
+            self.status_label.config(text="Manual: Left=node, Drag=edge, Right=delete")
+            self.auto_btn.pack(side=tk.LEFT, padx=5, after=self.stroke_btn)
+
+    def _on_press(self, event):
+        if self.stroke_mode_var.get():
+            self._stroke_press(event)
+        else:
+            self._manual_press(event)
+
+    def _on_drag(self, event):
+        if self.stroke_mode_var.get():
+            self._stroke_drag(event)
+        else:
+            self._manual_drag(event)
+
+    def _on_release(self, event):
+        if self.stroke_mode_var.get():
+            self._stroke_release(event)
+        else:
+            self._manual_release(event)
+
+    def _manual_press(self, event):
+        x, y = self.snap(event.x), self.snap(event.y)
+        closest, dist = self.find_closest_node(event.x, event.y)
+        if closest and dist < DOT_RADIUS * 3:
+            self.drag_start = closest
+        else:
+            self.drag_start = None
+            if (x, y) not in self.graph.nodes:
+                self.graph.add_node(x, y)
+                self.draw_node(x, y)
+                if self.auto_connect_var.get():
+                    self.auto_connect_nodes((x, y))
+
+    def _manual_drag(self, event):
+        if self.drag_start:
+            if self.active_line:
+                self.canvas.delete(self.active_line)
+            x1, y1 = self.drag_start
+            x2, y2 = self.snap(event.x), self.snap(event.y)
+            self.active_line = self.canvas.create_line(x1, y1, x2, y2, fill="gray")
+
+    def _manual_release(self, event):
+        if self.drag_start and self.active_line:
+            self.canvas.delete(self.active_line)
+            self.active_line = None
+            x1, y1 = self.drag_start
+            x2, y2 = self.snap(event.x), self.snap(event.y)
+            if (x2, y2) not in self.graph.nodes:
+                self.graph.add_node(x2, y2)
+                self.draw_node(x2, y2)
+            self.graph.add_edge(x1, y1, x2, y2)
+            self.draw_user_edge(x1, y1, x2, y2)
+        self.drag_start = None
+
+    def _stroke_press(self, event):
+        self.stroke_points = [(event.x, event.y)]
+        if self.stroke_line_id:
+            self.canvas.delete(self.stroke_line_id)
+        self.stroke_line_id = self.canvas.create_line(
+            event.x, event.y, event.x+1, event.y, fill="cyan", width=2)
+
+    def _stroke_drag(self, event):
+        if self.stroke_points:
+            self.stroke_points.append((event.x, event.y))
+            flat = [coord for p in self.stroke_points for coord in p]
+            if self.stroke_line_id:
+                self.canvas.delete(self.stroke_line_id)
+            if len(flat) >= 4:
+                self.stroke_line_id = self.canvas.create_line(
+                    *flat, fill="cyan", width=2)
+
+    def _stroke_release(self, event):
+        if not self.stroke_points:
+            return
+        if len(self.stroke_points) < 2:
+            self.stroke_points = []
+            return
+        if len(self.stroke_points) > STROKE_MAX_POINTS:
+            self.stroke_points = self.stroke_points[:STROKE_MAX_POINTS]
+
+        contour = stroke_to_contour(self.stroke_points)
+        if not contour:
+            self.stroke_points = []
+            if self.stroke_line_id:
+                self.canvas.delete(self.stroke_line_id)
+                self.stroke_line_id = None
+            return
+
+        new_graph = contour_to_graph(contour, existing_graph=self.graph)
+        self.graph = new_graph
+
+        if self.stroke_line_id:
+            self.canvas.delete(self.stroke_line_id)
+            self.stroke_line_id = None
+        self.stroke_points = []
+
+        self.redraw_all()
+
+    def on_right_click(self, event):
+        closest, dist = self.find_closest_node(event.x, event.y)
+        if closest and dist < DOT_RADIUS * 3:
+            self.graph.remove_node(*closest)
+            self.redraw_all()
+            self.recog_label.config(text="Draw & click Reconstruct")
+            self.alt_label.config(text="")
+            self.shadow_label.config(text="")
+
+    # ====================================================================
+    # UPDATED run_pipeline() — Shadow-Guided Tie-Breaker (Improved for ties)
+    # ====================================================================
+    def run_pipeline(self):
+        self.clear_overlays()
+        if not self.graph.nodes:
+            self.recog_label.config(text="No nodes drawn")
+            self.alt_label.config(text="")
+            self.shadow_label.config(text="")
+            return
+
+        if not self.memory.entries:
+            self.recog_label.config(text="No prototypes in memory")
+            self.alt_label.config(text="")
+            self.shadow_label.config(text="")
+            return
+
+        norm = self.graph.normalised()
+        candidates = self.memory.query(norm, top_k=5)
+        if not candidates:
+            self.recog_label.config(text="No match found")
+            self.alt_label.config(text="")
+            self.shadow_label.config(text="")
+            return
+
+        # Step 1: Compute actual shadow overlap for each candidate
+        scored_with_shadow = []
+        for sc, entry in candidates:
+            proto_graph = entry["graph"]
+            sh_overlap = compute_shadow_overlap(norm, proto_graph)
+            scored_with_shadow.append((sc, sh_overlap, entry))
+
+        # Step 2: Sort by structural score (descending)
+        scored_with_shadow.sort(key=lambda x: x[0], reverse=True)
+
+        # Step 3: Shadow-Guided Tie-Breaking
+        best_score, best_shadow, best_entry = scored_with_shadow[0]
+
+        if len(scored_with_shadow) > 1:
+            second_score, second_shadow, second_entry = scored_with_shadow[1]
+            score_delta = best_score - second_score
+
+            # Rule A: If scores are nearly tied (≤ 5%) AND the second candidate has
+            # a significantly better shadow overlap (≥ 20% higher), swap them.
+            if score_delta < 0.05 and (second_shadow - best_shadow) >= 0.20:
+                best_score, best_shadow, best_entry = second_score, second_shadow, second_entry
+
+            # Rule B (New): If scores are a dead tie (≤ 1%), we don't care about the 20% rule.
+            # Just pick the one with the better shadow.
+            elif score_delta < 0.01 and second_shadow > best_shadow:
+                best_score, best_shadow, best_entry = second_score, second_shadow, second_entry
+
+            # Rule C (Old fallback): if the current best has terrible shadow (< 30%)
+            # and the second is decent (> 50%) even if delta is a bit larger (≤ 10%)
+            elif best_shadow < 0.30 and score_delta < 0.10 and second_shadow >= 0.50:
+                best_score, best_shadow, best_entry = second_score, second_shadow, second_entry
+
+        proto_graph = best_entry["graph"]
+
+        # Step 4: Rest of pipeline (reconstruction, overlays, display)
+        missing, edge_conf = reconstruct(norm, proto_graph)
+        conf = compute_confidence(norm, proto_graph, best_score)
+
+        _, n_label = nmd_entropy([s[0] for s in scored_with_shadow])
+        if n_label == "high":
+            base_thresh = 0.45
+        elif n_label == "medium":
+            base_thresh = 0.35
+        else:
+            base_thresh = 0.25
+
+        if len(scored_with_shadow) > 1 and (scored_with_shadow[0][0] - scored_with_shadow[1][0]) < 0.1:
+            blend_edges = {}
+            for sc, _, e in scored_with_shadow:
+                for ed in e["graph"].edges:
+                    blend_edges[ed] = blend_edges.get(ed, 0.0) + sc
+            threshold = 0.3 * sum(s[0] for s in scored_with_shadow)
+            ambiguous_edges = [ed for ed, w in blend_edges.items()
+                               if w >= threshold and ed not in norm.edges]
+        else:
+            ambiguous_edges = []
+
+        for e in missing:
+            (x1n, y1n), (x2n, y2n) = e
+            sx1, sy1 = self.graph.denormalize_point(x1n, y1n)
+            sx2, sy2 = self.graph.denormalize_point(x2n, y2n)
+            color = "green" if edge_conf > 0.6 else "blue"
+            line = self.canvas.create_line(sx1, sy1, sx2, sy2, fill=color, width=4)
+            self.overlay_items.append(line)
+        for e in ambiguous_edges:
+            (x1n, y1n), (x2n, y2n) = e
+            sx1, sy1 = self.graph.denormalize_point(x1n, y1n)
+            sx2, sy2 = self.graph.denormalize_point(x2n, y2n)
+            line = self.canvas.create_line(sx1, sy1, sx2, sy2, fill="yellow", width=4)
+            self.overlay_items.append(line)
+
+        # Shadow sensor display
+        shadow_text = f"shadow overlap: {best_shadow:.0%}"
+        if best_shadow > 0.8:
+            self.shadow_label.config(text=shadow_text, fg="light green")
+        elif best_shadow > 0.5:
+            self.shadow_label.config(text=shadow_text, fg="yellow")
+        else:
+            self.shadow_label.config(text=shadow_text, fg="red")
+
+        top_sim_pct = best_score * 100
+        if best_score >= base_thresh:
+            self.recog_label.config(
+                text=f"{best_entry['name']}  ({top_sim_pct:.0f}% sim, conf {conf:.0%})")
+        else:
+            self.recog_label.config(
+                text=f"Uncertain (best: {best_entry['name']} {top_sim_pct:.0f}%)")
+
+        alt_parts = [f"{e['name']}({sc * 100:.0f}%)" for sc, _, e in scored_with_shadow[1:]]
+        self.alt_label.config(text=" | ".join(alt_parts) if alt_parts else "")
+    # ====================================================================
+
+def cross(o, a, b):
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+def main():
+    root = tk.Tk()
+    app = VisualLSRApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
+    
+    #//end//#

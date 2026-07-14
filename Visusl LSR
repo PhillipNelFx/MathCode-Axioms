@@ -1,42 +1,20 @@
 #!/usr/bin/env python3
 """
-Visual‑LSR (V_LSR) v0.2 — Hierarchical Structural DNA + Shadow Overlap Sensor
+Visual‑LSR (V_LSR) v0.2 — Hierarchical Structural DNA + Shadow Overlap Sensor + Active DTKO
 Empty memory – you build your own prototypes.
 
 Enhancements v0.2:
   • Shadow‑Guided Tie‑Breaker: uses the passive shadow sensor to resolve close structural ties.
+  • Added Connectivity Features to scoring (Quadrant Variance).
+  • Upgraded DTKO to operate on normalized graphs (scale‑invariant).
+  • DTKO now actively influences the main weighted score.
+  • Reconstruction tolerance tightened for better blue-line alignment.
   • All original code and sensor remain untouched – only decision logic improved.
-
-Enhancements original:
-  • Dual input modes (manual / stroke)
-  • Multi‑scale fingerprint: 11‑bit mask, spectral, geometry, path, regional, node‑profile EMD
-  • Passive shadow‑overlap sensor – displayed alongside recognition, does not affect scoring
-  • Backward‑compatible prototype storage
-  • All original LSR pipeline intact
-
-Controls:
-  Toggle "Stroke Mode" checkbox to switch.
-  
-  Manual mode:
-      Left‑click        place a node
-      Drag node‑to‑node draw an edge
-      Right‑click       delete a node (and its edges)
-      Middle‑click      clear the entire canvas
-
-  Stroke mode:
-      Drag              draw a stroke (released → vectorized and added)
-      Right‑click       delete a node
-      Middle‑click      clear the entire canvas
-
-  Global:
-      Save as Prototype – name the current drawing
-      Reconstruct       run LSR pipeline on current drawing
-      Auto‑Connect toggle – (manual mode only) link new node to 2 nearest neighbours
 """
 
 import tkinter as tk
 from tkinter import simpledialog, messagebox, Listbox
-import math, json, os, random
+import math, json, os, random, traceback
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
 
@@ -61,13 +39,16 @@ DNA_MULTI_COMPONENT        = 256
 DNA_HIGH_QUADRANT_VARIANCE = 512
 DNA_MULTI_HUB              = 1024
 
-# Weights for the multi‑scale scoring (shadow not included)
-W_MASK        = 0.15
-W_SPECTRAL    = 0.15
-W_GEOMETRY    = 0.15
-W_PATH        = 0.10
-W_REGIONAL    = 0.20
-W_NODE_PROFILE = 0.25
+# --- UPDATED WEIGHTS (Revised for better Car/Human separation) ---
+W_MASK        = 0.18   # Increased to heavily penalize missing loops
+W_SPECTRAL    = 0.10   # Slightly reduced
+W_GEOMETRY    = 0.12
+W_PATH        = 0.08
+W_REGIONAL    = 0.12
+W_CONNECTIVITY= 0.14   # Maintained (helps spatial distribution)
+W_NODE_PROFILE = 0.16  # Reduced to stop over-emphasizing local branches
+W_DTKO        = 0.10   # Increased (Density/Entropy strongly separate cars from humans)
+# -------------------------------------------------------------------------
 
 # Confidence weights (multi‑factor)
 CONF_EDGE      = 0.35
@@ -76,7 +57,7 @@ CONF_SPATIAL   = 0.15
 CONF_FEATURE   = 0.30
 
 # --- TUNED CONSTANTS ---
-EDGE_TOLERANCE = 0.05
+EDGE_TOLERANCE = 0.03   # Tightened for better blue-line alignment
 CENTRAL_NODE_RADIUS = 0.15
 SYMMETRY_THRESHOLD  = 0.6
 SPARSE_RATIO        = 0.8
@@ -897,28 +878,20 @@ class Graph:
             'geometry': self.geometry_fingerprint(),
             'path': self.path_fingerprint(),
             'regional': self.regional_profile_fingerprint(),
+            'conn_vec': connectivity_features(self)
         }
 
     # -----------------------------------------------------------------
     # SHADOW SENSOR HELPERS
     # -----------------------------------------------------------------
     def boundary_points(self) -> List[Tuple[float, float]]:
-        """
-        Return an ordered list of points representing the outer boundary.
-        If the graph is a single connected component, traverse edges to form a loop.
-        For multiple components, use convex hull of all nodes.
-        """
         if not self.nodes:
             return []
         comps = self.connected_components()
         if len(comps) == 1:
-            # Try to extract a single loop (if graph is 2‑regular)
-            # Otherwise fall back to convex hull
             nodes_set = comps[0]
-            # Check if every node has degree 2 (single cycle) or degree ≤2 (path/cycle)
             degrees = {n: self.degree(n) for n in nodes_set}
             if all(d == 2 for d in degrees.values()):
-                # It's a single cycle, extract by walking
                 start = next(iter(nodes_set))
                 path = []
                 current = start
@@ -930,7 +903,6 @@ class Graph:
                         if current in e:
                             other = next(iter(e - {current}))
                             neighbors.append(other)
-                    # choose the neighbor that is not prev
                     next_node = neighbors[0] if neighbors[0] != prev else (neighbors[1] if len(neighbors)>1 else None)
                     if next_node is None:
                         break
@@ -940,8 +912,6 @@ class Graph:
                         break
                 return path
             elif all(d <= 2 for d in degrees.values()):
-                # It's a path or collection of paths – build boundary by ordering nodes
-                # Find endpoint(s) and walk
                 endpoints = [n for n, d in degrees.items() if d == 1]
                 if endpoints:
                     start = endpoints[0]
@@ -963,16 +933,10 @@ class Graph:
                         if next_node is None:
                             break
                         prev, current = current, next_node
-                    # If there's a second component? not relevant
                     return path
-                else:
-                    # isolated nodes – just return hull
-                    pass
-        # Default: convex hull of all nodes
         pts = list(self.nodes)
         if len(pts) <= 2:
             return pts
-        # sort points for Graham scan
         def cross(o, a, b):
             return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
         pts = sorted(pts)
@@ -1031,13 +995,11 @@ def connectivity_features(graph):
     n = len(norm.nodes)
     if n == 0:
         return [0.0] * CONNECTIVITY_DIM
-
     degrees = [norm.degree(node) for node in norm.nodes]
     deg_bins = [0] * 6
     for d in degrees:
         deg_bins[min(d, 5)] += 1
     deg_bins = [x / n for x in deg_bins]
-
     lengths = []
     angles = []
     for (x1, y1), (x2, y2) in norm._edge_pairs():
@@ -1051,14 +1013,12 @@ def connectivity_features(graph):
         else: len_bins[2] += 1
     total_edges = len(lengths) or 1
     len_bins = [x / total_edges for x in len_bins]
-
     ang_bins = [0] * 8
     for a in angles:
         a = (a + 2 * math.pi) % (2 * math.pi)
         idx = int(a / (math.pi / 4)) % 8
         ang_bins[idx] += 1
     ang_bins = [x / total_edges for x in ang_bins]
-
     xs = [n[0] for n in norm.nodes]
     ys = [n[1] for n in norm.nodes]
     cx = sum(xs) / n
@@ -1071,7 +1031,6 @@ def connectivity_features(graph):
         elif d < 0.7 * max_dist: rad_bins[1] += 1
         else: rad_bins[2] += 1
     rad_bins = [x / n for x in rad_bins]
-
     adj = norm._adjacency_list()
     tri_total = 0
     for node in norm.nodes:
@@ -1081,15 +1040,12 @@ def connectivity_features(graph):
                 if neighbors[j] in adj[neighbors[i]]:
                     tri_total += 1
     avg_tri = tri_total / n if n else 0
-
     comp_count = norm.component_count()
     quad_var = norm.quadrant_density_variance()
     hubs = norm.hub_count()
-
     comp_norm = min(comp_count / 5.0, 1.0)
     hub_norm = min(hubs / 5.0, 1.0)
     quad_norm = min(quad_var / 10.0, 1.0)
-
     result = (deg_bins + len_bins + ang_bins + rad_bins + [avg_tri]
               + [comp_norm, quad_norm, hub_norm])
     return result
@@ -1099,7 +1055,6 @@ def node_profile_similarity(graph_a, graph_b):
     prof_b = graph_b.node_profiles()
     if not prof_a or not prof_b:
         return 0.0
-
     n_a, n_b = len(prof_a), len(prof_b)
     sim_matrix = []
     for _, vec_a in prof_a:
@@ -1108,7 +1063,6 @@ def node_profile_similarity(graph_a, graph_b):
             sim = 1.0 - emd_distance(vec_a, vec_b)
             row.append(sim)
         sim_matrix.append(row)
-
     forward = sum(max(row) for row in sim_matrix) / n_a
     backward = sum(max(sim_matrix[r][c] for r in range(n_a)) for c in range(n_b)) / n_b
     if forward + backward == 0:
@@ -1116,7 +1070,7 @@ def node_profile_similarity(graph_a, graph_b):
     return 2 * forward * backward / (forward + backward)
 
 # ─────────────────────────────────────────────
-# FINGERPRINT COMPARISON (unchanged)
+# FINGERPRINT COMPARISON (UPDATED WITH DTKO AS MAIN VOTER)
 # ─────────────────────────────────────────────
 def compare_fingerprints(fp1, fp2) -> float:
     score = 0.0
@@ -1154,13 +1108,26 @@ def compare_fingerprints(fp1, fp2) -> float:
     if reg1 and reg2:
         score += W_REGIONAL * cosine_similarity(reg1, reg2)
 
+    # Connectivity Features (Quadrant Variance)
+    conn1 = fp1.get('conn_vec', [0.0] * CONNECTIVITY_DIM)
+    conn2 = fp2.get('conn_vec', [0.0] * CONNECTIVITY_DIM)
+    if conn1 and conn2:
+        conn_sim = cosine_similarity(conn1, conn2)
+        score += W_CONNECTIVITY * conn_sim
+
+    # --- NEW: DTKO Structural Journey Similarity (Main Voter) ---
+    dtko1 = fp1.get('dtko_vec', [0.0] * 6)
+    dtko2 = fp2.get('dtko_vec', [0.0] * 6)
+    if dtko1 and dtko2:
+        dtko_sim = dtko_similarity(dtko1, dtko2)
+        score += W_DTKO * dtko_sim
+
     return score
 
 # ─────────────────────────────────────────────
 # SHADOW OVERLAP SENSOR - UPGRADED EDGE-BASED VERSION
 # ─────────────────────────────────────────────
 def point_to_segment_distance(p, a, b):
-    """Minimum distance from point p to segment ab."""
     px, py = p
     ax, ay = a
     bx, by = b
@@ -1175,21 +1142,17 @@ def point_to_segment_distance(p, a, b):
     return math.hypot(px - nearest_x, py - nearest_y)
 
 def is_point_in_shadow(pt, proto_boundary, dilation_radius):
-    """Check if pt is within dilation_radius of any segment of proto_boundary."""
     for i in range(len(proto_boundary)-1):
         a = proto_boundary[i]
         b = proto_boundary[i+1]
         if point_to_segment_distance(pt, a, b) <= dilation_radius:
             return True
-    # also check the closing segment if boundary is closed
     if len(proto_boundary) >= 3:
         if point_to_segment_distance(pt, proto_boundary[-1], proto_boundary[0]) <= dilation_radius:
             return True
     return False
 
 def is_line_in_shadow(p1, p2, proto_boundary, dilation_radius):
-    """Check if ANY point on the line segment p1-p2 falls into the shadow."""
-    # Sample 11 points along the edge
     for t in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
         px = p1[0] + (p2[0] - p1[0]) * t
         py = p1[1] + (p2[1] - p1[1]) * t
@@ -1198,48 +1161,197 @@ def is_line_in_shadow(p1, p2, proto_boundary, dilation_radius):
     return False
 
 def compute_shadow_overlap(user_graph: Graph, proto_graph: Graph, dilation_fraction=SHADOW_DILATION):
-    """
-    Symmetric shadow overlap fraction - UPGRADED TO EDGE OVERLAP.
-    Computes the fraction of user edges that fall within the dilated prototype shadow,
-    and vice versa, then returns harmonic mean.
-    """
     user_bnd = user_graph.boundary_points()
     if not user_bnd or not user_graph.edges or not proto_graph.edges:
         return 0.0
-
-    # Compute dilation radius based on user's bounding box diagonal
     xs = [p[0] for p in user_bnd]
     ys = [p[1] for p in user_bnd]
     diag = math.hypot(max(xs)-min(xs), max(ys)-min(ys))
     radius = diag * dilation_fraction
-
-    # Forward: User edges inside prototype shadow
     proto_bnd = proto_graph.boundary_points()
     forward_count = 0
     for (u1, u2) in user_graph.edges:
         if is_line_in_shadow(u1, u2, proto_bnd, radius):
             forward_count += 1
     forward_ov = forward_count / len(user_graph.edges)
-
-    # Backward: Prototype edges inside user shadow
     backward_count = 0
     for (p1, p2) in proto_graph.edges:
         if is_line_in_shadow(p1, p2, user_bnd, radius):
             backward_count += 1
     backward_ov = backward_count / len(proto_graph.edges)
-
-    # Harmonic mean
     if forward_ov + backward_ov == 0:
         return 0.0
     return 2 * forward_ov * backward_ov / (forward_ov + backward_ov)
-# ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
-# STRUCTURAL MEMORY (updated to store fingerprints)
+# DUAL TRAVERSAL KERNEL OBSERVER (Pure Python, Graph-based, Normalized)
+# ─────────────────────────────────────────────
+class DTKO:
+    def __init__(self, window_radius=0.13):  # 13% of normalized canvas
+        self.window_radius = window_radius
+
+    def _get_window_nodes(self, graph, center):
+        cx, cy = center
+        window_nodes = []
+        for n in graph.nodes:
+            if math.hypot(n[0] - cx, n[1] - cy) <= self.window_radius:
+                window_nodes.append(n)
+        return window_nodes
+
+    def _observe_window(self, graph, center):
+        window_nodes = self._get_window_nodes(graph, center)
+        if not window_nodes:
+            return {
+                'density': 0.0, 'edge_density': 0.0, 'continuity': 0.0,
+                'junction_count': 0, 'orientation': 0.0, 'entropy': 0.0
+            }
+        window_nodes_set = set(window_nodes)
+        edges_in_window = 0
+        angles = []
+        degrees = []
+        for e in graph.edges:
+            n1, n2 = e
+            if n1 in window_nodes_set and n2 in window_nodes_set:
+                edges_in_window += 1
+                dx = n2[0] - n1[0]
+                dy = n2[1] - n1[1]
+                angles.append(math.atan2(dy, dx))
+        junction_count = 0
+        for n in window_nodes:
+            deg = graph.degree(n)
+            degrees.append(deg)
+            if deg >= 3:
+                junction_count += 1
+        area = math.pi * (self.window_radius ** 2)
+        density = len(window_nodes) / area if area > 0 else 0.0
+        edge_density = edges_in_window / area if area > 0 else 0.0
+        if angles:
+            sum_sin = sum(math.sin(a) for a in angles)
+            sum_cos = sum(math.cos(a) for a in angles)
+            orientation = math.atan2(sum_sin, sum_cos)
+        else:
+            orientation = 0.0
+        if len(angles) > 1:
+            sorted_angles = sorted(angles)
+            diffs = [sorted_angles[i+1] - sorted_angles[i] for i in range(len(sorted_angles)-1)]
+            avg_diff = sum(abs(d) for d in diffs) / len(diffs)
+            continuity = 1.0 - min(avg_diff / math.pi, 1.0)
+        else:
+            continuity = 1.0 if angles else 0.0
+        hist = [0]*4
+        for d in degrees:
+            if d < 3:
+                hist[d] += 1
+            else:
+                hist[3] += 1
+        total = len(degrees) or 1
+        probs = [h / total for h in hist]
+        entropy = -sum(p * math.log2(p + 1e-9) for p in probs)
+        return {
+            'density': density,
+            'edge_density': edge_density,
+            'continuity': continuity,
+            'junction_count': junction_count,
+            'orientation': orientation,
+            'entropy': entropy
+        }
+
+    def observe_horizontal(self, graph):
+        if not graph.nodes: return []
+        nodes_sorted = sorted(graph.nodes, key=lambda p: (p[1], p[0]))
+        rows = {}
+        for n in nodes_sorted:
+            rows.setdefault(int(n[1]), []).append(n)
+        memory = []
+        row_keys = sorted(rows.keys())
+        for i, y in enumerate(row_keys):
+            row_nodes = rows[y]
+            if i % 2 == 0:
+                row_iter = row_nodes
+            else:
+                row_iter = reversed(row_nodes)
+            for n in row_iter:
+                memory.append(self._observe_window(graph, n))
+        return memory
+
+    def observe_vertical(self, graph):
+        if not graph.nodes: return []
+        nodes_sorted = sorted(graph.nodes, key=lambda p: (p[0], p[1]))
+        cols = {}
+        for n in nodes_sorted:
+            cols.setdefault(int(n[0]), []).append(n)
+        memory = []
+        col_keys = sorted(cols.keys())
+        for i, x in enumerate(col_keys):
+            col_nodes = cols[x]
+            if i % 2 == 0:
+                col_iter = col_nodes
+            else:
+                col_iter = reversed(col_nodes)
+            for n in col_iter:
+                memory.append(self._observe_window(graph, n))
+        return memory
+
+    def reconstruct(self, graph):
+        horizontal = self.observe_horizontal(graph)
+        vertical = self.observe_vertical(graph)
+        return {"horizontal": horizontal, "vertical": vertical}
+
+    def compute_signature(self, graph):
+        """
+        Returns a 6-element vector:
+        [density_mean, density_std, entropy_mean, entropy_std, continuity_mean, continuity_std]
+        All values are in normalized scale.
+        """
+        result = self.reconstruct(graph)
+        h_mem = result["horizontal"]
+        v_mem = result["vertical"]
+        def stats(vals):
+            if not vals: return 0.0, 0.0
+            mean = sum(vals) / len(vals)
+            variance = sum((x - mean) ** 2 for x in vals) / len(vals)
+            return mean, math.sqrt(variance)
+        h_d = [m["density"] for m in h_mem]
+        h_e = [m["entropy"] for m in h_mem]
+        h_c = [m["continuity"] for m in h_mem]
+        v_d = [m["density"] for m in v_mem]
+        v_e = [m["entropy"] for m in v_mem]
+        v_c = [m["continuity"] for m in v_mem]
+        d_mean, d_std = stats(h_d + v_d)
+        e_mean, e_std = stats(h_e + v_e)
+        c_mean, c_std = stats(h_c + v_c)
+        return [d_mean, d_std, e_mean, e_std, c_mean, c_std]
+
+# ─────────────────────────────────────────────
+# DTKO Similarity Helper (ratio-based)
+# ─────────────────────────────────────────────
+def dtko_similarity(sig1, sig2):
+    def ratio_sim(a, b):
+        hi = max(a, b)
+        lo = min(a, b)
+        if hi < 1e-9:
+            return 1.0
+        return lo / hi
+
+    dens_sim = ratio_sim(sig1[0], sig2[0])
+    dens_std_sim = ratio_sim(sig1[1], sig2[1])
+
+    # Entropy max for 4 bins is log2(4) = 2.0
+    ent_sim = 1 - min(abs(sig1[2] - sig2[2]) / 2.0, 1.0)
+    ent_std_sim = 1 - min(abs(sig1[3] - sig2[3]) / 2.0, 1.0)
+
+    cont_sim = 1 - min(abs(sig1[4] - sig2[4]), 1.0)
+    cont_std_sim = 1 - min(abs(sig1[5] - sig2[5]), 1.0)
+
+    return (dens_sim + dens_std_sim + ent_sim + ent_std_sim + cont_sim + cont_std_sim) / 6.0
+
+# ─────────────────────────────────────────────
+# STRUCTURAL MEMORY (updated to store DTKO signatures)
 # ─────────────────────────────────────────────
 class StructuralMemory:
     def __init__(self):
         self.entries = []
+        self.dtko = DTKO(window_radius=0.13)
 
     def add(self, name, graph):
         norm = graph.normalised()
@@ -1247,6 +1359,7 @@ class StructuralMemory:
         mask, vec = compute_dna(norm)
         cvec = connectivity_features(norm)
         sdesc = norm.shape_descriptors()
+        dtko_sig = self.dtko.compute_signature(norm)
         entry = {
             "name": name,
             "graph": norm,
@@ -1254,13 +1367,18 @@ class StructuralMemory:
             "vector": vec,
             "conn_vec": cvec,
             "shape_desc": sdesc,
-            "fingerprint": fingerprint
+            "fingerprint": fingerprint,
+            "dtko_sig": dtko_sig
         }
         self.entries.append(entry)
 
     def query(self, graph, top_k=5):
         norm = graph.normalised()
         query_fp = norm.compute_structural_fingerprint()
+        # Add DTKO vector to query fingerprint for active voting
+        dtko_vec = self.dtko.compute_signature(norm)
+        query_fp['dtko_vec'] = dtko_vec
+
         scored = []
         for e in self.entries:
             if "fingerprint" in e:
@@ -1269,7 +1387,7 @@ class StructuralMemory:
                 total = fp_score + W_NODE_PROFILE * node_sim
                 scored.append((total, e))
             else:
-                # Fallback to original scoring
+                # Fallback to original scoring (legacy)
                 q_mask, q_vec = compute_dna(norm)
                 q_conn = connectivity_features(norm)
                 q_sdesc = norm.shape_descriptors()
@@ -1301,7 +1419,8 @@ class StructuralMemory:
                 "vector": e["vector"],
                 "conn_vec": e["conn_vec"],
                 "shape_desc": e["shape_desc"],
-                "fingerprint": fp
+                "fingerprint": fp,
+                "dtko_sig": e.get("dtko_sig", [0.0]*6)
             })
         try:
             with open(path, "w") as f:
@@ -1329,6 +1448,10 @@ class StructuralMemory:
                 }
                 if "fingerprint" in d:
                     entry["fingerprint"] = d["fingerprint"]
+                if "dtko_sig" in d:
+                    entry["dtko_sig"] = d["dtko_sig"]
+                else:
+                    entry["dtko_sig"] = [0.0]*6
                 self.entries.append(entry)
             return True, f"Loaded {len(self.entries)} prototypes."
         except Exception as ex:
@@ -1388,12 +1511,14 @@ def nmd_entropy(scores):
     return round(norm, 4), label
 
 # ─────────────────────────────────────────────
-# GUI (VisualLSRApp) — now with shadow tie‑breaking
+# GUI (VisualLSRApp) — with Active DTKO
 # ─────────────────────────────────────────────
 class VisualLSRApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Visual‑LSR (V_LSR) — Hierarchical DNA + Shadow Sensor")
+        self.root.title("Visual‑LSR (V_LSR) — Hierarchical DNA + Shadow Sensor + Active DTKO")
+
+        self.dtko = DTKO(window_radius=0.13)
 
         left_frame = tk.Frame(root, width=180, bg="#222")
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(5, 0), pady=5)
@@ -1426,10 +1551,12 @@ class VisualLSRApp:
         self.alt_label = tk.Label(info_frame, text="", font=("Arial", 10),
                                   fg="gray", bg="black")
         self.alt_label.pack()
-        # Shadow sensor label
         self.shadow_label = tk.Label(info_frame, text="", font=("Arial", 10, "italic"),
                                      fg="light green", bg="black")
         self.shadow_label.pack()
+        self.dtko_label = tk.Label(info_frame, text="DTKO: Not run", font=("Arial", 9),
+                                   fg="cyan", bg="black")
+        self.dtko_label.pack()
 
         ctrl = tk.Frame(right_frame)
         ctrl.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1439,6 +1566,8 @@ class VisualLSRApp:
                   command=self.clear_canvas).pack(side=tk.LEFT, padx=5)
         tk.Button(ctrl, text="Reconstruct",
                   command=self.run_pipeline).pack(side=tk.LEFT, padx=5)
+        tk.Button(ctrl, text="Run DTKO",
+                  command=self.run_dtko).pack(side=tk.LEFT, padx=5)
 
         self.stroke_mode_var = tk.BooleanVar(value=False)
         self.stroke_btn = tk.Checkbutton(ctrl, text="Stroke Mode",
@@ -1566,6 +1695,7 @@ class VisualLSRApp:
         self.recog_label.config(text="Draw & click Reconstruct")
         self.alt_label.config(text="")
         self.shadow_label.config(text="")
+        self.dtko_label.config(text="DTKO: Not run")
 
     def auto_connect_nodes(self, new_node):
         if len(self.graph.nodes) < 2:
@@ -1696,7 +1826,78 @@ class VisualLSRApp:
             self.shadow_label.config(text="")
 
     # ====================================================================
-    # UPDATED run_pipeline() — Shadow-Guided Tie-Breaker (Improved for ties)
+    # DTKO display method (FIXED display scaling)
+    # ====================================================================
+    def run_dtko(self):
+        try:
+            if not self.graph.nodes:
+                self.dtko_label.config(text="DTKO: No nodes to analyze")
+                return
+
+            norm = self.graph.normalised()
+            dtko_result = self.dtko.reconstruct(norm)
+            h_mem = dtko_result["horizontal"]
+            v_mem = dtko_result["vertical"]
+
+            def stats(vals):
+                if not vals: return 0.0, 0.0
+                mean = sum(vals) / len(vals)
+                variance = sum((x - mean) ** 2 for x in vals) / len(vals)
+                return mean, math.sqrt(variance)
+
+            h_densities = [m["density"] for m in h_mem]
+            h_entropies = [m["entropy"] for m in h_mem]
+            h_continuities = [m["continuity"] for m in h_mem]
+
+            v_densities = [m["density"] for m in v_mem]
+            v_entropies = [m["entropy"] for m in v_mem]
+            v_continuities = [m["continuity"] for m in v_mem]
+
+            density_vals = h_densities + v_densities
+            entropy_vals = h_entropies + v_entropies
+            cont_vals = h_continuities + v_continuities
+
+            d_mean, d_std = stats(density_vals)
+            e_mean, e_std = stats(entropy_vals)
+            c_mean, c_std = stats(cont_vals)
+
+            # FIXED: Removed the * 10000.0 multiplier for normalized space
+            scaled_d_mean = d_mean
+            scaled_d_std = d_std
+
+            self.dtko_label.config(
+                text=f"DTKO: Density μ({scaled_d_mean:.2f}) σ({scaled_d_std:.2f}) | "
+                     f"Entropy μ({e_mean:.3f}) σ({e_std:.3f}) | "
+                     f"Cont. μ({c_mean:.3f}) σ({c_std:.3f})"
+            )
+
+            print("\n=== DTKO Structural Journey Report (Normalized) ===")
+            print(f"Horizontal Windows: {len(h_mem)}")
+            print(f"Vertical Windows:   {len(v_mem)}")
+            print(f"Total Observations: {len(density_vals)}")
+            print("")
+            print("Density:")
+            print(f"  Mean (μ): {scaled_d_mean:.4f}")
+            print(f"  Std Dev (σ): {scaled_d_std:.4f}")
+            print("")
+            print("Entropy:")
+            print(f"  Mean (μ): {e_mean:.4f}")
+            print(f"  Std Dev (σ): {e_std:.4f}")
+            print("")
+            print("Continuity:")
+            print(f"  Mean (μ): {c_mean:.4f}")
+            print(f"  Std Dev (σ): {c_std:.4f}")
+            print("=======================================\n")
+
+        except Exception as e:
+            error_msg = f"DTKO Error: {str(e)}"
+            self.dtko_label.config(text=error_msg)
+            print("\n!!! DTKO CRASH DETECTED !!!")
+            traceback.print_exc()
+            print("===========================\n")
+
+    # ====================================================================
+    # run_pipeline() — Uses main weighted score including DTKO
     # ====================================================================
     def run_pipeline(self):
         self.clear_overlays()
@@ -1704,12 +1905,14 @@ class VisualLSRApp:
             self.recog_label.config(text="No nodes drawn")
             self.alt_label.config(text="")
             self.shadow_label.config(text="")
+            self.dtko_label.config(text="DTKO: Not run")
             return
 
         if not self.memory.entries:
             self.recog_label.config(text="No prototypes in memory")
             self.alt_label.config(text="")
             self.shadow_label.config(text="")
+            self.dtko_label.config(text="DTKO: Not run")
             return
 
         norm = self.graph.normalised()
@@ -1718,9 +1921,10 @@ class VisualLSRApp:
             self.recog_label.config(text="No match found")
             self.alt_label.config(text="")
             self.shadow_label.config(text="")
+            self.dtko_label.config(text="DTKO: Not run")
             return
 
-        # Step 1: Compute actual shadow overlap for each candidate
+        # Step 1: Shadow overlap for each candidate
         scored_with_shadow = []
         for sc, entry in candidates:
             proto_graph = entry["graph"]
@@ -1730,25 +1934,17 @@ class VisualLSRApp:
         # Step 2: Sort by structural score (descending)
         scored_with_shadow.sort(key=lambda x: x[0], reverse=True)
 
-        # Step 3: Shadow-Guided Tie-Breaking
+        # Step 3: Shadow-Guided Tie-Breaking (DTKO is now in the main score)
         best_score, best_shadow, best_entry = scored_with_shadow[0]
 
         if len(scored_with_shadow) > 1:
             second_score, second_shadow, second_entry = scored_with_shadow[1]
             score_delta = best_score - second_score
 
-            # Rule A: If scores are nearly tied (≤ 5%) AND the second candidate has
-            # a significantly better shadow overlap (≥ 20% higher), swap them.
             if score_delta < 0.05 and (second_shadow - best_shadow) >= 0.20:
                 best_score, best_shadow, best_entry = second_score, second_shadow, second_entry
-
-            # Rule B (New): If scores are a dead tie (≤ 1%), we don't care about the 20% rule.
-            # Just pick the one with the better shadow.
             elif score_delta < 0.01 and second_shadow > best_shadow:
                 best_score, best_shadow, best_entry = second_score, second_shadow, second_entry
-
-            # Rule C (Old fallback): if the current best has terrible shadow (< 30%)
-            # and the second is decent (> 50%) even if delta is a bit larger (≤ 10%)
             elif best_shadow < 0.30 and score_delta < 0.10 and second_shadow >= 0.50:
                 best_score, best_shadow, best_entry = second_score, second_shadow, second_entry
 
@@ -1759,12 +1955,7 @@ class VisualLSRApp:
         conf = compute_confidence(norm, proto_graph, best_score)
 
         _, n_label = nmd_entropy([s[0] for s in scored_with_shadow])
-        if n_label == "high":
-            base_thresh = 0.45
-        elif n_label == "medium":
-            base_thresh = 0.35
-        else:
-            base_thresh = 0.25
+        base_thresh = 0.45 if n_label == "high" else 0.35 if n_label == "medium" else 0.25
 
         if len(scored_with_shadow) > 1 and (scored_with_shadow[0][0] - scored_with_shadow[1][0]) < 0.1:
             blend_edges = {}
@@ -1791,7 +1982,6 @@ class VisualLSRApp:
             line = self.canvas.create_line(sx1, sy1, sx2, sy2, fill="yellow", width=4)
             self.overlay_items.append(line)
 
-        # Shadow sensor display
         shadow_text = f"shadow overlap: {best_shadow:.0%}"
         if best_shadow > 0.8:
             self.shadow_label.config(text=shadow_text, fg="light green")
@@ -1810,6 +2000,9 @@ class VisualLSRApp:
 
         alt_parts = [f"{e['name']}({sc * 100:.0f}%)" for sc, _, e in scored_with_shadow[1:]]
         self.alt_label.config(text=" | ".join(alt_parts) if alt_parts else "")
+
+        # --- Run DTKO display ---
+        self.run_dtko()
     # ====================================================================
 
 def cross(o, a, b):
@@ -1822,5 +2015,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-    #//end//#

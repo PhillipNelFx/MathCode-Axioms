@@ -46,7 +46,7 @@ DOT_RADIUS  = 4
 CANVAS_SIZE = 600
 CELL_SIZE   = CANVAS_SIZE // GRID_SIZE
 
-# 11‑bit Mersenne DNA definitions
+# 12‑bit Mersenne DNA definitions
 DNA_HAS_LOOP               = 1
 DNA_HAS_DIAGONAL           = 2
 DNA_HAS_JUNCTION           = 4

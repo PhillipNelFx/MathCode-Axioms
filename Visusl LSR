@@ -6,6 +6,8 @@ Empty memory – you build your own prototypes.
 Enhancements:
   • Shadow‑Guided Tie‑Breaker: uses the passive shadow sensor to resolve close structural ties.
   • Added Connectivity Features to scoring (Quadrant Variance).
+  • Added Loop Position Signature (W_LOOP_SIG) to separate internal cycle layout.
+  • Added DNA_HAS_APEX to detect roof peaks.
   • Reconstruction tolerance tightened for better blue-line alignment.
   • Stroke mode and edge-based shadow sensor included.
   • All original code and sensor remain untouched.
@@ -56,15 +58,17 @@ DNA_HAS_PENDANT            = 128
 DNA_MULTI_COMPONENT        = 256
 DNA_HIGH_QUADRANT_VARIANCE = 512
 DNA_MULTI_HUB              = 1024
+DNA_HAS_APEX               = 2048
 
-# --- WEIGHTS (No DTKO) ---
+# --- UPDATED WEIGHTS (Added Loop Signature) ---
 W_MASK        = 0.12
-W_SPECTRAL    = 0.12
+W_SPECTRAL    = 0.08
 W_GEOMETRY    = 0.12
-W_PATH        = 0.08
+W_PATH        = 0.05
 W_REGIONAL    = 0.16
 W_CONNECTIVITY= 0.10
 W_NODE_PROFILE = 0.30
+W_LOOP_SIG    = 0.07
 # -------------------------------------------------------------------------
 
 # Confidence weights (multi‑factor)
@@ -744,6 +748,37 @@ class Graph:
         return g
 
     # -----------------------------------------------------------------
+    # NEW: EXTRACT CYCLES
+    # -----------------------------------------------------------------
+    def _extract_cycles(self):
+        """
+        Extract all unique cycles (node sets) using DFS.
+        Returns a list of sets, where each set is a cycle.
+        """
+        cycles = set()
+        visited = set()
+        for start in self.nodes:
+            if start in visited: continue
+            stack = [(start, None, [])]
+            while stack:
+                v, p, path = stack.pop()
+                if v in visited: continue
+                visited.add(v)
+                path = path + [v]
+                for e in self.edges:
+                    if v in e:
+                        other = next(iter(e - {v}))
+                        if other == p: continue
+                        if other in path:
+                            # Back edge found
+                            idx = path.index(other)
+                            cycle = frozenset(path[idx:])
+                            cycles.add(cycle)
+                        elif other not in visited:
+                            stack.append((other, v, path))
+        return [list(c) for c in cycles]
+
+    # -----------------------------------------------------------------
     # FINGERPRINT EXTRACTION METHODS (unchanged)
     # -----------------------------------------------------------------
     def _laplacian_matrix(self, normalized=False):
@@ -887,6 +922,47 @@ class Graph:
         std_vec = [math.sqrt(sum((x-m)**2 for x in col)/len(profiles)) for col,m in zip(zip(*profiles), mean_vec)]
         return mean_vec + std_vec
 
+    # -----------------------------------------------------------------
+    # NEW: LOOP POSITION SIGNATURE
+    # -----------------------------------------------------------------
+    def compute_loop_signature(self):
+        cycles = self._extract_cycles()
+        if not cycles:
+            return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+        xs = [n[0] for n in self.nodes]
+        ys = [n[1] for n in self.nodes]
+        bbox_height = max(ys) - min(ys) + 1e-9
+        bbox_width = max(xs) - min(xs) + 1e-9
+        bbox_area = bbox_height * bbox_width
+
+        centroids = []
+        areas = []
+        y_rel = []
+        for cycle in cycles:
+            cyc_nodes = list(cycle)
+            cx = sum(n[0] for n in cyc_nodes) / len(cyc_nodes)
+            cy = sum(n[1] for n in cyc_nodes) / len(cyc_nodes)
+            # Shoelace area
+            area = 0.0
+            for i in range(len(cyc_nodes)):
+                x1, y1 = cyc_nodes[i]
+                x2, y2 = cyc_nodes[(i+1)%len(cyc_nodes)]
+                area += x1*y2 - x2*y1
+            area = abs(area) / 2.0
+            centroids.append((cx, cy))
+            areas.append(area)
+            y_rel.append(cy / bbox_height)
+
+        num_loops = len(cycles)
+        mean_y_rel = sum(y_rel) / num_loops
+        std_y_rel = math.sqrt(sum((y - mean_y_rel)**2 for y in y_rel) / num_loops) if num_loops > 1 else 0.0
+        mean_area_rel = sum(areas) / (bbox_area * num_loops) if bbox_area > 0 else 0.0
+        std_area_rel = math.sqrt(sum((a - mean_area_rel)**2 for a in areas) / num_loops) if num_loops > 1 else 0.0
+
+        return [float(num_loops), mean_y_rel, std_y_rel, mean_area_rel, std_area_rel]
+
+    # -----------------------------------------------------------------
     def compute_structural_fingerprint(self) -> Dict:
         return {
             'dna_mask': compute_dna_mask(self),
@@ -895,7 +971,8 @@ class Graph:
             'geometry': self.geometry_fingerprint(),
             'path': self.path_fingerprint(),
             'regional': self.regional_profile_fingerprint(),
-            'conn_vec': connectivity_features(self)
+            'conn_vec': connectivity_features(self),
+            'loop_sig': self.compute_loop_signature()
         }
 
     # -----------------------------------------------------------------
@@ -986,6 +1063,34 @@ def compute_dna_mask(graph):
     if norm.component_count() >= 2: mask |= DNA_MULTI_COMPONENT
     if norm.quadrant_density_variance() >= QUADRANT_VARIANCE_THRESHOLD: mask |= DNA_HIGH_QUADRANT_VARIANCE
     if norm.hub_count() >= MULTI_HUB_THRESHOLD: mask |= DNA_MULTI_HUB
+
+    # --- NEW: APEX DETECTION ---
+    xs = [n[0] for n in norm.nodes]
+    ys = [n[1] for n in norm.nodes]
+    has_apex = False
+    if xs and ys:
+        # Find the topmost node(s)
+        min_y = min(ys)
+        for n in norm.nodes:
+            if n[1] == min_y and norm.degree(n) == 2:
+                neighbors = []
+                for e in norm.edges:
+                    if n in e:
+                        neighbors.append(next(iter(e - {n})))
+                if len(neighbors) == 2:
+                    n1, n2 = neighbors
+                    # Both neighbors must be strictly below the apex
+                    if n1[1] > n[1] and n2[1] > n[1]:
+                        # Check for divergence (opposite x directions)
+                        dx1 = n1[0] - n[0]
+                        dx2 = n2[0] - n[0]
+                        # If the slopes diverge outward, it's a roof peak
+                        if dx1 * dx2 < 0:
+                            has_apex = True
+                            break
+    if has_apex:
+        mask |= DNA_HAS_APEX
+
     return mask
 
 def compute_dna_vec(graph):
@@ -1087,7 +1192,7 @@ def node_profile_similarity(graph_a, graph_b):
     return 2 * forward * backward / (forward + backward)
 
 # ─────────────────────────────────────────────
-# FINGERPRINT COMPARISON (NO DTKO)
+# FINGERPRINT COMPARISON (UPDATED WITH LOOP SIGNATURE)
 # ─────────────────────────────────────────────
 def compare_fingerprints(fp1, fp2) -> float:
     score = 0.0
@@ -1130,6 +1235,13 @@ def compare_fingerprints(fp1, fp2) -> float:
     if conn1 and conn2:
         conn_sim = cosine_similarity(conn1, conn2)
         score += W_CONNECTIVITY * conn_sim
+
+    # --- NEW: Loop Position Signature Similarity ---
+    loop1 = fp1.get('loop_sig', [0.0] * 5)
+    loop2 = fp2.get('loop_sig', [0.0] * 5)
+    if loop1 and loop2:
+        loop_sim = cosine_similarity(loop1, loop2)
+        score += W_LOOP_SIG * loop_sim
 
     return score
 
@@ -1193,7 +1305,7 @@ def compute_shadow_overlap(user_graph: Graph, proto_graph: Graph, dilation_fract
     return 2 * forward_ov * backward_ov / (forward_ov + backward_ov)
 
 # ─────────────────────────────────────────────
-# STRUCTURAL MEMORY (NO DTKO)
+# STRUCTURAL MEMORY (UPDATED WITH LOOP SIGNATURE)
 # ─────────────────────────────────────────────
 class StructuralMemory:
     def __init__(self):
@@ -1765,6 +1877,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-   
-
-           #//end//#
+      
+       #/end/#

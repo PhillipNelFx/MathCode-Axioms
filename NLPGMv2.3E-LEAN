@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Non‑Linear Probabilistic Graph Model V2.3EL
+Non‑Linear Probabilistic Graph Model V2.3EL+AE1
 Latent State Reconstruction Engine with Contradiction Insight Sensor,
 NMD hypothesis‑space observer, strict B/R/L separation, and
 probabilistic forward trace (branching preserved, learning aware).
@@ -19,12 +19,19 @@ Mathcode‑aligned refinements (v4.4.4 → V2.3EL):
   • 3‑flag pre‑filter in DNA similarity (primary SYS/DATA/OP)
   • T13 optimal forward‑trace horizon (dynamic stop)
   • Axiom‑traceable scale tags in report
+
+Adaptive Edge Fix (V2.3EL+AE1):
+  - Weight reinforces on repeat transitions (reinforce‑or‑create in batch_add)
+  - Confidence/entropy deltas computed in why‑vectors (weighted‑additive formula)
+  - L_reconcile picks highest‑strength edge
+  - _observe_adapt fires on confirmed forward transitions only, with cached vector field
+  - Shared epistemic update method for consistency
 """
 
 import time, math, json, os, shutil, random, hashlib, re
 from dataclasses import dataclass
 
-VERSION = "V2.3EL"
+VERSION = "V2.3EL+AE1"
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -121,6 +128,8 @@ class Config:
     FWD_BRANCH_SPREAD_THRESHOLD: float = 0.15
     # T13 optimal horizon – stop forward trace when max prob drops below this
     FWD_MARGINAL_GAIN_MIN: float = 0.15
+    # Vector field refresh interval for batch_add (performance)
+    VF_REFRESH_INTERVAL:  int   = 10
     SAVE_FILE:   str = "contacts.json"
     BACKUP_FILE: str = "contacts.json.bak"
     TEMP_FILE:   str = "contacts.json.tmp"
@@ -596,7 +605,7 @@ class MemoryDB:
         if n.price: self._rec_price(n.price)
         return n
 
-    # ── public API ── (unchanged)
+    # ── public API ──
     def batch_add(self, text):
         lines=text.strip().split("\n"); items=[]
         for line in lines:
@@ -606,6 +615,10 @@ class MemoryDB:
             elif " " in line and not re.match(r'^\d+\.?\d*$',line): items.extend(line.split())
             else: items.append(line)
         if not items: return "No valid items."
+
+        # Cache vector field for _observe_adapt, refreshed periodically
+        vf_cache = self.vector_field()
+        refresh_interval = cfg.VF_REFRESH_INTERVAL
 
         stored=[]; batch_nodes=[]; prev=None
         for i,item in enumerate(items):
@@ -642,6 +655,7 @@ class MemoryDB:
                 self._last_step_price=np if np else self._last_step_price
                 continue
 
+            # FIX: reinforce-or-create edges on repeat transitions (Weight)
             if prev and prev in self.nodes:
                 pn=self.nodes[prev]
                 if pn.price and nn.price:
@@ -652,15 +666,37 @@ class MemoryDB:
                 else:
                     strength=cfg.BATCH_LINK_STRENGTH; tr=None
                 xz=not same_zone(nn.price,pn.price)
-                if prev not in nn.links: nn.links[prev]=Edge(strength,cross_zone=xz,transition=tr)
-                if text_c not in pn.links:
-                    rt=get_transition(nn.price,pn.price) if tr else None
-                    pn.links[text_c]=Edge(strength,cross_zone=xz,transition=rt)
+                # forward edge: prev -> nn (confirmed observation)
+                pc = p_sim(nn.price, pn.price, nn.volatility) if pn.price and nn.price else 1.0
+                if prev in nn.links:
+                    nn.links[prev].reinforce(pc)
+                    if tr: nn.links[prev].transition = tr
+                    nn.links[prev].cross_zone = xz
+                else:
+                    nn.links[prev] = Edge(strength, cross_zone=xz, transition=tr)
+
+                # reverse edge: nn -> prev (still update weight, but NOT epistemic learning)
+                pc_rev = p_sim(pn.price, nn.price, pn.volatility) if pn.price and nn.price else 1.0
+                if text_c in pn.links:
+                    pn.links[text_c].reinforce(pc_rev)
+                    rt_rev = get_transition(nn.price, pn.price) if tr else None
+                    if rt_rev: pn.links[text_c].transition = rt_rev
+                    pn.links[text_c].cross_zone = xz
+                else:
+                    rt_rev = get_transition(nn.price, pn.price) if tr else None
+                    pn.links[text_c] = Edge(strength, cross_zone=xz, transition=rt_rev)
+
+                # FIX: Adapt on confirmed forward transition only (Bug 1)
+                self._observe_adapt(pn, nn, nn.links[prev], vf=vf_cache)
 
             batch_nodes.append(nn)
             stored.append(f"{text_c}[{nn.price_zone}]")
             prev=text_c
             self._last_step_price=np if np else self._last_step_price
+
+            # Refresh vector field cache every refresh_interval items
+            if (i + 1) % refresh_interval == 0:
+                vf_cache = self.vector_field()
 
         if batch_nodes and batch_nodes[-1].price:
             self._last_step_price=batch_nodes[-1].price
@@ -1155,6 +1191,27 @@ class MemoryDB:
                 "density":round(df,4),"entropy":round(ef,4),"epistemic":round(epf,4),"stability":round(rsf,4)}
 
     # ─────────────────────────────────────────────
+    #  Shared epistemic helpers
+    # ─────────────────────────────────────────────
+
+    def _confidence_estimate(self, density_factor, contradiction_strength):
+        """Weighted-additive confidence: evidence depth + consistency."""
+        return round(0.4 * density_factor + 0.6 * (1.0 - contradiction_strength), 4)
+
+    def _apply_epistemic_update(self, edge, delta_entropy, delta_contradiction, delta_confidence):
+        """Incremental mean updates and epistemic_weight calculation (shared)."""
+        edge.epistemic_count += 1
+        n = edge.epistemic_count
+        edge.mu_entropy += (delta_entropy - edge.mu_entropy) / n
+        edge.mu_contradiction += (delta_contradiction - edge.mu_contradiction) / n
+        edge.mu_confidence += (delta_confidence - edge.mu_confidence) / n
+        freq_norm = math.tanh(n / 10.0)
+        edge.epistemic_weight = round(
+            cfg.L_ALPHA * freq_norm +
+            cfg.L_BETA * max(0, edge.mu_confidence) -
+            cfg.L_GAMMA * abs(edge.mu_contradiction), 4)
+
+    # ─────────────────────────────────────────────
     #  NMD Phase 2A — Hypothesis-Space Observer
     # ─────────────────────────────────────────────
 
@@ -1440,6 +1497,8 @@ class MemoryDB:
             return why
         dna = self.dna_distribution()
         global_contradiction = ssv.get("contradiction_strength", 0.0)
+        global_confidence = ssv["combined_confidence"]["overall"]
+        global_entropy = ssv["dna_profile"].get("entropy", 0)
         vf = self.vector_field()
         prev_zone = ssv["observed_zone"]
         for hop in fwd_structured:
@@ -1456,11 +1515,26 @@ class MemoryDB:
             cls_to = vf_to.get("classification", "neutral")
             cs_to, _ = self._contradiction(regime_to, nd_to, cls_to, ssv.get("mirror_similarity", 0.0))
             contradiction_delta = round(cs_to - global_contradiction, 4)
-            confidence_delta = 0.0
+
+            # Weighted‑additive confidence (Bug 2 fix)
+            density_factor = min(density_to / 10.0, 1.0)
+            confidence_to = self._confidence_estimate(density_factor, cs_to)
+            confidence_delta = round(confidence_to - global_confidence, 4)
+
+            # per‑hop normalized entropy
+            pr = self.ct.probs(z_to)
+            if pr:
+                raw_entropy = -sum(p * math.log(p) for p in pr.values() if p > 0)
+                n = len(pr)
+                norm_entropy = raw_entropy / math.log(n) if n > 1 else 0.0
+            else:
+                norm_entropy = 0.0
+            entropy_delta = round(norm_entropy - global_entropy, 4)
+
             why.append({
                 "from": prev_zone,
                 "to": z_to,
-                "delta_entropy": 0.0,
+                "delta_entropy": entropy_delta,
                 "delta_contradiction": contradiction_delta,
                 "delta_confidence": confidence_delta,
                 "context": {
@@ -1480,27 +1554,72 @@ class MemoryDB:
         for wv in why_vectors:
             z_from = wv["from"]
             z_to = wv["to"]
+            # pick highest‑strength edge between the two zones
             edge = None
+            best_strength = -1.0
             from_nodes = [n for n in self.nodes.values() if n.price_zone == z_from]
             for fn in from_nodes:
                 for lv, e in fn.links.items():
                     if lv in self.nodes and self.nodes[lv].price_zone == z_to:
-                        edge = e
-                        break
-                if edge:
-                    break
+                        if e.strength > best_strength:
+                            edge = e
+                            best_strength = e.strength
             if edge is None:
                 continue
-            edge.epistemic_count += 1
-            n = edge.epistemic_count
-            edge.mu_entropy += (wv["delta_entropy"] - edge.mu_entropy) / n
-            edge.mu_contradiction += (wv["delta_contradiction"] - edge.mu_contradiction) / n
-            edge.mu_confidence += (wv["delta_confidence"] - edge.mu_confidence) / n
-            freq_norm = math.tanh(n / 10.0)
-            edge.epistemic_weight = round(
-                cfg.L_ALPHA * freq_norm +
-                cfg.L_BETA * max(0, edge.mu_confidence) -
-                cfg.L_GAMMA * abs(edge.mu_contradiction), 4)
+            # Use shared update method (Bug 4)
+            self._apply_epistemic_update(edge, wv["delta_entropy"], wv["delta_contradiction"], wv["delta_confidence"])
+
+    # ── Observation‑driven adaptation (fires on B, forward transitions only) ──
+    def _observe_adapt(self, from_node, to_node, edge, vf=None):
+        """Update edge epistemic fields using local deltas of the actual transition."""
+        from_zone = from_node.price_zone
+        to_zone = to_node.price_zone
+        if from_zone == to_zone or from_zone == "Z?" or to_zone == "Z?":
+            return
+        if vf is None:
+            vf = self.vector_field()
+        # source contradiction
+        an_from = self._cluster(from_zone)
+        vf_from = vf.get(from_zone, {})
+        regime_from = an_from["regime"]
+        nd_from = vf_from.get("net_direction", 0.0)
+        cls_from = vf_from.get("classification", "neutral")
+        cs_from, _ = self._contradiction(regime_from, nd_from, cls_from, 0.0)
+        # target contradiction
+        an_to = self._cluster(to_zone)
+        vf_to = vf.get(to_zone, {})
+        regime_to = an_to["regime"]
+        nd_to = vf_to.get("net_direction", 0.0)
+        cls_to = vf_to.get("classification", "neutral")
+        cs_to, _ = self._contradiction(regime_to, nd_to, cls_to, 0.0)
+
+        delta_contradiction = round(cs_to - cs_from, 4)
+
+        # Weighted‑additive confidence estimates (Bug 2 fix)
+        density_factor_from = min(an_from["node_count"] / 10.0, 1.0)
+        density_factor_to   = min(an_to["node_count"]   / 10.0, 1.0)
+        confidence_from = self._confidence_estimate(density_factor_from, cs_from)
+        confidence_to   = self._confidence_estimate(density_factor_to, cs_to)
+        delta_confidence = round(confidence_to - confidence_from, 4)
+
+        # local delta entropy
+        pr_from = self.ct.probs(from_zone)
+        raw_entropy_from = 0.0
+        if pr_from:
+            raw_entropy_from = -sum(p * math.log(p) for p in pr_from.values() if p > 0)
+        nf = len(pr_from)
+        norm_entropy_from = raw_entropy_from / math.log(nf) if nf > 1 else 0.0
+
+        pr_to = self.ct.probs(to_zone)
+        raw_entropy_to = 0.0
+        if pr_to:
+            raw_entropy_to = -sum(p * math.log(p) for p in pr_to.values() if p > 0)
+        nt = len(pr_to)
+        norm_entropy_to = raw_entropy_to / math.log(nt) if nt > 1 else 0.0
+        delta_entropy = round(norm_entropy_to - norm_entropy_from, 4)
+
+        # Use shared update method (Bug 4)
+        self._apply_epistemic_update(edge, delta_entropy, delta_contradiction, delta_confidence)
 
     # ── build_ssv (unchanged except fwd_distributions) ──
 

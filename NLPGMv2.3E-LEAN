@@ -26,6 +26,8 @@ Adaptive Edge Fix (V2.3EL+AE1):
   - L_reconcile picks highest‑strength edge
   - _observe_adapt fires on confirmed forward transitions only, with cached vector field
   - Shared epistemic update method for consistency
+  - Entropy baseline aligned between observe‑adapt and why‑vectors
+  - Representative edge now uses newest‑first example lookup
 """
 
 import time, math, json, os, shutil, random, hashlib, re
@@ -708,7 +710,7 @@ class MemoryDB:
 
     def decay_cycle(self):
         for n in self.nodes.values():
-            for e in n.links.values(): e.decay()
+            for e in n.links.items(): e[1].decay()
         dead=[s for s,p in self.patterns.items() if not p.decay() or not p.alive()]
         for s in dead: del self.patterns[s]
         self.ct.decay(); self.cycles+=1
@@ -1495,10 +1497,8 @@ class MemoryDB:
         why = []
         if len(fwd_structured) < 1:
             return why
-        dna = self.dna_distribution()
         global_contradiction = ssv.get("contradiction_strength", 0.0)
         global_confidence = ssv["combined_confidence"]["overall"]
-        global_entropy = ssv["dna_profile"].get("entropy", 0)
         vf = self.vector_field()
         prev_zone = ssv["observed_zone"]
         for hop in fwd_structured:
@@ -1516,20 +1516,30 @@ class MemoryDB:
             cs_to, _ = self._contradiction(regime_to, nd_to, cls_to, ssv.get("mirror_similarity", 0.0))
             contradiction_delta = round(cs_to - global_contradiction, 4)
 
-            # Weighted‑additive confidence (Bug 2 fix)
+            # Weighted‑additive confidence
             density_factor = min(density_to / 10.0, 1.0)
             confidence_to = self._confidence_estimate(density_factor, cs_to)
             confidence_delta = round(confidence_to - global_confidence, 4)
 
-            # per‑hop normalized entropy
-            pr = self.ct.probs(z_to)
-            if pr:
-                raw_entropy = -sum(p * math.log(p) for p in pr.values() if p > 0)
-                n = len(pr)
-                norm_entropy = raw_entropy / math.log(n) if n > 1 else 0.0
+            # per‑hop normalized entropy (target zone) and source zone entropy
+            pr_to = self.ct.probs(z_to)
+            if pr_to:
+                raw_entropy_to = -sum(p * math.log(p) for p in pr_to.values() if p > 0)
+                n_to = len(pr_to)
+                norm_entropy_to = raw_entropy_to / math.log(n_to) if n_to > 1 else 0.0
             else:
-                norm_entropy = 0.0
-            entropy_delta = round(norm_entropy - global_entropy, 4)
+                norm_entropy_to = 0.0
+
+            # source zone entropy (prev_zone) – the domain‑consistent baseline
+            pr_from = self.ct.probs(prev_zone)
+            if pr_from:
+                raw_entropy_from = -sum(p * math.log(p) for p in pr_from.values() if p > 0)
+                n_from = len(pr_from)
+                norm_entropy_from = raw_entropy_from / math.log(n_from) if n_from > 1 else 0.0
+            else:
+                norm_entropy_from = 0.0
+
+            entropy_delta = round(norm_entropy_to - norm_entropy_from, 4)
 
             why.append({
                 "from": prev_zone,
@@ -1554,20 +1564,34 @@ class MemoryDB:
         for wv in why_vectors:
             z_from = wv["from"]
             z_to = wv["to"]
-            # pick highest‑strength edge between the two zones
-            edge = None
-            best_strength = -1.0
-            from_nodes = [n for n in self.nodes.values() if n.price_zone == z_from]
-            for fn in from_nodes:
-                for lv, e in fn.links.items():
-                    if lv in self.nodes and self.nodes[lv].price_zone == z_to:
-                        if e.strength > best_strength:
-                            edge = e
-                            best_strength = e.strength
+            edge = self._representative_edge(z_from, z_to)
             if edge is None:
                 continue
-            # Use shared update method (Bug 4)
             self._apply_epistemic_update(edge, wv["delta_entropy"], wv["delta_contradiction"], wv["delta_confidence"])
+
+    def _representative_edge(self, z_from, z_to):
+        """Return the literal edge that best represents the zone‑pair transition,
+        newest recorded example first, falling back to highest‑strength edge."""
+        # Try recorded examples (newest‑first)
+        examples = self.ct.examples_for(z_from, z_to)
+        for fp, tp in reversed(examples):
+            from_candidates = [n for n in self.nodes.values() if n.price_zone == z_from and n.price == fp]
+            to_candidates   = [n for n in self.nodes.values() if n.price_zone == z_to   and n.price == tp]
+            for fn in from_candidates:
+                for tn in to_candidates:
+                    if tn.value in fn.links:
+                        return fn.links[tn.value]
+        # Fallback to highest‑strength edge in the zone pair
+        best_edge = None
+        best_strength = -1.0
+        from_nodes = [n for n in self.nodes.values() if n.price_zone == z_from]
+        for fn in from_nodes:
+            for lv, e in fn.links.items():
+                if lv in self.nodes and self.nodes[lv].price_zone == z_to:
+                    if e.strength > best_strength:
+                        best_edge = e
+                        best_strength = e.strength
+        return best_edge
 
     # ── Observation‑driven adaptation (fires on B, forward transitions only) ──
     def _observe_adapt(self, from_node, to_node, edge, vf=None):
@@ -1595,14 +1619,14 @@ class MemoryDB:
 
         delta_contradiction = round(cs_to - cs_from, 4)
 
-        # Weighted‑additive confidence estimates (Bug 2 fix)
+        # Weighted‑additive confidence estimates
         density_factor_from = min(an_from["node_count"] / 10.0, 1.0)
         density_factor_to   = min(an_to["node_count"]   / 10.0, 1.0)
         confidence_from = self._confidence_estimate(density_factor_from, cs_from)
         confidence_to   = self._confidence_estimate(density_factor_to, cs_to)
         delta_confidence = round(confidence_to - confidence_from, 4)
 
-        # local delta entropy
+        # local delta entropy (consistent, same domain as why‑vectors)
         pr_from = self.ct.probs(from_zone)
         raw_entropy_from = 0.0
         if pr_from:
@@ -1618,10 +1642,9 @@ class MemoryDB:
         norm_entropy_to = raw_entropy_to / math.log(nt) if nt > 1 else 0.0
         delta_entropy = round(norm_entropy_to - norm_entropy_from, 4)
 
-        # Use shared update method (Bug 4)
         self._apply_epistemic_update(edge, delta_entropy, delta_contradiction, delta_confidence)
 
-    # ── build_ssv (unchanged except fwd_distributions) ──
+    # ── build_ssv (unchanged) ──
 
     def build_ssv(self, results, query, vf=None):
         if not results: return {"error":"No matches found"}

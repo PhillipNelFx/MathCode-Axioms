@@ -1,0 +1,2282 @@
+#!/usr/bin/env python3
+"""
+Non‑Linear Probabilistic Graph Model V2.3EL+AE1
+Latent State Reconstruction Engine with Contradiction Insight Sensor,
+NMD hypothesis‑space observer, strict B/R/L separation, and
+probabilistic forward trace (branching preserved, learning aware).
+Single‑file lean build. All LSR mechanisms intact.
+NMD is a read‑only meta‑observer; it never influences the reconstruction.
+Phase 2 adds WHY vectors (Ω) on every transition and a separate
+Learning operator (L) that reconciles epistemic deltas into edge weights
+without contaminating the reconstruction (R).
+
+Forward Trace now correctly preserves the full zone probability
+distribution at each hop rather than collapsing to a greedy path.
+Branch points are explicitly labelled, and learning skips ambiguous hops.
+
+Mathcode‑aligned refinements (v4.4.4 → V2.3EL):
+  • DNA vacuum state labelled VACUUM (cat=0 → identity)
+  • 3‑flag pre‑filter in DNA similarity (primary SYS/DATA/OP)
+  • T13 optimal forward‑trace horizon (dynamic stop)
+  • Axiom‑traceable scale tags in report
+
+Adaptive Edge Fix (V2.3EL+AE1):
+  - Weight reinforces on repeat transitions (reinforce‑or‑create in batch_add)
+  - Confidence/entropy deltas computed in why‑vectors (weighted‑additive formula)
+  - L_reconcile picks highest‑strength edge
+  - _observe_adapt fires on confirmed forward transitions only, with cached vector field
+  - Shared epistemic update method for consistency
+  - Entropy baseline aligned between observe‑adapt and why‑vectors
+  - Representative edge now uses newest‑first example lookup
+"""
+
+import time, math, json, os, shutil, random, hashlib, re
+from dataclasses import dataclass
+
+VERSION = "V2.3EL+AE1"
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+
+@dataclass
+class Config:
+    LINK_THRESHOLD:       float = 0.30
+    GRAPH_BOOST:          float = 0.10
+    HOP2_DAMPEN:          float = 0.30
+    DECAY_RATE:           float = 0.98
+    MIN_EDGE_STRENGTH:    float = 0.05
+    USAGE_BIAS:           float = 0.002
+    REINFORCE_RATE:       float = 0.05
+    FREQ_BONUS:           float = 0.02
+    W_NGRAM:              float = 0.26
+    W_PHONETIC:           float = 0.23
+    W_VECTOR:             float = 0.16
+    W_WORD_OVERLAP:       float = 0.10
+    W_DNA_SIM:            float = 0.08
+    W_PRICE:              float = 0.17
+    W_PRICE_NUMERIC:      float = 0.85
+    W_DNA_NUMERIC:        float = 0.15
+    CONFIDENCE_HIGH:      float = 0.70
+    CONFIDENCE_MEDIUM:    float = 0.40
+    CONFIDENCE_LOW:       float = 0.15
+    CONFIDENCE_NONE:      float = 0.10
+    FOREX_VOL_RATIO:      float = 0.0002
+    MID_FOREX_VOL_RATIO:  float = 0.005
+    CRYPTO_VOL_RATIO:     float = 0.02
+    GOLD_VOL_RATIO:       float = 0.01
+    DEFAULT_VOL_RATIO:    float = 0.01
+    EDGE_VOLATILITY_MULT: float = 5.0
+    MIN_SINGULARITY_LEN:  int   = 3
+    BASE_SINGULARITY_WT:  float = 0.12
+    POSITION_PREFIX_WT:   float = 0.08
+    POSITION_SUFFIX_WT:   float = 0.06
+    BOOST_GATE_THRESHOLD: float = 0.35
+    AGRR_MIN_STRENGTH:    float = 0.60
+    RESONANCE_THRESHOLD:  float = 0.05
+    HUB_DEGREE_THRESHOLD: float = 0.70
+    HUB_PENALTY_FACTOR:   float = 0.15
+    BATCH_LINK_STRENGTH:  float = 0.55
+    FINGERPRINT_K:        int   = 8
+    COMPLEMENTARY_BOOST:  float = 1.25
+    SAME_TYPE_PENALTY:    float = 0.75
+    CROSS_ZONE_PENALTY:   float = 0.50
+    TRANSITION_MAGNITUDE_TOLERANCE: float = 0.20
+    PATTERN_MIN_LENGTH:   int   = 3
+    PATTERN_MAX_STORED:   int   = 50
+    PATTERN_DECAY_RATE:   float = 0.90
+    CLUSTER_TRANSITION_DECAY: float = 0.99
+    MAX_TRANSITION_EXAMPLES: int  = 5
+    MIRROR_WINDOW:        int   = 10
+    MIRROR_SIMILARITY_THRESHOLD: float = 0.60
+    DNA_ARCHETYPES:       list  = None
+    DNA_WINDOW:           int   = 10
+    DNA_HISTORY_MAX:      int   = 5
+    EMA_PERIOD:           int   = 50
+    EMA_BAND_NEAR_MAX:    float = 0.20
+    EMA_BAND_EXTENDED:    float = 0.70
+    COMPLETION_WEIGHT_DIRECT: float = 0.5
+    COMPLETION_WEIGHT_GRAPH:  float = 0.5
+    FORWARD_MOMENTUM_PENALTY: float = 0.3
+    CONVERGENCE_HISTORY_SIZE: int   = 20
+    REGIME_SHIFT_PRESSURE_MIN: float = 0.7
+    # ── CIS configuration ──
+    CIS_CONTRADICTION_THRESHOLD: float = 0.3
+    CIS_MILD_TENSION_MIN:        float = 0.15
+    CIS_OUTCOME_STEPS:           int   = 5
+    CIS_MAX_EPISODES:            int   = 50
+    CIS_DECAY_AGE_DAYS:          float = 30.0
+    CIS_MIN_MATCHES:             int   = 3
+    CIS_SIMILARITY_THRESHOLD:    float = 0.7
+    CIS_KERNEL_BETA:             float = 2.5
+    CIS_CONFIDENCE_CAP:          float = 0.85
+    CIS_VERBOSE:                 bool  = False
+    CIS_PRE_TRANSITION_CONTRADICTION_MIN: float = 0.6
+    CIS_PRE_TRANSITION_STABILITY_MAX:     float = 0.3
+    CIS_PRE_TRANSITION_PRESSURE_MIN:      float = 0.8
+    # Component‑level divergence
+    CIS_COMPONENT_SPREAD_MIN:    float = 0.35
+    # NMD Phase 2A
+    NMD_TOPK:            int   = 5
+    NMD_ENTROPY_LOW:     float = 0.4
+    NMD_ENTROPY_HIGH:    float = 0.7
+    # Phase 2 – Reconciliation operator coefficients
+    L_ALPHA:  float = 0.5
+    L_BETA:   float = 0.3
+    L_GAMMA:  float = 0.2
+    # Forward trace – probability threshold for RECONSTRUCTION label
+    FWD_RECON_PROB_THRESHOLD: float = 0.4
+    # Branch detection – spread threshold for ambiguity
+    FWD_BRANCH_SPREAD_THRESHOLD: float = 0.15
+    # T13 optimal horizon – stop forward trace when max prob drops below this
+    FWD_MARGINAL_GAIN_MIN: float = 0.15
+    # Vector field refresh interval for batch_add (performance)
+    VF_REFRESH_INTERVAL:  int   = 10
+    SAVE_FILE:   str = "contacts.json"
+    BACKUP_FILE: str = "contacts.json.bak"
+    TEMP_FILE:   str = "contacts.json.tmp"
+
+    def __post_init__(self):
+        if self.DNA_ARCHETYPES is None:
+            self.DNA_ARCHETYPES = ["TrendingUp","TrendingDown","Ranging","Breakout","Reversing","LowVol"]
+
+cfg = Config()
+
+CONFIDENCE_DISPLAY = {
+    "HIGH":           "✓  CONFIRMED MATCH",
+    "RESOLVED_MATCH": "✓  RESOLVED MATCH",
+    "MEDIUM":         "~  CONFIRM BEFORE ACTING",
+    "LOW":            "!  WEAK MATCH — CAUTION",
+    "AMBIGUOUS":      "?  MULTIPLE CANDIDATES",
+    "NO_MATCH":       "✗  NO MATCH",
+    "INVALID":        "✗  NO DATA",
+}
+
+# ─────────────────────────────────────────────
+# TEXT + PRICE HELPERS (unchanged)
+# ─────────────────────────────────────────────
+
+_ALPHA    = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789. "
+_CHAR_NUM = {c: i for i, c in enumerate(_ALPHA)}
+_BASE     = len(_ALPHA)
+
+def _log(tag, msg): print(f"  [{tag}] {msg}")
+
+def clean_text(text):
+    if not text: return ""
+    s = text.strip()
+    if re.match(r'^\d+\.?\d*$', s): return s
+    return "".join(c if c in _CHAR_NUM else " " for c in text.upper()).strip()
+
+def get_price_zone(price):
+    if price is None: return "Z?"
+    if price < 5:      return f"Z{int(price*100)/100:.2f}"
+    if price < 200:    return f"Z{int(price*10)/10:.1f}"
+    if price < 50000:  return f"Z{(int(price)//100)*100}"
+    return f"Z{(int(price)//1000)*1000}"
+
+def _zone_val(z):
+    try: return float(z.replace("Z",""))
+    except: return 0.0
+
+def same_zone(pa, pb):
+    return pa is not None and pb is not None and get_price_zone(pa) == get_price_zone(pb)
+
+def extract_price(text):
+    c = clean_text(text)
+    price = None
+    try: price = float(c)
+    except:
+        d = re.sub(r'[^0-9.]','',c)
+        try: price = float(d) if d else None
+        except: pass
+    if price and price > 0:
+        r = cfg.FOREX_VOL_RATIO if price<5 else cfg.MID_FOREX_VOL_RATIO if price<200 else cfg.CRYPTO_VOL_RATIO if price<10000 else cfg.GOLD_VOL_RATIO
+        return price, price * r
+    return None, 0.005
+
+def get_transition(pf, pt):
+    if pf is None or pt is None: return None
+    d = pt - pf
+    mag = abs(d)
+    dir_ = "UP" if d>0 else "DOWN" if d<0 else "FLAT"
+    if pf < 5:    mr, sig = round(mag*10000)/10000, f"{dir_}_{int(mag*10000)}"
+    elif pf < 200: mr, sig = round(mag*10)/10,     f"{dir_}_{int(mag*10)}"
+    else:          mr, sig = round(mag,1),           f"{dir_}_{int(mag)}"
+    return {"direction":dir_, "magnitude":mr, "signature":sig}
+
+def build_pattern_sig(transitions):
+    if len(transitions) < cfg.PATTERN_MIN_LENGTH: return None
+    return hashlib.sha256("→".join(transitions).encode()).hexdigest()[:16]
+
+def p_sim(pa, pb, vol):
+    if pa is None or pb is None: return 0.0
+    d = abs(pa-pb)
+    if d == 0: return 1.0
+    vol = vol or (max(abs(pa),abs(pb))*cfg.DEFAULT_VOL_RATIO or 0.005)
+    return math.exp(-d/vol)
+
+def ep_sim(pa, pb, vol):
+    if pa is None or pb is None: return 0.0
+    d = abs(pa-pb)
+    if d == 0: return 1.0
+    vol = vol or (max(abs(pa),abs(pb))*cfg.DEFAULT_VOL_RATIO or 0.005)
+    return math.exp(-d/(vol*cfg.EDGE_VOLATILITY_MULT))
+
+def fmt_age(s):
+    if s<60:     return f"{int(s)}s"
+    if s<3600:   return f"{int(s/60)}m"
+    if s<86400:  return f"{int(s/3600)}h"
+    if s<604800: return f"{int(s/86400)}d"
+    return f"{int(s/604800)}w"
+
+def detect_regime(zone_nodes):
+    prices = sorted([n.price for n in zone_nodes if n.price])
+    if len(prices) < 4: return "SIDEWAYS"
+    h = len(prices)//2
+    fa, sa = sum(prices[:h])/h, sum(prices[h:])/h
+    return "UP" if sa>fa*1.001 else "DOWN" if sa<fa*0.999 else "SIDEWAYS"
+
+# ── DNA helpers (vacuum label added) ──
+
+def _expr_cat(text):
+    u = text.upper(); words = u.split()
+    hn = any(c.isdigit() for c in u); hl = any(c.isalpha() for c in u)
+    cat = 0
+    if hn: cat |= 2
+    if any("_" in w or (any(c.isdigit() for c in w) and any(c.isalpha() for c in w)) for w in words): cat |= 1
+    if any(len(w)>=3 and w.isalpha() for w in words): cat |= 8
+    if any(len(w)>=4 and (w.endswith("ER") or w.endswith("OR") or w.endswith("ING")) for w in words): cat |= 4
+    if hn and not hl: cat = 2
+    return cat or (2 if hn else 8)
+
+def express_dna(text, links=None, strand=None, price=None):
+    if links is None: links = {}
+    cat  = _expr_cat(text)
+    zone = get_price_zone(price) if price else "Z?"
+    top  = sorted(links.items(), key=lambda x: x[1].strength if hasattr(x[1],'strength') else 0, reverse=True)[:cfg.FINGERPRINT_K]
+    if top:
+        fp  = hashlib.sha256(",".join(f"{t}:{e.strength:.3f}" for t,e in top).encode()).hexdigest()[:16]
+        ps  = "→".join(t[:8] for t,_ in top[:5])
+    else:
+        fp  = hashlib.sha256(b"no_links").hexdigest()[:16]
+        ps  = "no_paths"
+    cats = "+".join(n for b,n in [(1,"SYS"),(2,"DAT"),(4,"OP"),(8,"HUM"),(16,"URG")] if cat&b) or "?"
+    if cat == 0:
+        disp = "00000000|VACUUM"
+    else:
+        disp = f"{cat:08b}|T{strand}|{zone}|{fp[:4]}({cats})"
+    return {"category":cat,"strand_type":strand,"price_zone":zone,"fingerprint":fp,"path_signature":ps,
+            "display": disp}
+
+def dna_sim(a, b):
+    if not a or not b: return 0.0
+    s = 0.0
+    ca,cb = a.get("category",0), b.get("category",0)
+    if ca and cb:
+        # 3‑flag pre‑filter: if no primary flags shared, skip full Jaccard
+        primary_mask = 1 | 2 | 4   # SYS, DATA, OP
+        if (ca & primary_mask) & (cb & primary_mask) == 0:
+            # no primary overlap → category contribution is zero
+            pass
+        else:
+            s += 0.30*(bin(ca&cb).count("1")/max(bin(ca|cb).count("1"),1))
+    ta,tb = a.get("strand_type"), b.get("strand_type")
+    if ta is not None and tb is not None and ta!=tb: s += 0.12
+    za,zb = a.get("price_zone",""), b.get("price_zone","")
+    if za and zb and za!="Z?" and za==zb: s += 0.10
+    fa,fb = a.get("fingerprint",""), b.get("fingerprint","")
+    if fa and fb: s += 0.28*(sum(1 for x,y in zip(fa,fb) if x==y)/max(len(fa),len(fb),1))
+    pa,pb = a.get("path_signature",""), b.get("path_signature","")
+    if pa and pb and pa!="no_paths" and pb!="no_paths":
+        s += 0.20*(sum(1 for x,y in zip(pa,pb) if x==y)/max(len(pa),len(pb),1))
+    return round(min(s,1.0),4)
+
+# ── Text similarity ── (unchanged)
+
+def _ngrams(text, mn=2, mx=4):
+    t = clean_text(text); g = []
+    for n in range(mn, mx+1):
+        for i in range(len(t)-n+1): g.append(t[i:i+n])
+    return g
+
+def ngram_sim(a, b):
+    A,B = set(_ngrams(a)), set(_ngrams(b))
+    return len(A&B)/len(A|B) if A and B else 0.0
+
+def phonetic_sim(a, b):
+    def sig(t):
+        t = clean_text(t); r=[]; prev=""
+        for c in t:
+            ch = "V" if c in "AEIOU" else "C" if c.isalpha() else "D" if c.isdigit() else c
+            if ch!=prev: r.append(ch)
+            prev=ch
+        return set(r)
+    A,B = sig(a), sig(b)
+    return len(A&B)/len(A|B) if A and B else 0.0
+
+def vec_sim(a, b):
+    av = [_CHAR_NUM[c] for c in clean_text(a) if c in _CHAR_NUM]
+    bv = [_CHAR_NUM[c] for c in clean_text(b) if c in _CHAR_NUM]
+    if not av or not bv: return 0.0
+    n = min(len(av),len(bv))
+    diff = sum(abs(av[i]-bv[i]) for i in range(n))
+    return 1.0-(diff/(n*(_BASE-1)) if n*(_BASE-1) else 1.0)
+
+def is_num(text):
+    c = clean_text(text).replace(" ","").replace(".","")
+    return bool(c) and c.isdigit()
+
+def hybrid_score(a, b, da=None, db=None, pa=None, pb=None, vol=None):
+    n=p=v=total=0.0
+    if is_num(a) and is_num(b):
+        if pa is not None and pb is not None:
+            vv = vol or (max(abs(pa),abs(pb))*cfg.DEFAULT_VOL_RATIO or 0.005)
+            total += cfg.W_PRICE_NUMERIC * p_sim(pa,pb,vv)
+        if da and db: total += cfg.W_DNA_NUMERIC * dna_sim(da,db)
+        ca,cb = clean_text(a).replace(" ","").replace(".",""), clean_text(b).replace(" ","").replace(".","")
+        if ca==cb: total = min(1.0,total*1.6)
+        return min(total,1.0),0.0,0.0,0.0
+    n = ngram_sim(a,b); p = phonetic_sim(a,b)
+    av = [_CHAR_NUM[c] for c in clean_text(a) if c in _CHAR_NUM]
+    bv = [_CHAR_NUM[c] for c in clean_text(b) if c in _CHAR_NUM]
+    v  = vec_sim(a,b)
+    total = cfg.W_NGRAM*n + cfg.W_PHONETIC*p + cfg.W_VECTOR*v
+    qw = set(clean_text(a).split()); nw = set(clean_text(b).split())
+    if qw and nw: total += cfg.W_WORD_OVERLAP*(len(qw&nw)/len(qw))
+    if da and db: total += cfg.W_DNA_SIM*dna_sim(da,db)
+    if pa is not None and pb is not None:
+        vv = vol or (max(abs(pa),abs(pb))*cfg.DEFAULT_VOL_RATIO or 0.005)
+        total += cfg.W_PRICE*p_sim(pa,pb,vv)
+    ca,cb = clean_text(a).replace(" ","").replace(".",""), clean_text(b).replace(" ","").replace(".","")
+    if ca==cb: total = min(1.0,total*1.6)
+    if is_num(a):
+        la,lb = len(ca), len(cb)
+        lp = (min(la,lb)/max(la,lb)) if la and lb else 0.0
+        total = total*(0.4+0.6*lp)
+    return min(total,1.0),n,p,v
+
+# ─────────────────────────────────────────────
+# DATA STRUCTURES
+# ─────────────────────────────────────────────
+
+class Edge:
+    __slots__ = ['strength','created_at','hits','price_delta','cross_zone','transition',
+                 'epistemic_count','mu_entropy','mu_contradiction','mu_confidence','epistemic_weight']
+    def __init__(self, strength, hits=0, price_delta=None, cross_zone=False, transition=None):
+        self.strength    = round(max(0.0,min(1.0,strength)),4)
+        self.created_at  = time.time()
+        self.hits        = hits
+        self.price_delta = price_delta
+        self.cross_zone  = cross_zone
+        self.transition  = transition
+        self.epistemic_count = 0
+        self.mu_entropy = 0.0
+        self.mu_contradiction = 0.0
+        self.mu_confidence = 0.0
+        self.epistemic_weight = 0.0
+    def reinforce(self, pc=1.0):
+        self.strength = min(1.0,round(self.strength+cfg.REINFORCE_RATE*pc,4)); self.hits+=1
+    def decay(self):
+        self.strength = round(max(self.strength*cfg.DECAY_RATE+self.hits*cfg.USAGE_BIAS, cfg.MIN_EDGE_STRENGTH),4)
+    def age(self): return round(time.time()-self.created_at)
+    def to_dict(self):
+        return {"strength":self.strength,"hits":self.hits,"price_delta":self.price_delta,
+                "cross_zone":self.cross_zone,"transition":self.transition,"created_at":self.created_at,
+                "epistemic_count":self.epistemic_count,"mu_entropy":self.mu_entropy,
+                "mu_contradiction":self.mu_contradiction,"mu_confidence":self.mu_confidence,
+                "epistemic_weight":self.epistemic_weight}
+
+class PatternNode:
+    __slots__ = ['transitions','signature','length','hits','created_at','start_zone','display']
+    def __init__(self, transitions, signature, start_zone="Z?"):
+        self.transitions = transitions; self.signature = signature
+        self.length = len(transitions); self.hits = 1
+        self.created_at = time.time(); self.start_zone = start_zone
+        self.display = "→".join(transitions[:5])+("..." if len(transitions)>5 else "")
+    def reinforce(self): self.hits+=1
+    def decay(self):     self.hits=max(0,int(self.hits*cfg.PATTERN_DECAY_RATE))
+    def alive(self):     return self.hits>0
+    def age(self):       return round(time.time()-self.created_at)
+    def to_dict(self):
+        return {"transitions":self.transitions,"signature":self.signature,"length":self.length,
+                "hits":self.hits,"created_at":self.created_at,"start_zone":self.start_zone,"display":self.display}
+
+class Node:
+    def __init__(self, value, hits=0, dna=None, price=None, volatility=None, strand_type=None):
+        self.value      = clean_text(value)
+        self.created_at = time.time()
+        self.hits       = hits
+        self.links      = {}
+        self._dirty     = True
+        self.strand_type = strand_type
+        ep, ev          = extract_price(value)
+        self.price      = price if price is not None else ep
+        self.volatility = volatility if volatility is not None else ev
+        self.price_zone = get_price_zone(self.price)
+        if dna is not None:
+            self.dna = dna; self._dirty = False
+        else:
+            self.dna = {"category":0,"strand_type":strand_type,"price_zone":self.price_zone,
+                        "fingerprint":"","path_signature":"","display":"pending"}
+    def refresh_dna(self, db_nodes):
+        if self._dirty or not self.dna.get("fingerprint"):
+            self.dna = express_dna(self.value, self.links, self.strand_type, self.price)
+            self._dirty = False
+    def mark_dirty(self): self._dirty = True
+    def age(self):        return round(time.time()-self.created_at)
+    def freq_bonus(self, qp=None):
+        r = math.log1p(min(self.hits,200))*cfg.FREQ_BONUS
+        if qp and self.price: r *= p_sim(qp,self.price,self.volatility)
+        return round(r,4)
+    def hub_pen(self, total):
+        if total<=1: return 0.0
+        ratio = len(self.links)/(total-1)
+        return round((ratio-cfg.HUB_DEGREE_THRESHOLD)*cfg.HUB_PENALTY_FACTOR,4) if ratio>cfg.HUB_DEGREE_THRESHOLD else 0.0
+    def to_dict(self):
+        return {"value":self.value,"hits":self.hits,"dna":self.dna,"price":self.price,
+                "volatility":self.volatility,"created_at":self.created_at,"strand_type":self.strand_type,
+                "price_zone":self.price_zone,"links":{k:e.to_dict() for k,e in self.links.items()}}
+
+class ClusterTransitions:
+    def __init__(self):
+        self.counts={}; self.examples={}; self.step_counts={}
+    def record(self, fz, tz, fp=None, tp=None, steps=None):
+        if fz==tz or fz=="Z?" or tz=="Z?": return
+        k=f"{fz}→{tz}"; self.counts[k]=self.counts.get(k,0)+1
+        if fp and tp:
+            self.examples.setdefault(k,[]).append((fp,tp))
+            if len(self.examples[k])>cfg.MAX_TRANSITION_EXAMPLES:
+                self.examples[k]=self.examples[k][-cfg.MAX_TRANSITION_EXAMPLES:]
+        if steps: self.step_counts.setdefault(k,[]).append(steps)
+    def probs(self, fz):
+        rel={};total=0
+        for k,c in self.counts.items():
+            if k.startswith(f"{fz}→"):
+                tz=k.split("→")[1]; rel[tz]=c; total+=c
+        return dict(sorted({z:round(c/total,2) for z,c in rel.items()}.items(),key=lambda x:x[1],reverse=True)) if total else {}
+    def avg_steps(self, fz, tz):
+        sl=self.step_counts.get(f"{fz}→{tz}",[])
+        return round(sum(sl)/len(sl),2) if sl else None
+    def examples_for(self, fz, tz): return self.examples.get(f"{fz}→{tz}",[])
+    def cluster_analysis(self, zone, db_nodes):
+        zn=[n for n in db_nodes.values() if n.price_zone==zone]
+        pr=self.probs(zone)
+        return {"zone":zone,"node_count":len(zn),"regime":detect_regime(zn),
+                "transitions":pr,"dominant":max(pr,key=pr.get) if pr else None,
+                "dominant_prob":max(pr.values()) if pr else 0}
+    def decay(self):
+        for k in list(self.counts):
+            self.counts[k]=max(0,int(self.counts[k]*cfg.CLUSTER_TRANSITION_DECAY))
+            if not self.counts[k]:
+                del self.counts[k]; self.examples.pop(k,None); self.step_counts.pop(k,None)
+    def to_dict(self):
+        return {"counts":self.counts,
+                "examples":{k:[(float(f),float(t)) for f,t in v] for k,v in self.examples.items()},
+                "step_counts":self.step_counts}
+    def load(self, data):
+        self.counts=data.get("counts",{})
+        self.examples={k:[(float(f),float(t)) for f,t in v] for k,v in data.get("examples",{}).items()}
+        self.step_counts={k:(v if isinstance(v,list) else []) for k,v in data.get("step_counts",{}).items()}
+
+# ─────────────────────────────────────────────
+# MEMORY DATABASE
+# ─────────────────────────────────────────────
+
+class MemoryDB:
+    def __init__(self):
+        self.nodes={}; self.patterns={}
+        self.ct = ClusterTransitions()
+        self._recent=[]; self._last_step_price=None
+        self.cycles=0; self._last_strand=None
+        self._pbuf=[]; self._dbuf=[]
+        self._step_counter=0; self.last_zone=None
+        self.use_mod=True; self.lam=0.5
+        self.use_log=False; self.merge_rp=False
+        self._last_dna=None; self._dna_valid=False
+        self._dna_age=0; self._dna_vel=None
+        self._dna_hist=[]; self._dna_persist=0
+        self.price_hist=[]; self._agree_hist=[]
+        # CIS state (always active)
+        self.cis_verbose = cfg.CIS_VERBOSE
+        self.cis_episodes = []
+        self.cis_pending = []
+        self.cis_pending_mild = []
+        self.cis_pending_component = []
+        self._global_step = 0
+        # Phase 2 – store last R output for optional L invocation
+        self.last_r_output = None
+
+    # ── strand ──
+    def _next_strand(self):
+        self._last_strand = 0 if self._last_strand is None else 1-self._last_strand
+        return self._last_strand
+
+    # ── patterns ── (unchanged)
+    def _flush_pbuf(self):
+        if len(self._pbuf)<cfg.PATTERN_MIN_LENGTH: return
+        sig=build_pattern_sig(self._pbuf)
+        if not sig: return
+        if sig in self.patterns: self.patterns[sig].reinforce()
+        else:
+            if len(self.patterns)>=cfg.PATTERN_MAX_STORED: self._prune()
+            self.patterns[sig]=PatternNode(self._pbuf.copy(),sig,"Z?")
+        ov=cfg.PATTERN_MIN_LENGTH-1
+        self._pbuf=self._pbuf[-ov:] if ov and len(self._pbuf)>ov else []
+
+    def _flush_dbuf(self):
+        if len(self._dbuf)<cfg.PATTERN_MIN_LENGTH: return
+        sig=hashlib.sha256("→".join(self._dbuf).encode()).hexdigest()[:16]
+        if sig in self.patterns: self.patterns[sig].reinforce()
+        else:
+            if len(self.patterns)>=cfg.PATTERN_MAX_STORED: self._prune()
+            self.patterns[sig]=PatternNode(self._dbuf.copy(),sig,"DIR?")
+        ov=cfg.PATTERN_MIN_LENGTH-1
+        self._dbuf=self._dbuf[-ov:] if ov and len(self._dbuf)>ov else []
+
+    def _finalize_batch_patterns(self, nodes):
+        if len(nodes)<cfg.PATTERN_MIN_LENGTH: return
+        tr=[]
+        for i in range(len(nodes)-1):
+            a,b=nodes[i],nodes[i+1]
+            if a.price and b.price:
+                t=get_transition(a.price,b.price)
+                if t:
+                    tr.append(t["signature"]); self._recent.append(t["signature"])
+                    self._dbuf.append(t["direction"])
+                    if len(self._dbuf)>=cfg.PATTERN_MIN_LENGTH: self._flush_dbuf()
+        if len(self._recent)>30: self._recent=self._recent[-30:]
+        if len(tr)<cfg.PATTERN_MIN_LENGTH: return
+        sig=build_pattern_sig(tr)
+        if not sig: return
+        if sig in self.patterns: self.patterns[sig].reinforce()
+        else:
+            if len(self.patterns)>=cfg.PATTERN_MAX_STORED: self._prune()
+            self.patterns[sig]=PatternNode(tr,sig,nodes[0].price_zone if nodes else "Z?")
+
+    def _prune(self):
+        if not self.patterns: return
+        now=time.time()
+        del self.patterns[min(self.patterns,key=lambda s:self.patterns[s].hits/max(now-self.patterns[s].created_at,1))]
+
+    def _rec_price(self, price):
+        if price:
+            self.price_hist.append([price,time.time()])
+            if len(self.price_hist)>10000: self.price_hist=self.price_hist[-10000:]
+
+    # ── zone helpers ── (unchanged)
+    def _zone_prices(self, zone):
+        return sorted([n.price for n in self.nodes.values() if n.price_zone==zone and n.price])
+
+    def median_price(self, zone, direction=None):
+        prices=self._zone_prices(zone)
+        if not prices: return None
+        m=len(prices)//2
+        whole=prices[m] if len(prices)%2 else (prices[m-1]+prices[m])/2
+        if direction=="DOWN":
+            up=[p for p in prices if p>=whole]; m2=len(up)//2
+            return up[m2] if len(up)%2 else (up[m2-1]+up[m2])/2 if up else whole
+        if direction=="UP":
+            lo=[p for p in prices if p<=whole]; m2=len(lo)//2
+            return lo[m2] if len(lo)%2 else (lo[m2-1]+lo[m2])/2 if lo else whole
+        return whole
+
+    # ── graph linking ── (unchanged)
+    def _link(self, new_node, existing_nodes):
+        for ex in existing_nodes.values():
+            sc,_,_,_ = hybrid_score(new_node.value,ex.value,new_node.dna,ex.dna,new_node.price,ex.price,ex.volatility)
+            cm = cfg.COMPLEMENTARY_BOOST if new_node.strand_type!=ex.strand_type else cfg.SAME_TYPE_PENALTY if new_node.strand_type is not None else 1.0
+            zm = 1.0 if same_zone(new_node.price,ex.price) else cfg.CROSS_ZONE_PENALTY
+            adj = (sc*(0.5+0.5*ep_sim(new_node.price,ex.price,ex.volatility))*cm*zm
+                   if is_num(new_node.value) and is_num(ex.value) else sc*cm)
+            if adj>=cfg.LINK_THRESHOLD:
+                pd=abs(new_node.price-ex.price) if new_node.price and ex.price else None
+                xz=not same_zone(new_node.price,ex.price)
+                new_node.links[ex.value]=Edge(adj,price_delta=pd,cross_zone=xz)
+                ex.links[new_node.value]=Edge(adj,price_delta=pd,cross_zone=xz)
+                ex.mark_dirty()
+
+    def _add_node(self, text, strand=None):
+        if strand is None: strand=self._next_strand()
+        if text in self.nodes: self.nodes[text].hits+=1; return None
+        n=Node(text,strand_type=strand)
+        self._link(n,self.nodes); self.nodes[text]=n
+        n.refresh_dna(self.nodes)
+        for nd in self.nodes.values():
+            if nd._dirty: nd.refresh_dna(self.nodes)
+        if n.price: self._rec_price(n.price)
+        return n
+
+    # ── public API ──
+    def batch_add(self, text):
+        lines=text.strip().split("\n"); items=[]
+        for line in lines:
+            line=line.strip()
+            if not line: continue
+            if "," in line: items.extend([p.strip() for p in line.split(",") if p.strip()])
+            elif " " in line and not re.match(r'^\d+\.?\d*$',line): items.extend(line.split())
+            else: items.append(line)
+        if not items: return "No valid items."
+
+        # Cache vector field for _observe_adapt, refreshed periodically
+        vf_cache = self.vector_field()
+        refresh_interval = cfg.VF_REFRESH_INTERVAL
+
+        stored=[]; batch_nodes=[]; prev=None
+        for i,item in enumerate(items):
+            text_c=clean_text(item)
+            if not text_c: continue
+            np,_=extract_price(text_c)
+            nz=get_price_zone(np) if np else "Z?"
+            self._global_step += 1
+
+            if self.last_zone is None:
+                self._step_counter=1; self.last_zone=nz
+            else:
+                if nz==self.last_zone: self._step_counter+=1
+                else:
+                    if self._last_step_price:
+                        self.ct.record(self.last_zone,nz,self._last_step_price,np,self._step_counter)
+                    self._step_counter=1; self.last_zone=nz
+
+            if prev and prev in self.nodes:
+                pn=self.nodes[prev]
+                if pn.price and np:
+                    t=get_transition(pn.price,np)
+                    if t:
+                        self._recent.append(t["signature"])
+                        if len(self._recent)>30: self._recent=self._recent[-30:]
+                        self._pbuf.append(t["signature"])
+                        if len(self._pbuf)>=cfg.PATTERN_MIN_LENGTH: self._flush_pbuf()
+                        self._dbuf.append(t["direction"])
+                        if len(self._dbuf)>=cfg.PATTERN_MIN_LENGTH: self._flush_dbuf()
+
+            strand=i%2; nn=self._add_node(text_c,strand)
+            if nn is None:
+                stored.append(f"{text_c}(+)"); prev=text_c
+                self._last_step_price=np if np else self._last_step_price
+                continue
+
+            # FIX: reinforce-or-create edges on repeat transitions (Weight)
+            if prev and prev in self.nodes:
+                pn=self.nodes[prev]
+                if pn.price and nn.price:
+                    es=ep_sim(nn.price,pn.price,nn.volatility)
+                    zm=1.0 if same_zone(nn.price,pn.price) else cfg.CROSS_ZONE_PENALTY
+                    strength=max(cfg.BATCH_LINK_STRENGTH*es*zm,cfg.MIN_EDGE_STRENGTH)
+                    tr=get_transition(pn.price,nn.price)
+                else:
+                    strength=cfg.BATCH_LINK_STRENGTH; tr=None
+                xz=not same_zone(nn.price,pn.price)
+                # forward edge: prev -> nn (confirmed observation)
+                pc = p_sim(nn.price, pn.price, nn.volatility) if pn.price and nn.price else 1.0
+                if prev in nn.links:
+                    nn.links[prev].reinforce(pc)
+                    if tr: nn.links[prev].transition = tr
+                    nn.links[prev].cross_zone = xz
+                else:
+                    nn.links[prev] = Edge(strength, cross_zone=xz, transition=tr)
+
+                # reverse edge: nn -> prev (still update weight, but NOT epistemic learning)
+                pc_rev = p_sim(pn.price, nn.price, pn.volatility) if pn.price and nn.price else 1.0
+                if text_c in pn.links:
+                    pn.links[text_c].reinforce(pc_rev)
+                    rt_rev = get_transition(nn.price, pn.price) if tr else None
+                    if rt_rev: pn.links[text_c].transition = rt_rev
+                    pn.links[text_c].cross_zone = xz
+                else:
+                    rt_rev = get_transition(nn.price, pn.price) if tr else None
+                    pn.links[text_c] = Edge(strength, cross_zone=xz, transition=rt_rev)
+
+                # FIX: Adapt on confirmed forward transition only (Bug 1)
+                self._observe_adapt(pn, nn, nn.links[prev], vf=vf_cache)
+
+            batch_nodes.append(nn)
+            stored.append(f"{text_c}[{nn.price_zone}]")
+            prev=text_c
+            self._last_step_price=np if np else self._last_step_price
+
+            # Refresh vector field cache every refresh_interval items
+            if (i + 1) % refresh_interval == 0:
+                vf_cache = self.vector_field()
+
+        if batch_nodes and batch_nodes[-1].price:
+            self._last_step_price=batch_nodes[-1].price
+        for n in self.nodes.values(): n.refresh_dna(self.nodes)
+        self._finalize_batch_patterns(batch_nodes)
+
+        self._cis_scheduler()
+        return f"Stored {len(stored)} items · {len(self.patterns)} patterns · {len(self.nodes)} total nodes"
+
+    def decay_cycle(self):
+        for n in self.nodes.values():
+            for e in n.links.items(): e[1].decay()
+        dead=[s for s,p in self.patterns.items() if not p.decay() or not p.alive()]
+        for s in dead: del self.patterns[s]
+        self.ct.decay(); self.cycles+=1
+        self._cis_prune()
+        return f"Decay {self.cycles} complete · {len(self.patterns)} patterns remain"
+
+    # ── PHASE 2: search() no longer mutates graph ──
+    def search(self, query):
+        if not self.nodes: return []
+        cq=clean_text(query); qc=cq.replace(" ","").replace(".",""); ql=len(qc)
+        qp,qv=extract_price(query)
+        qd=express_dna(query,{},price=qp); total=len(self.nodes)
+        enc=[v for v in self.nodes if ql>=cfg.MIN_SINGULARITY_LEN and qc in v.replace(" ","").replace(".","")]
+
+        raw={}
+        for n in self.nodes.values():
+            sc,ng,ph,vc=hybrid_score(query,n.value,qd,n.dna,qp,n.price,n.volatility)
+            base=sc-n.hub_pen(total)
+            sing=0.0
+            if len(enc)==1 and n.value==enc[0]:
+                cov=ql/max(len(n.value.replace(" ","").replace(".",""),),1)
+                sing=(cfg.BASE_SINGULARITY_WT+cov*0.25)*base
+            pos=0.0
+            if ql>=cfg.MIN_SINGULARITY_LEN and qc in n.value.replace(" ","").replace(".",""):
+                cn=n.value.replace(" ","").replace(".","")
+                if cn.startswith(qc): pos+=cfg.POSITION_PREFIX_WT*base
+                if cn.endswith(qc):   pos+=cfg.POSITION_SUFFIX_WT*base
+            raw[n.value]={"value":n.value,"base":round(base,4),"ngram":round(ng,4),"phonetic":round(ph,4),
+                          "vector":round(vc,4),"boost":0.0,"singularity":round(sing,4),"position":round(pos,4),
+                          "freq":n.freq_bonus(qp),"hub_penalty":round(n.hub_pen(total),4),
+                          "dna":n.dna,"price":n.price,"zone":n.price_zone,"age":n.age(),"strand":n.strand_type,"node":n}
+
+        ec={}
+        for n in self.nodes.values():
+            ns=raw[n.value]["base"]
+            if ns<=0: continue
+            for lv,edge in n.links.items():
+                if lv not in raw: continue
+                boost=ns*edge.strength*cfg.GRAPH_BOOST
+                rb=raw[lv]["base"]
+                if rb<cfg.BOOST_GATE_THRESHOLD: boost*=(rb/cfg.BOOST_GATE_THRESHOLD)
+                raw[lv]["boost"]+=round(boost,4); ec.setdefault(lv,[]).append(edge)
+                ln=self.nodes.get(lv)
+                if not ln: continue
+                for h2,h2e in ln.links.items():
+                    if h2 not in raw or h2==n.value: continue
+                    b2=boost*h2e.strength*cfg.HOP2_DAMPEN
+                    if ln.dna and self.nodes[h2].dna and dna_sim(ln.dna,self.nodes[h2].dna)>0.5: b2*=1.25
+                    r2=raw[h2]["base"]
+                    if r2<cfg.BOOST_GATE_THRESHOLD: b2*=(r2/cfg.BOOST_GATE_THRESHOLD)
+                    raw[h2]["boost"]+=round(b2,4); ec.setdefault(h2,[]).append(h2e)
+
+        results=[]
+        for r in raw.values():
+            r["boost"]=round(min(r["boost"],r["base"]*0.5),4)
+            unc=r["base"]+r["boost"]+r["singularity"]+r["position"]+r["freq"]
+            r["raw_score"]=round(unc,4); r["total"]=round(min(unc,1.0),4)
+            results.append(r)
+        results.sort(key=lambda x:x["raw_score"],reverse=True)
+        return results
+
+    def _learn_from_query(self, results):
+        if not results:
+            return
+        top = results[0]
+        tn = top.get("node")
+        if tn is None:
+            return
+        qp = tn.price
+        pc = p_sim(qp, tn.price, tn.volatility) if (qp and tn.price) else 1.0
+        tn.hits += 1
+        tn.mark_dirty()
+        tn.refresh_dna(self.nodes)
+        for r in results:
+            r.pop("node", None)
+
+    def _cluster(self, zone):
+        return self.ct.cluster_analysis(zone,self.nodes)
+
+    # ─── LSR CORE ───
+
+    def get_arrival_depth(self, zone):
+        all_steps=[]
+        for k,sl in self.ct.step_counts.items():
+            if k.endswith(f"→{zone}") and sl: all_steps.extend(sl)
+        if not all_steps: return 0
+        s=sorted(all_steps); n=len(s)
+        return int(round(s[n//2] if n%2 else (s[n//2-1]+s[n//2])/2))
+
+    # ── PROBABILISTIC FORWARD TRACE (with T13 optimal stopping) ──
+    def trace_forward(self, start_zone, steps=5):
+        """Returns probability distributions, with dynamic early stopping
+        when the maximum probability in any hop drops below threshold."""
+        ad = self.get_arrival_depth(start_zone)
+        rh = max(1, ad // 2) if ad > 0 else 1
+
+        distributions = []
+        current_dist = {start_zone: 1.0}
+        distributions.append(dict(current_dist))
+
+        for _ in range(steps):
+            next_dist = {}
+            for zone, prob in current_dist.items():
+                probs = self.ct.probs(zone)
+                if not probs:
+                    next_dist[zone] = next_dist.get(zone, 0.0) + prob
+                    continue
+                for nxt, p in probs.items():
+                    if nxt == zone:
+                        continue
+                    next_dist[nxt] = next_dist.get(nxt, 0.0) + prob * p
+            total_mass = sum(next_dist.values())
+            if total_mass <= 0:
+                break
+            for z in next_dist:
+                next_dist[z] = round(next_dist[z] / total_mass, 4)
+            # T13 optimal stop: if max probability < marginal gain threshold, halt
+            if max(next_dist.values()) < cfg.FWD_MARGINAL_GAIN_MIN:
+                # still record this last distribution for completeness
+                distributions.append(dict(next_dist))
+                break
+            distributions.append(dict(next_dist))
+            current_dist = next_dist
+
+        # Build a sampled path for backward compatibility, with ambiguity flags
+        structured = []
+        flat = [start_zone]
+        for i in range(1, len(distributions)):
+            dist = distributions[i]
+            if not dist:
+                break
+            max_prob = max(dist.values())
+            top_zones = [z for z, p in dist.items() if p == max_prob]
+            second_prob = 0.0
+            if len(top_zones) < len(dist):
+                second_prob = max(p for z, p in dist.items() if z not in top_zones)
+            elif len(top_zones) > 1:
+                second_prob = max_prob
+            ambiguous = (max_prob - second_prob) < cfg.FWD_BRANCH_SPREAD_THRESHOLD and len(dist) > 1
+
+            chosen = top_zones[0]
+            prob = dist[chosen]
+            status = "RECONSTRUCTION" if prob >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
+            structured.append({
+                "zone": chosen,
+                "confidence": prob,
+                "status": status,
+                "depth": i,
+                "ambiguous": ambiguous
+            })
+            flat.append(chosen)
+
+        return {
+            "flat": flat,
+            "structured": structured,
+            "arrival_depth": ad,
+            "reliable_horizon": rh,
+            "distributions": distributions
+        }
+
+    def vector_field(self):
+        all_zones=sorted(set(n.price_zone for n in self.nodes.values() if n.price_zone!="Z?"),key=_zone_val)
+        field={}
+        for zone in all_zones:
+            an=self._cluster(zone); pr=an["transitions"]
+            nd=tp=0.0
+            for t,p in pr.items():
+                tv,zv=_zone_val(t),_zone_val(zone)
+                nd+=p if tv>zv else -p if tv<zv else 0; tp+=p
+            if tp: nd/=tp
+            ws=tw=0.0
+            for t,p in pr.items():
+                av=self.ct.avg_steps(zone,t); sp=(1/av) if av and av>0 else 1.0
+                ws+=sp*p; tw+=p
+            mag=ws/tw if tw else 0.0
+            ot=sum(pr.values())
+            it=sum(self.ct.probs(oz).get(zone,0) for oz in all_zones if oz!=zone)
+            asc=it-ot
+            cls="attractor" if asc>0.1 else "repeller" if asc<-0.1 else "transit" if abs(nd)>0.3 else "neutral"
+            field[zone]={"net_direction":round(nd,4),"magnitude":round(mag,4),"regime":an["regime"],
+                         "node_count":an["node_count"],"attractor_score":round(asc,2),"classification":cls}
+        return field
+
+    def mirror_analysis(self, window=None):
+        if window is None: window=cfg.MIRROR_WINDOW
+        rd=[sig.split("_")[0] for sig in self._recent[-window:] if "_" in sig]
+        md=["DOWN" if d=="UP" else "UP" if d=="DOWN" else "FLAT" for d in reversed(rd)]
+        best_sim,best_pat=0.0,None
+        for _,pn in self.patterns.items():
+            if pn.start_zone!="DIR?": continue
+            ml=min(len(md),len(pn.transitions))
+            if not ml: continue
+            sim=sum(1 for i in range(ml) if md[i]==pn.transitions[i])/max(len(md),len(pn.transitions),1)
+            if sim>best_sim: best_sim,best_pat=sim,pn
+        if best_sim>=cfg.MIRROR_SIMILARITY_THRESHOLD and best_pat:
+            interp=f"Strong mirror symmetry ({best_sim:.2f}) — pattern seen {best_pat.hits}x"
+        elif best_sim>=0.30: interp=f"Moderate mirror symmetry ({best_sim:.2f})"
+        else:                interp="No significant mirror symmetry"
+        return {"recent":rd,"mirror":md,"similarity":round(best_sim,4),
+                "best_match":best_pat.display if best_pat else None,
+                "matched_hits":best_pat.hits if best_pat else 0,"interpretation":interp}
+
+    def _avg_vol(self):
+        vols=[n.volatility for n in self.nodes.values() if n.price and n.volatility>0]
+        return max(sum(vols)/len(vols),1e-6) if vols else 0.01
+
+    def dna_distribution(self, vf=None):
+        if vf is None: vf=self.vector_field()
+        if not vf: return {"error":"No zones."}
+        tn=sum(v["node_count"] for v in vf.values())
+        if tn==0: return {"error":"No nodes in field."}
+        and_=sum(v["net_direction"]*v["node_count"] for v in vf.values())/tn
+        amg=sum(v["magnitude"]*v["node_count"] for v in vf.values())/tn
+        cg=sum(1 for v in vf.values() if v["classification"]=="attractor")/max(len(vf),1)
+        mir=self.mirror_analysis()
+        rzs=set()
+        for k in list(self.ct.counts.keys())[-cfg.DNA_WINDOW:]:
+            parts=k.split("→")
+            if len(parts)==2: rzs.update(parts)
+        zsp=len(rzs)/max(len(vf),1)
+        dps=[p for p in self.patterns.values() if p.start_zone=="DIR?"]
+        if dps:
+            th=sum(p.hits for p in dps)
+            pp=[p.hits/max(th,1) for p in dps]
+            pe=-sum(p*math.log(max(p,1e-12)) for p in pp)
+        else: pe=0.0
+        mgs=[]
+        for sig in self._recent[-cfg.DNA_WINDOW:]:
+            if "_" in sig:
+                try: mgs.append(float(sig.split("_")[1]))
+                except: pass
+        ms=math.sqrt(sum((m-sum(mgs)/len(mgs))**2 for m in mgs)/len(mgs)) if mgs else 0.0
+        av=self._avg_vol(); mn=max(av*5,0.001)
+        ec=math.log(cfg.PATTERN_MAX_STORED)
+        s={a:0.0 for a in cfg.DNA_ARCHETYPES}
+        s["TrendingUp"]   += max(0,and_)*0.6+(1-cg)*0.2+min(ms/mn,1)*0.2
+        s["TrendingDown"] += max(0,-and_)*0.6+(1-cg)*0.2+min(ms/mn,1)*0.2
+        s["Ranging"]      += (1-abs(and_))*0.3+cg*0.3+mir["similarity"]*0.2+(1-min(ms/(mn*0.5),1))*0.2
+        s["Breakout"]     += min(ms/(mn*0.5),1)*0.5+(1-cg)*0.3+min(zsp*5,1)*0.2
+        s["Reversing"]    += mir["similarity"]*0.5+(1-abs(and_))*0.25+(1-min(pe/ec,1) if ec>0 else 0)*0.25
+        s["LowVol"]       += (1-min(amg*2,1))*0.4+(1-min(ms/(mn*0.3),1))*0.3+(min(pe/ec,1) if ec>0 else 0)*0.3
+        ts=sum(s.values())
+        dist={k:round(v/ts,4) for k,v in s.items()} if ts>0 else {k:1/len(s) for k in s}
+        dom=max(dist,key=dist.get); conf=dist[dom]
+        ent=-sum(p*math.log(max(p,1e-12)) for p in dist.values())
+        stab=None
+        if self._dna_valid and self._last_dna:
+            diff=sum(abs(dist.get(k,0)-self._last_dna.get(k,0)) for k in set(dist)|set(self._last_dna))/2
+            stab=round(1.0-diff,4)
+        if self._dna_valid and self._last_dna:
+            pd=max(self._last_dna,key=self._last_dna.get)
+            self._dna_age=self._dna_age+1 if pd==dom else 1
+        else: self._dna_age=1
+        vel=None
+        if self._dna_valid and self._last_dna:
+            vel={a:round(dist.get(a,0)-self._last_dna.get(a,0),4) for a in cfg.DNA_ARCHETYPES}
+        self._dna_vel=vel
+        sp=sorted(dist.values(),reverse=True)
+        pres=round(1-(sp[0]-sp[1]),4) if len(sp)>=2 else 1.0
+        ep=round(1-min(len(self.nodes)/100,1.0),4)
+        self._dna_hist.append(dist.copy())
+        if len(self._dna_hist)>cfg.DNA_HISTORY_MAX: self._dna_hist.pop(0)
+        al=0.6; ma=dist.copy()
+        for h in reversed(self._dna_hist[:-1]):
+            for k in ma: ma[k]=al*ma[k]+(1-al)*h.get(k,0)
+        tm=sum(ma.values())
+        mv={k:round(v/tm,4) for k,v in ma.items()} if tm>0 else {k:1/len(ma) for k in ma}
+        if len(self._dna_hist)>=2:
+            pd2=max(self._dna_hist[-2],key=self._dna_hist[-2].get)
+            self._dna_persist=self._dna_persist+1 if pd2==dom else 1
+        else: self._dna_persist=1
+        self._last_dna=dist.copy(); self._dna_valid=True
+        interps={"TrendingUp":"Strong upward bias","TrendingDown":"Strong downward bias",
+                 "Ranging":"Congested balanced directionality","Breakout":"Rapid multi-zone expansion",
+                 "Reversing":"High mirror symmetry — structural reversal","LowVol":"Low volatility, muted transitions"}
+        return {"distribution":dist,"dominant_state":dom,"confidence":round(conf,4),"entropy":round(ent,4),
+                "stability":stab,"pressure":pres,"age":self._dna_age,"velocity":vel,"epistemic":ep,
+                "interpretation":interps.get(dom,""),"persistence":self._dna_persist,"moving_average":mv}
+
+    def ema_sensor(self, qp):
+        if not self.price_hist or len(self.price_hist)<cfg.EMA_PERIOD:
+            return {"available":False,"message":f"Need {cfg.EMA_PERIOD} prices (have {len(self.price_hist)})"}
+        if qp is None: return {"available":False,"message":"No query price"}
+        prices=[p for p,_ in self.price_hist]
+        al=2/(cfg.EMA_PERIOD+1); ema=prices[0]
+        for p in prices[1:]: ema=p*al+ema*(1-al)
+        dev=qp-ema; devs=[]; ev=prices[0]
+        for p in prices: ev=p*al+ev*(1-al); devs.append(p-ev)
+        ma=max(abs(d) for d in devs); ca=abs(dev)
+        ads=sorted(abs(d) for d in devs)
+        rank=sum(1 for d in ads if d<ca); pct=rank/len(ads) if ads else 0.0
+        if pct>0.8:   rp=min(0.6+0.4*(pct-0.8)/0.2,1.0)
+        elif pct>0.6: rp=0.3+0.3*(pct-0.6)/0.2
+        elif pct>0.4: rp=0.1+0.2*(pct-0.4)/0.2
+        else:         rp=0.1*pct/0.4
+        rp=round(max(0.0,min(1.0,rp)),3)
+        ratio=ca/max(ma,1e-9)
+        if dev>0:   cls="extended_above" if ratio>0.8 else "above_mean" if ratio>0.5 else "near_mean"
+        else:       cls="extended_below" if ratio>0.8 else "below_mean" if ratio>0.5 else "near_mean"
+        if ca<self._avg_vol()*0.5: cls="compressed"
+        nt=cfg.EMA_BAND_NEAR_MAX*ma; et=cfg.EMA_BAND_EXTENDED*ma
+        def band(d): return "near" if d<=nt else "moderate" if d<=et else "extended"
+        def bord(b): return {"near":0,"moderate":1,"extended":2}[b]
+        eps={b:{"total":0,"rev":0,"cont":0,"sr":[],"sc":[]} for b in ["near","moderate","extended"]}
+        pb=ceb=es=None
+        for i,d in enumerate(devs):
+            cb=band(abs(d))
+            if cb!=pb:
+                if ceb and es is not None:
+                    ln=i-es
+                    if pb and bord(cb)<bord(pb): eps[pb]["rev"]+=1; eps[pb]["sr"].append(ln)
+                    elif pb: eps[pb]["cont"]+=1; eps[pb]["sc"].append(ln)
+                es,ceb=i,cb; eps[cb]["total"]+=1
+            pb=cb
+        bands={}
+        for bn in ["near","moderate","extended"]:
+            d=eps[bn]; t=d["total"]
+            if not t: bands[bn]={"episodes":0,"reversion_prob":None,"continuation_prob":None}
+            else:
+                te=d["rev"]+d["cont"]
+                bands[bn]={"episodes":t,
+                           "reversion_prob":round(d["rev"]/te,4) if te else None,
+                           "continuation_prob":round(d["cont"]/te,4) if te else None,
+                           "avg_steps_rev":round(sum(d["sr"])/len(d["sr"]),2) if d["sr"] else None,
+                           "avg_steps_cont":round(sum(d["sc"])/len(d["sc"]),2) if d["sc"] else None}
+        return {"available":True,"ema_value":round(ema,4),"current_deviation":round(dev,4),
+                "deviation_percentile":round(pct,4),"reversion_probability":rp,"classification":cls,
+                "data_points":len(prices),"ema_period":cfg.EMA_PERIOD,"bands":bands}
+
+    def convergence_sensor(self, ssv):
+        sensors=[]
+        regime=ssv.get("internal_regime")
+        if regime in ("UP","DOWN"):
+            dn=ssv.get("local_density",0)
+            sensors.append({"name":"regime","direction":1 if regime=="UP" else -1,
+                            "confidence":min(0.5+0.05*dn,0.95) if dn else 0.5})
+        nd=ssv.get("net_flow_direction",0.0)
+        if abs(nd)>0.1: sensors.append({"name":"vector_field","direction":1 if nd>0 else -1,"confidence":min(abs(nd),1.0)})
+        ema=ssv.get("ema_sensor",{})
+        if ema.get("available"):
+            ec,rp=ema.get("classification"),ema.get("reversion_probability",0.5)
+            if ec in ("extended_above","extended_below") and rp>0.5:
+                sensors.append({"name":"ema","direction":-1 if "above" in ec else 1,"confidence":rp})
+        fwd_dist = ssv.get("fwd_distributions", [])
+        if len(fwd_dist) >= 2:
+            hop1 = fwd_dist[1]
+            start_zone = ssv.get("observed_zone", "")
+            expected_dir = 0.0
+            total_prob = 0.0
+            for z, p in hop1.items():
+                try:
+                    dir_sign = 1 if _zone_val(z) > _zone_val(start_zone) else -1 if _zone_val(z) < _zone_val(start_zone) else 0
+                except:
+                    dir_sign = 0
+                expected_dir += p * dir_sign
+                total_prob += p
+            if total_prob > 0:
+                expected_dir /= total_prob
+            fwd_dir = 1 if expected_dir > 0.15 else -1 if expected_dir < -0.15 else 0
+            fwd_confidence = min(abs(expected_dir), 1.0)
+            if fwd_dir != 0:
+                sensors.append({"name":"forward_trace","direction":fwd_dir,"confidence":round(fwd_confidence, 4)})
+        cis = ssv.get("cis_sensor", {})
+        if cis.get("active") and cis.get("mode") == "historical_resolution" and cis.get("direction"):
+            sensors.append({"name":"cis","direction":1 if cis["direction"]=="UP" else -1 if cis["direction"]=="DOWN" else 0,
+                            "confidence":cis["confidence"]})
+        if len(sensors)<2: return {"available":False,"message":f"{len(sensors)} sensor(s) (need ≥2)"}
+        dirs=[s["direction"] for s in sensors]
+        twa=tp=0.0
+        for i in range(len(sensors)):
+            for j in range(i+1,len(sensors)):
+                w=min(sensors[i]["confidence"],sensors[j]["confidence"]); tp+=w
+                if dirs[i]==dirs[j]: twa+=w
+        wpa=twa/tp if tp else 0.0
+        tw=sum(s["confidence"] for s in sensors)
+        wa=sum(s["direction"]*s["confidence"] for s in sensors)/tw if tw else 0.0
+        cs=abs(wa)
+        mc=0.5
+        ind=1.0-min(mc,1.0); eff=cs*(ind*2) if ind<0.5 else cs
+        self._agree_hist.append(wpa)
+        if len(self._agree_hist)>cfg.CONVERGENCE_HISTORY_SIZE: self._agree_hist=self._agree_hist[-cfg.CONVERGENCE_HISTORY_SIZE:]
+        hl=len(self._agree_hist)
+        if hl>=5:
+            mean=sum(self._agree_hist)/hl
+            std=math.sqrt(sum((x-mean)**2 for x in self._agree_hist)/hl) or 1e-9
+            az=(wpa-mean)/std
+        else: az=0.0
+        base=sum(self._agree_hist)/hl if hl else 0.0
+        if hl>=5 and abs(az)>0.1:
+            if az>2.0:    cls="HIGH_CONVICTION"
+            elif az>1.5 or (eff>0.7 and az>1.0): cls="MODERATE_CONVICTION"
+            elif az<-1.5: cls="CONTRADICTORY"
+            else:         cls="LOW_CONVICTION"
+        else:
+            if eff>0.8 and wpa>0.7:   cls="HIGH_CONVICTION"
+            elif eff>0.6 or wpa>0.5:  cls="MODERATE_CONVICTION"
+            elif wpa<0.3:             cls="CONTRADICTORY"
+            else:                      cls="LOW_CONVICTION"
+        interps={"HIGH_CONVICTION":"Sensors converge anomalously — meaningful structural agreement",
+                 "MODERATE_CONVICTION":"Moderate convergence — within expected range",
+                 "LOW_CONVICTION":"Weak convergence — sensors ambiguous",
+                 "CONTRADICTORY":"Sensors disagree — structure transitioning"}
+        return {"available":True,"sensors_total":len(sensors),
+                "sensors_agreeing":sum(1 for d in dirs if d==dirs[0]),
+                "pairwise_agreement":round(wpa,4),"convergence_strength":round(cs,4),
+                "effective_strength":round(eff,4),"anomaly_z":round(az,4),
+                "direction":"UP" if wa>0.2 else "DOWN" if wa<-0.2 else "SIDEWAYS",
+                "classification":cls,"interpretation":interps.get(cls,""),
+                "sensor_details":[{"name":s["name"],"direction":"UP" if s["direction"]>0 else "DOWN",
+                                   "confidence":round(s["confidence"],4)} for s in sensors]}
+
+    def _sensor_notes(self, ssv):
+        notes=[]; regime=ssv.get("internal_regime","SIDEWAYS"); nd=ssv.get("net_flow_direction",0.0)
+        if regime=="UP" and nd<-0.15:    notes.append("[Contradiction] UP regime but downward flow")
+        elif regime=="DOWN" and nd>0.15: notes.append("[Contradiction] DOWN regime but upward flow")
+        if regime=="SIDEWAYS" and abs(nd)>0.5:
+            notes.append(f"[Mixed] SIDEWAYS regime but strong {'upward' if nd>0 else 'downward'} flow bias")
+        ema=ssv.get("ema_sensor",{}); conv=ssv.get("convergence_sensor",{})
+        if ema.get("available"):
+            ec,rp=ema.get("classification"),ema.get("reversion_probability",0)
+            if ec=="extended_below" and regime=="UP" and rp>0.5:
+                notes.append("[Alignment] Extended below EMA + UP regime → mean-reversion long setup")
+            if ec=="extended_above" and regime=="DOWN" and rp>0.5:
+                notes.append("[Alignment] Extended above EMA + DOWN regime → mean-reversion short setup")
+        if conv.get("classification")=="HIGH_CONVICTION":
+            notes.append("[Alignment] Independent sensors converge strongly")
+        elif conv.get("classification")=="CONTRADICTORY":
+            notes.append("[Warning] Sensors disagree — possible structural transition")
+        cis = ssv.get("cis_sensor", {})
+        if cis.get("active"):
+            if cis.get("mode") == "instability":
+                notes.append("[Structural Instability] Contradiction pattern resembles prior representational shifts — current directional confidence may be unreliable")
+            elif cis.get("direction"):
+                notes.append(f"[CIS] Historical contradiction resolution supports current consensus ({cis['direction']})")
+        return notes
+
+    def _contradiction(self, regime, nd, cls, mir_sim, conv_z=None):
+        strength=0.0; hint=None
+        if regime=="UP" and nd<-0.1:    strength+=0.4+min(abs(nd),0.5); hint="UP regime contradicts downward flow"
+        elif regime=="DOWN" and nd>0.1: strength+=0.4+min(nd,0.5);     hint="DOWN regime contradicts upward flow"
+        elif regime=="SIDEWAYS" and abs(nd)>0.3: strength+=0.2+min(abs(nd),0.5)*0.5; hint="SIDEWAYS but biased flow"
+        if cls=="attractor" and nd<-0.2: strength+=0.2; hint=hint or "Attractor losing gravity"
+        elif cls=="repeller" and nd>0.2: strength+=0.2; hint=hint or "Repeller gaining strength"
+        if mir_sim>0.5 and regime!="SIDEWAYS": strength+=0.1; hint=hint or "Mirror symmetry contradicts directional regime"
+        if conv_z and abs(conv_z)>1.5:
+            strength+=min(abs(conv_z),3)/3*0.2
+            hint=(hint+f" (conv anomaly {conv_z:.2f})") if hint else f"Convergence anomaly {conv_z:.2f}"
+        return round(min(strength,1.0),2), hint
+
+    def _completion_hyp(self, ssv):
+        mc=ssv.get("match_confidence","LOW")
+        cm={"HIGH":1.0,"RESOLVED_MATCH":0.9,"MEDIUM":0.7,"LOW":0.4,"AMBIGUOUS":0.3,"NO_MATCH":0.1,"INVALID":0.0}
+        ms=cm.get(mc,0.4); dn=min(ssv.get("local_density",1)/10,1.0)
+        dr=1.0 if ssv.get("local_density",1)>=4 else 0.5
+        dew=round((ms+dn+dr)/3,4)
+        vf=1.0 if ssv.get("zone_classification","neutral") in ("attractor","repeller") else 0.5
+        ts=ssv.get("exit_probability",0.0); ms2=ssv.get("mirror_similarity",0.0)
+        ds=ssv.get("dna_profile",{}).get("confidence",0.0)
+        gcw=round((vf+ts+ms2+ds)/4,4)
+        cs=round(max(0.0,min(1.0,(cfg.COMPLETION_WEIGHT_DIRECT*dew+cfg.COMPLETION_WEIGHT_GRAPH*gcw)*(1-0.2*ssv.get("contradiction_strength",0.0)))),4)
+        inferences=[]
+        if vf>0.6:  inferences.append(f"Zone '{ssv.get('zone_classification')}' from attractor score")
+        if ts>0.3:  inferences.append(f"Exit {ssv.get('dominant_exit')} at {int(ts*100)}%")
+        if ms2>0.3: inferences.append(f"Mirror symmetry {ms2:.2f}")
+        if ds>0.3:  inferences.append(f"DNA {ssv.get('dna_profile',{}).get('dominant_state')}")
+        fts=ssv.get("fwd_structured",[])
+        rec=[h for h in fts if h["status"]=="RECONSTRUCTION"]
+        spe=[h for h in fts if h["status"]=="SPECULATIVE"]
+        if rec:  inferences.append(f"Reconstruction: {' → '.join(h['zone'] for h in rec)}")
+        if spe:  inferences.append(f"Speculative: {' → '.join(h['zone'] for h in spe)}")
+        return {"direct_evidence":dew,"graph_completion":gcw,"completion_strength":cs,
+                "completion_risk":round(1-cs,4),"inferences":inferences[:5]}
+
+    def _combined_conf(self, mc, nc, entropy, ep, stab=None, persist=0):
+        cm={"HIGH":0.9,"RESOLVED_MATCH":0.85,"MEDIUM":0.6,"LOW":0.35,"AMBIGUOUS":0.2,"NO_MATCH":0.1,"INVALID":0.0}
+        ms=cm.get(mc,0.3); df=min(nc/20,1.0)
+        ef=max(0.0,1-entropy/2.5) if entropy>0 else 0.5; epf=1-ep
+        rsf=0.5+0.5*max(0.0,min(1.0,stab))*min(persist/5.0,1.0) if stab is not None else 0.5
+        return {"overall":round(max(0,min(1,(ms+df+ef+epf+rsf)/5)),4),"match":round(ms,4),
+                "density":round(df,4),"entropy":round(ef,4),"epistemic":round(epf,4),"stability":round(rsf,4)}
+
+    # ─────────────────────────────────────────────
+    #  Shared epistemic helpers
+    # ─────────────────────────────────────────────
+
+    def _confidence_estimate(self, density_factor, contradiction_strength):
+        """Weighted-additive confidence: evidence depth + consistency."""
+        return round(0.4 * density_factor + 0.6 * (1.0 - contradiction_strength), 4)
+
+    def _apply_epistemic_update(self, edge, delta_entropy, delta_contradiction, delta_confidence):
+        """Incremental mean updates and epistemic_weight calculation (shared)."""
+        edge.epistemic_count += 1
+        n = edge.epistemic_count
+        edge.mu_entropy += (delta_entropy - edge.mu_entropy) / n
+        edge.mu_contradiction += (delta_contradiction - edge.mu_contradiction) / n
+        edge.mu_confidence += (delta_confidence - edge.mu_confidence) / n
+        freq_norm = math.tanh(n / 10.0)
+        edge.epistemic_weight = round(
+            cfg.L_ALPHA * freq_norm +
+            cfg.L_BETA * max(0, edge.mu_confidence) -
+            cfg.L_GAMMA * abs(edge.mu_contradiction), 4)
+
+    # ─────────────────────────────────────────────
+    #  NMD Phase 2A — Hypothesis-Space Observer
+    # ─────────────────────────────────────────────
+
+    def _nmd_summary(self, results):
+        topk = cfg.NMD_TOPK
+        candidates = results[:topk] if len(results) >= topk else results[:len(results)]
+        scores = [max(r["total"], 0.0) for r in candidates]
+        s = sum(scores)
+        if s <= 0 or len(scores) < 2:
+            return {
+                "entropy": 0.0,
+                "entropy_label": "low",
+                "hypothesis_count": len(scores),
+                "dominant_score": scores[0] if scores else 0.0,
+                "second_score": 0.0,
+                "spread": 0.0,
+                "alternatives": []
+            }
+
+        probs = [x / s for x in scores]
+        raw_entropy = -sum(p * math.log(p) for p in probs if p > 0)
+        if len(probs) > 1:
+            normalized = raw_entropy / math.log(len(probs))
+        else:
+            normalized = 0.0
+        normalized = round(normalized, 4)
+
+        if normalized < cfg.NMD_ENTROPY_LOW:
+            label = "low"
+        elif normalized < cfg.NMD_ENTROPY_HIGH:
+            label = "medium"
+        else:
+            label = "high"
+
+        alternatives = []
+        for r in candidates[1:4]:
+            alternatives.append({
+                "zone": r.get("zone", "Z?"),
+                "score": r["total"],
+                "price": r.get("price")
+            })
+
+        return {
+            "entropy": normalized,
+            "entropy_label": label,
+            "hypothesis_count": len(candidates),
+            "dominant_score": scores[0],
+            "second_score": scores[1] if len(scores) > 1 else 0.0,
+            "spread": round(scores[0] - (scores[1] if len(scores) > 1 else 0.0), 4),
+            "alternatives": alternatives
+        }
+
+    # ─────────────────────────────────────────────
+    #  CONTRADICTION INSIGHT SENSOR (CIS)
+    # ─────────────────────────────────────────────
+
+    def _component_contradiction(self, cc, comp):
+        vals = [cc[k] for k in ("match","density","entropy","epistemic","stability")]
+        return round(max(vals) - min(vals), 4)
+
+    def _cis_trigger_component(self, ssv):
+        return ssv.get("component_spread", 0.0) >= cfg.CIS_COMPONENT_SPREAD_MIN
+
+    def _cis_bin_val(self, value, thresholds):
+        for (lo, hi), label in thresholds.items():
+            if lo <= value < hi or (hi == float('inf') and value >= lo):
+                return label
+        return "?"
+
+    def _cis_snapshot(self, ssv):
+        regime = ssv.get("internal_regime", "SIDEWAYS")
+        nd = ssv.get("net_flow_direction", 0.0)
+        if nd > 0.15: vf_bin = "UP"
+        elif nd < -0.15: vf_bin = "DOWN"
+        else: vf_bin = "FLAT"
+        ema = ssv.get("ema_sensor", {})
+        ema_cls = ema.get("classification", "none") if ema.get("available") else "none"
+        mir_sim = ssv.get("mirror_similarity", 0.0)
+        mir_bin = "high" if mir_sim > 0.5 else "med" if mir_sim > 0.3 else "low"
+        cs = ssv.get("contradiction_strength", 0.0)
+        if cs < 0.3: cs_bin = "low"
+        elif cs < 0.6: cs_bin = "med"
+        else: cs_bin = "high"
+        conv = ssv.get("convergence_sensor", {})
+        conv_cls = conv.get("classification", "none") if conv.get("available") else "none"
+        sensors = ssv.get("convergence_sensor", {}).get("sensor_details", [])
+        sensor_vec = tuple((s["name"], s["direction"]) for s in sensors)
+        comp_spread = ssv.get("component_spread", 0.0)
+        if comp_spread < 0.2: spread_bin = "low"
+        elif comp_spread < 0.4: spread_bin = "med"
+        else: spread_bin = "high"
+        return {
+            "regime": regime,
+            "vector_field_bin": vf_bin,
+            "ema_class": ema_cls,
+            "mirror_bin": mir_bin,
+            "contradiction_bin": cs_bin,
+            "convergence_class": conv_cls,
+            "sensor_vector": sensor_vec,
+            "component_spread_bin": spread_bin
+        }
+
+    def _cis_distance(self, snap_a, snap_b):
+        weights = {
+            "regime": 0.25,
+            "vector_field_bin": 0.25,
+            "ema_class": 0.15,
+            "mirror_bin": 0.10,
+            "contradiction_bin": 0.15,
+            "convergence_class": 0.05,
+            "component_spread_bin": 0.05
+        }
+        dist = 0.0
+        for k, w in weights.items():
+            if snap_a.get(k) != snap_b.get(k):
+                dist += w
+        vec_a = set(snap_a.get("sensor_vector", ()))
+        vec_b = set(snap_b.get("sensor_vector", ()))
+        if vec_a or vec_b:
+            jacc = len(vec_a & vec_b) / max(len(vec_a | vec_b), 1)
+            dist += 0.1 * (1 - jacc)
+        return round(dist, 4)
+
+    def _cis_kernel(self, dist):
+        return math.exp(-cfg.CIS_KERNEL_BETA * dist)
+
+    def _cis_trigger(self, ssv):
+        return ssv.get("contradiction_strength", 0.0) >= cfg.CIS_CONTRADICTION_THRESHOLD
+
+    def _cis_trigger_mild(self, ssv):
+        cs = ssv.get("contradiction_strength", 0.0)
+        return cfg.CIS_MILD_TENSION_MIN <= cs < cfg.CIS_CONTRADICTION_THRESHOLD
+
+    def _cis_schedule(self, snapshot, current_zone, start_regime, dna_dominant, dna_stability, conv_class, episode_type="full"):
+        entry = {
+            "snapshot": snapshot,
+            "start_zone": current_zone,
+            "start_step": self._global_step,
+            "start_regime": start_regime,
+            "start_dna_dominant": dna_dominant,
+            "start_dna_stability": dna_stability,
+            "start_convergence_class": conv_class,
+            "type": episode_type
+        }
+        if episode_type == "mild":
+            self.cis_pending_mild.append(entry)
+        elif episode_type == "component":
+            self.cis_pending_component.append(entry)
+        else:
+            self.cis_pending.append(entry)
+
+    def _cis_scheduler(self):
+        for lst in [self.cis_pending, self.cis_pending_mild, self.cis_pending_component]:
+            if not lst:
+                continue
+            current_zone = self.last_zone
+            resolved = []
+            for event in lst:
+                if self._global_step - event["start_step"] >= cfg.CIS_OUTCOME_STEPS:
+                    self._cis_finalize(event, current_zone)
+                    resolved.append(event)
+            for r in resolved:
+                lst.remove(r)
+
+    def _cis_finalize(self, event, current_zone):
+        start_zone = event["start_zone"]
+        if start_zone is None or current_zone is None:
+            return
+        try:
+            sv = _zone_val(start_zone)
+            tv = _zone_val(current_zone)
+            if tv > sv: direction = "UP"
+            elif tv < sv: direction = "DOWN"
+            else: direction = "SIDEWAYS"
+        except:
+            direction = "SIDEWAYS"
+
+        current_regime = "?"
+        if start_zone in [n.price_zone for n in self.nodes.values()]:
+            zn = [n for n in self.nodes.values() if n.price_zone == start_zone]
+            current_regime = detect_regime(zn)
+        regime_changed = (event["start_regime"] != current_regime)
+        convergence_resolved = False
+        dna_now = self.dna_distribution()
+        stability_after = dna_now.get("stability")
+        reorg = 0
+        if direction != "SIDEWAYS": reorg += 1
+        if regime_changed: reorg += 1
+        start_stab = event.get("start_dna_stability")
+        if start_stab is not None and stability_after is not None:
+            if stability_after > start_stab + 0.1:
+                reorg += 1
+
+        outcome = {
+            "direction": direction,
+            "regime_changed": regime_changed,
+            "convergence_resolved": convergence_resolved,
+            "stability_after": stability_after,
+            "reorg_score": reorg
+        }
+        episode = {
+            "snapshot": event["snapshot"],
+            "outcome": outcome,
+            "steps_to_outcome": self._global_step - event["start_step"],
+            "timestamp": time.time(),
+            "type": event.get("type", "full")
+        }
+        self.cis_episodes.append(episode)
+        self._cis_prune()
+
+    def _cis_prune(self):
+        now = time.time()
+        cutoff = now - cfg.CIS_DECAY_AGE_DAYS * 86400
+        self.cis_episodes = [ep for ep in self.cis_episodes if ep["timestamp"] > cutoff]
+        if len(self.cis_episodes) > cfg.CIS_MAX_EPISODES:
+            self.cis_episodes = sorted(self.cis_episodes, key=lambda x: x["timestamp"], reverse=True)[:cfg.CIS_MAX_EPISODES]
+
+    def _cis_detect_instability(self, ssv):
+        cs = ssv.get("contradiction_strength", 0.0)
+        dna = ssv.get("dna_profile", {})
+        stab = dna.get("stability")
+        pres = dna.get("pressure", 1.0)
+        if stab is None:
+            stab = 0.5
+        if (cs >= cfg.CIS_PRE_TRANSITION_CONTRADICTION_MIN and
+            stab <= cfg.CIS_PRE_TRANSITION_STABILITY_MAX and
+            pres >= cfg.CIS_PRE_TRANSITION_PRESSURE_MIN):
+            return True
+        return False
+
+    def _cis_sensor(self, ssv):
+        if self._cis_detect_instability(ssv):
+            return {"active": True, "mode": "instability",
+                    "message": "Structural instability detected — past similar contradiction patterns preceded representational shifts"}
+        current_snap = self._cis_snapshot(ssv)
+        matches = []
+        for ep in self.cis_episodes:
+            d = self._cis_distance(current_snap, ep["snapshot"])
+            if d < cfg.CIS_SIMILARITY_THRESHOLD:
+                matches.append((ep, self._cis_kernel(d)))
+        if len(matches) < cfg.CIS_MIN_MATCHES:
+            return {"active": False, "reason": "insufficient_data",
+                    "match_count": len(matches),
+                    "contradiction_strength": ssv.get("contradiction_strength", 0.0),
+                    "episode_count": len(self.cis_episodes),
+                    "pending_count": len(self.cis_pending) + len(self.cis_pending_mild) + len(self.cis_pending_component)}
+        scores = {"UP": 0.0, "DOWN": 0.0, "SIDEWAYS": 0.0}
+        reorg_total = 0.0; count = 0
+        for ep, w in matches:
+            scores[ep["outcome"]["direction"]] += w
+            reorg_total += ep["outcome"].get("reorg_score", 0) * w
+            count += 1
+        total = sum(scores.values()) or 1e-9
+        probs = {k: v / total for k, v in scores.items()}
+        ent = -sum(p * math.log(p + 1e-9) for p in probs.values())
+        direction = max(probs, key=probs.get)
+        confidence = min(probs[direction], cfg.CIS_CONFIDENCE_CAP)
+        avg_reorg = reorg_total / count if count > 0 else 0.0
+        conv_dir = ssv.get("convergence_sensor", {}).get("direction", "SIDEWAYS")
+        if direction != conv_dir:
+            if self.cis_verbose:
+                return {"active": True, "mode": "silent_disagreement",
+                        "direction": direction, "confidence": confidence,
+                        "match_count": len(matches), "entropy": ent,
+                        "consensus": conv_dir, "avg_reorg": round(avg_reorg, 2),
+                        "note": f"CIS direction {direction} disagrees with consensus {conv_dir} — suppressed"}
+            return {"active": False, "reason": "direction_mismatch",
+                    "match_count": len(matches),
+                    "contradiction_strength": ssv.get("contradiction_strength", 0.0),
+                    "episode_count": len(self.cis_episodes),
+                    "pending_count": len(self.cis_pending) + len(self.cis_pending_mild) + len(self.cis_pending_component)}
+        return {"active": True, "mode": "historical_resolution",
+                "direction": direction, "confidence": confidence,
+                "entropy": round(ent, 4), "match_count": len(matches),
+                "probs": {k: round(v, 4) for k, v in probs.items()},
+                "avg_reorg": round(avg_reorg, 2)}
+
+    # ── PHASE 2: WHY vectors and L operator (skips ambiguous hops) ──
+
+    def _compute_why_vectors(self, ssv, fwd_structured):
+        why = []
+        if len(fwd_structured) < 1:
+            return why
+        global_contradiction = ssv.get("contradiction_strength", 0.0)
+        global_confidence = ssv["combined_confidence"]["overall"]
+        vf = self.vector_field()
+        prev_zone = ssv["observed_zone"]
+        for hop in fwd_structured:
+            z_to = hop["zone"]
+            ambiguous = hop.get("ambiguous", False)
+            if ambiguous:
+                prev_zone = z_to
+                continue
+            an_to = self._cluster(z_to)
+            regime_to = an_to["regime"]
+            density_to = an_to["node_count"]
+            vf_to = vf.get(z_to, {})
+            nd_to = vf_to.get("net_direction", 0.0)
+            cls_to = vf_to.get("classification", "neutral")
+            cs_to, _ = self._contradiction(regime_to, nd_to, cls_to, ssv.get("mirror_similarity", 0.0))
+            contradiction_delta = round(cs_to - global_contradiction, 4)
+
+            # Weighted‑additive confidence
+            density_factor = min(density_to / 10.0, 1.0)
+            confidence_to = self._confidence_estimate(density_factor, cs_to)
+            confidence_delta = round(confidence_to - global_confidence, 4)
+
+            # per‑hop normalized entropy (target zone) and source zone entropy
+            pr_to = self.ct.probs(z_to)
+            if pr_to:
+                raw_entropy_to = -sum(p * math.log(p) for p in pr_to.values() if p > 0)
+                n_to = len(pr_to)
+                norm_entropy_to = raw_entropy_to / math.log(n_to) if n_to > 1 else 0.0
+            else:
+                norm_entropy_to = 0.0
+
+            # source zone entropy (prev_zone) – the domain‑consistent baseline
+            pr_from = self.ct.probs(prev_zone)
+            if pr_from:
+                raw_entropy_from = -sum(p * math.log(p) for p in pr_from.values() if p > 0)
+                n_from = len(pr_from)
+                norm_entropy_from = raw_entropy_from / math.log(n_from) if n_from > 1 else 0.0
+            else:
+                norm_entropy_from = 0.0
+
+            entropy_delta = round(norm_entropy_to - norm_entropy_from, 4)
+
+            why.append({
+                "from": prev_zone,
+                "to": z_to,
+                "delta_entropy": entropy_delta,
+                "delta_contradiction": contradiction_delta,
+                "delta_confidence": confidence_delta,
+                "context": {
+                    "regime": regime_to,
+                    "density": density_to,
+                    "vector_field": f"{nd_to:+.2f}",
+                    "classification": cls_to
+                }
+            })
+            prev_zone = z_to
+        return why
+
+    def L_reconcile(self, r_output):
+        why_vectors = r_output.get("why_vectors", [])
+        if not why_vectors:
+            return
+        for wv in why_vectors:
+            z_from = wv["from"]
+            z_to = wv["to"]
+            edge = self._representative_edge(z_from, z_to)
+            if edge is None:
+                continue
+            self._apply_epistemic_update(edge, wv["delta_entropy"], wv["delta_contradiction"], wv["delta_confidence"])
+
+    def _representative_edge(self, z_from, z_to):
+        """Return the literal edge that best represents the zone‑pair transition,
+        newest recorded example first, falling back to highest‑strength edge."""
+        # Try recorded examples (newest‑first)
+        examples = self.ct.examples_for(z_from, z_to)
+        for fp, tp in reversed(examples):
+            from_candidates = [n for n in self.nodes.values() if n.price_zone == z_from and n.price == fp]
+            to_candidates   = [n for n in self.nodes.values() if n.price_zone == z_to   and n.price == tp]
+            for fn in from_candidates:
+                for tn in to_candidates:
+                    if tn.value in fn.links:
+                        return fn.links[tn.value]
+        # Fallback to highest‑strength edge in the zone pair
+        best_edge = None
+        best_strength = -1.0
+        from_nodes = [n for n in self.nodes.values() if n.price_zone == z_from]
+        for fn in from_nodes:
+            for lv, e in fn.links.items():
+                if lv in self.nodes and self.nodes[lv].price_zone == z_to:
+                    if e.strength > best_strength:
+                        best_edge = e
+                        best_strength = e.strength
+        return best_edge
+
+    # ── Observation‑driven adaptation (fires on B, forward transitions only) ──
+    def _observe_adapt(self, from_node, to_node, edge, vf=None):
+        """Update edge epistemic fields using local deltas of the actual transition."""
+        from_zone = from_node.price_zone
+        to_zone = to_node.price_zone
+        if from_zone == to_zone or from_zone == "Z?" or to_zone == "Z?":
+            return
+        if vf is None:
+            vf = self.vector_field()
+        # source contradiction
+        an_from = self._cluster(from_zone)
+        vf_from = vf.get(from_zone, {})
+        regime_from = an_from["regime"]
+        nd_from = vf_from.get("net_direction", 0.0)
+        cls_from = vf_from.get("classification", "neutral")
+        cs_from, _ = self._contradiction(regime_from, nd_from, cls_from, 0.0)
+        # target contradiction
+        an_to = self._cluster(to_zone)
+        vf_to = vf.get(to_zone, {})
+        regime_to = an_to["regime"]
+        nd_to = vf_to.get("net_direction", 0.0)
+        cls_to = vf_to.get("classification", "neutral")
+        cs_to, _ = self._contradiction(regime_to, nd_to, cls_to, 0.0)
+
+        delta_contradiction = round(cs_to - cs_from, 4)
+
+        # Weighted‑additive confidence estimates
+        density_factor_from = min(an_from["node_count"] / 10.0, 1.0)
+        density_factor_to   = min(an_to["node_count"]   / 10.0, 1.0)
+        confidence_from = self._confidence_estimate(density_factor_from, cs_from)
+        confidence_to   = self._confidence_estimate(density_factor_to, cs_to)
+        delta_confidence = round(confidence_to - confidence_from, 4)
+
+        # local delta entropy (consistent, same domain as why‑vectors)
+        pr_from = self.ct.probs(from_zone)
+        raw_entropy_from = 0.0
+        if pr_from:
+            raw_entropy_from = -sum(p * math.log(p) for p in pr_from.values() if p > 0)
+        nf = len(pr_from)
+        norm_entropy_from = raw_entropy_from / math.log(nf) if nf > 1 else 0.0
+
+        pr_to = self.ct.probs(to_zone)
+        raw_entropy_to = 0.0
+        if pr_to:
+            raw_entropy_to = -sum(p * math.log(p) for p in pr_to.values() if p > 0)
+        nt = len(pr_to)
+        norm_entropy_to = raw_entropy_to / math.log(nt) if nt > 1 else 0.0
+        delta_entropy = round(norm_entropy_to - norm_entropy_from, 4)
+
+        self._apply_epistemic_update(edge, delta_entropy, delta_contradiction, delta_confidence)
+
+    # ── build_ssv (unchanged) ──
+
+    def build_ssv(self, results, query, vf=None):
+        if not results: return {"error":"No matches found"}
+        status,_=classify(results,self)
+        top=results[0]; zone=top.get("zone","Z?")
+        an=self._cluster(zone)
+        if vf is None: vf=self.vector_field()
+        vfz=vf.get(zone,{}); mir=self.mirror_analysis()
+        fwd=self.trace_forward(zone,steps=5)
+        dp=[p for p in self.patterns.values() if p.start_zone=="DIR?"]
+        dp.sort(key=lambda x:x.hits,reverse=True)
+        nc=an["node_count"]
+        dom_z=an.get("dominant"); dom_p=an.get("dominant_prob",0)
+        dom_dir=avg_st=None
+        if dom_z:
+            dv,zv=_zone_val(dom_z),_zone_val(zone)
+            dom_dir="UP" if dv>zv else "DOWN" if dv<zv else "FLAT"
+            avg_st=self.ct.avg_steps(zone,dom_z)
+        dna=self.dna_distribution(vf=vf)
+        regime=an["regime"]; nd=vfz.get("net_direction",0.0); cls=vfz.get("classification","unknown")
+        mir_sim=mir["similarity"]; qp=top.get("price")
+        ema=self.ema_sensor(qp) if qp else {"available":False}
+        ssv_partial={"internal_regime":regime,"net_flow_direction":nd,"local_density":nc,
+                     "ema_sensor":ema,"fwd_distributions":fwd["distributions"],
+                     "observed_zone":zone,"exit_probability":dom_p}
+        conv=self.convergence_sensor(ssv_partial)
+        cs,ch=self._contradiction(regime,nd,cls,mir_sim,conv.get("anomaly_z"))
+        cc=self._combined_conf(status,nc,dna.get("entropy",0.5),dna.get("epistemic",0.5),
+                               stab=dna.get("stability"),persist=dna.get("persistence",0))
+        comp_hyp = self._completion_hyp({
+            "match_confidence": status, "local_density": nc,
+            "zone_classification": cls, "exit_probability": dom_p,
+            "dominant_exit": dom_z, "mirror_similarity": mir_sim,
+            "dna_profile": dna, "contradiction_strength": cs,
+            "fwd_structured": fwd["structured"]
+        })
+        component_spread = self._component_contradiction(cc, comp_hyp)
+
+        zm_prices=self._zone_prices(zone); zm_med=self.median_price(zone)
+        zn=[n for n in self.nodes.values() if n.price_zone==zone]
+        latest=max((n.created_at for n in zn),default=0)
+        zm_recent=round(time.time()-latest,0) if latest else None
+        pr=self.ct.probs(zone)
+        sl=[self.ct.avg_steps(zone,t) for t in pr if self.ct.avg_steps(zone,t)]
+        zm_steps=round(sum(sl)/len(sl),2) if sl else None
+        rsa={"active":False,"message":""}
+        pers=dna.get("persistence",0); pres=dna.get("pressure",1.0); stab=dna.get("stability")
+        if pers==1 and pres>cfg.REGIME_SHIFT_PRESSURE_MIN:
+            if stab is not None and stab<0.5:
+                rsa={"active":True,"message":f"DNA shifted to {dna['dominant_state']} (persist={pers} pressure={pres:.2f} stab={stab:.2f})"}
+            elif stab is None:
+                rsa={"active":True,"message":f"DNA first classified as {dna['dominant_state']}"}
+        ssv = {"observed_zone":zone,"observed_price":qp,"matched_node":top["value"],
+             "match_confidence":status,"local_density":nc,"internal_regime":regime,
+             "dominant_exit":dom_z,"exit_probability":dom_p,"exit_direction":dom_dir,"avg_exit_time":avg_st,
+             "zone_classification":cls,"net_flow_direction":nd,"flow_magnitude":vfz.get("magnitude",0.0),
+             "mirror_similarity":mir_sim,"fwd_flat":fwd["flat"],"fwd_structured":fwd["structured"],
+             "fwd_distributions":fwd["distributions"],
+             "arrival_depth":fwd["arrival_depth"],"reliable_horizon":fwd["reliable_horizon"],
+             "dna_profile":dna,
+             "contradiction_strength":cs,"reconciliation_hint":ch,"combined_confidence":cc,
+             "zone_median_price":zm_med,"zone_avg_steps":zm_steps,"zone_recent_activity":zm_recent,
+             "ema_sensor":ema,"convergence_sensor":conv,"regime_shift_alert":rsa,
+             "dominant_pattern":dp[0].display if dp else "none","pattern_freq":dp[0].hits if dp else 0,
+             "reconstruction_confidence":"HIGH" if nc>=10 else "MEDIUM" if nc>=4 else "LOW",
+             "completion_hypothesis": comp_hyp,
+             "component_spread": component_spread}
+        cis_out = self._cis_sensor(ssv)
+        ssv["cis_sensor"] = cis_out
+        if cis_out.get("active") and cis_out.get("mode") == "historical_resolution" and cis_out.get("direction"):
+            ssv_partial2 = dict(ssv_partial)
+            ssv_partial2["cis_sensor"] = cis_out
+            conv2 = self.convergence_sensor(ssv_partial2)
+            ssv["convergence_sensor"] = conv2
+        ssv["sensor_notes"] = self._sensor_notes(ssv)
+
+        if zone:
+            if self._cis_trigger(ssv):
+                snap = self._cis_snapshot(ssv)
+                self._cis_schedule(snap, zone,
+                                   start_regime=regime,
+                                   dna_dominant=dna.get("dominant_state","?"),
+                                   dna_stability=dna.get("stability"),
+                                   conv_class=conv.get("classification","none"),
+                                   episode_type="full")
+            elif self._cis_trigger_mild(ssv):
+                snap = self._cis_snapshot(ssv)
+                self._cis_schedule(snap, zone,
+                                   start_regime=regime,
+                                   dna_dominant=dna.get("dominant_state","?"),
+                                   dna_stability=dna.get("stability"),
+                                   conv_class=conv.get("classification","none"),
+                                   episode_type="mild")
+            if self._cis_trigger_component(ssv):
+                snap = self._cis_snapshot(ssv)
+                self._cis_schedule(snap, zone,
+                                   start_regime=regime,
+                                   dna_dominant=dna.get("dominant_state","?"),
+                                   dna_stability=dna.get("stability"),
+                                   conv_class=conv.get("classification","none"),
+                                   episode_type="component")
+        return ssv
+
+    def reconstruct(self, query):
+        results = self.search(query)
+        if not results:
+            return {"error": "No matches found"}
+        ssv = self.build_ssv(results, query)
+        why = self._compute_why_vectors(ssv, ssv.get("fwd_structured", []))
+        r_output = {
+            "trajectory": ssv.get("fwd_flat", []),
+            "why_vectors": why,
+            "snapshot": {
+                "entropy": ssv["dna_profile"].get("entropy", 0),
+                "contradiction": ssv.get("contradiction_strength", 0),
+                "confidence": ssv["combined_confidence"]["overall"]
+            }
+        }
+        self.last_r_output = r_output
+        self._learn_from_query(results)
+        self.L_reconcile(r_output)
+        return ssv
+
+    def distance_map(self, zone):
+        all_zones=sorted(set(n.price_zone for n in self.nodes.values() if n.price_zone!="Z?"),key=_zone_val)
+        if not all_zones or zone not in all_zones: return {}
+        vf=self.vector_field()
+        att=[z for z in all_zones if vf.get(z,{}).get("classification")=="attractor"]
+        rep=[z for z in all_zones if vf.get(z,{}).get("classification")=="repeller"]
+        def zdist(z1,z2):
+            try: return abs(all_zones.index(z1)-all_zones.index(z2))
+            except: return None
+        path,cur,visited=[],zone,set()
+        for _ in range(10):
+            if cur in visited: break
+            visited.add(cur); path.append(cur)
+            if vf.get(cur,{}).get("classification")=="attractor": break
+            pr=self.ct.probs(cur)
+            if not pr: break
+            nxt=max(pr,key=pr.get)
+            if nxt==cur: break
+            cur=nxt
+        return {"current_zone":zone,
+                "nearest_attractor":min(att,key=lambda z:zdist(zone,z),default=None),
+                "nearest_repeller":min(rep,key=lambda z:zdist(zone,z),default=None),
+                "path_to_equilibrium":path,"equilibrium_steps":len(path)-1}
+
+    def structural_report(self, query):
+        if not self.nodes: return "  No data loaded."
+        ssv = self.reconstruct(query)
+        if "error" in ssv:
+            return f"  {ssv['error']}"
+        results = self.search(query)
+        vf=self.vector_field()
+        dmap=self.distance_map(ssv["observed_zone"])
+        nmd = self._nmd_summary(results)
+
+        L=[]
+        W=56
+
+        def rule(c="─"): L.append(" "+c*W)
+        def hdr(t): L.append(f" ╔{'═'*(W)}╗"); L.append(f" ║  {t:<{W-2}}║"); L.append(f" ╚{'═'*(W)}╝")
+        def sec(t): L.append(""); rule(); L.append(f"  {t} [Axiomatic]"); rule()
+        def row(k,v,w=20): L.append(f"  {k:<{w}} {v}")
+
+        hdr(f"NLPGM {VERSION}  ·  LATENT STATE RECONSTRUCTION")
+        L.append(f"  Query : {query}")
+        L.append(f"  Zone  : {ssv['observed_zone']}  ·  Price: {ssv['observed_price']}")
+        L.append(f"  Match : {CONFIDENCE_DISPLAY.get(ssv['match_confidence'], ssv['match_confidence'])}")
+
+        rsa=ssv.get("regime_shift_alert",{})
+        if rsa.get("active"):
+            L.append("")
+            L.append(f"  ⚠  REGIME SHIFT  {rsa['message']}")
+
+        sec("MATCH SCORES")
+        for i,r in enumerate(results[:5],1):
+            tag=f"px={r['price']:.4f}" if r.get("price") else ""
+            boost_str=f"+{r['boost']:.3f}" if r.get("boost",0)>0 else ""
+            L.append(f"  {i}. {r['value']:<22} {r['total']:.4f}  base={r['base']:.3f} {boost_str}  [{r.get('zone','?')}] {tag}")
+
+        sec("NMD HYPOTHESIS SPACE")
+        row("Entropy (normalized)", f"{nmd['entropy']:.2f} ({nmd['entropy_label']})  [0=dominated, 1=fully competitive]")
+        row("Hypotheses examined", str(nmd["hypothesis_count"]))
+        row("Dominant score", f"{nmd['dominant_score']:.4f}")
+        row("Second score", f"{nmd['second_score']:.4f}")
+        row("Score spread", f"{nmd['spread']:.4f}")
+
+        sec("LATENT STATE RECONSTRUCTION")
+        zone=ssv["observed_zone"]
+        row("Zone",f"{zone}  ({ssv['zone_classification']})")
+        row("Internal regime",ssv["internal_regime"])
+        row("Local density",f"{ssv['local_density']} nodes")
+        row("Zone median price",f"{ssv['zone_median_price']:.4f}" if ssv.get("zone_median_price") else "N/A")
+        row("Recent activity",f"{fmt_age(ssv['zone_recent_activity'])} ago" if ssv.get("zone_recent_activity") else "N/A")
+        row("Dominant exit",f"{ssv['dominant_exit']} ({int(ssv['exit_probability']*100)}% {ssv.get('exit_direction','')})" if ssv.get("dominant_exit") else "None")
+        row("Avg exit time",f"{ssv['avg_exit_time']} steps" if ssv.get("avg_exit_time") else "N/A")
+        row("Recon confidence",ssv["reconstruction_confidence"])
+        L.append("")
+
+        L.append(f"  FORWARD TRACE  (arrival depth={ssv['arrival_depth']}, horizon={ssv['reliable_horizon']} [informational])")
+        dists = ssv.get("fwd_distributions", [])
+        for i in range(1, len(dists)):
+            hop_dist = dists[i]
+            if not hop_dist:
+                break
+            sorted_items = sorted(hop_dist.items(), key=lambda x: x[1], reverse=True)
+            max_prob = sorted_items[0][1]
+            second_prob = sorted_items[1][1] if len(sorted_items) > 1 else 0.0
+            spread = max_prob - second_prob
+            if len(sorted_items) > 1 and spread < cfg.FWD_BRANCH_SPREAD_THRESHOLD:
+                L.append(f"  ⚠  HOP {i} BRANCH POINT (spread={spread:.3f})")
+                for z, p in sorted_items:
+                    st = "RECONSTRUCTION" if p >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
+                    bar = "█"*int(p*20)
+                    L.append(f"     → {z:<12} prob={p:.3f}  [{st}] {bar}")
+            else:
+                z = sorted_items[0][0]
+                p = sorted_items[0][1]
+                st = "RECONSTRUCTION" if p >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
+                bar = "█"*int(p*20)
+                L.append(f"  {'→':>4} {z:<12} [{st}] conf={p:.3f}  {bar}")
+        if not dists or len(dists) <= 1:
+            L.append("    (insufficient transition history)")
+
+        sec("SENSORS")
+        ema=ssv["ema_sensor"]
+        if ema.get("available"):
+            row("EMA value",f"{ema['ema_value']:.4f}  (period {ema['ema_period']})")
+            row("Deviation",f"{ema['current_deviation']:+.4f}  [{ema['classification']}]")
+            row("Deviation pct",f"{ema['deviation_percentile']:.2f}")
+            row("Reversion prob",f"{ema['reversion_probability']:.2f}")
+            L.append("  EMA BANDS:")
+            for bn in ["near","moderate","extended"]:
+                info=ema["bands"].get(bn,{})
+                if info.get("episodes",0):
+                    rv=f"{info['reversion_prob']:.2f}" if info.get("reversion_prob") is not None else "N/A"
+                    ct=f"{info['continuation_prob']:.2f}" if info.get("continuation_prob") is not None else "N/A"
+                    L.append(f"    {bn:<10} ep={info['episodes']}  rev={rv}  cont={ct}")
+        else:
+            row("EMA",ema.get("message","not available"))
+        L.append("")
+        conv=ssv["convergence_sensor"]
+        if conv.get("available"):
+            row("Convergence",f"{conv['classification']}  (Z={conv['anomaly_z']:.2f})")
+            row("Agreement",f"{conv['pairwise_agreement']:.2f}  eff={conv['effective_strength']:.2f}")
+            row("Direction",conv["direction"])
+            L.append(f"  {conv['interpretation']}")
+            L.append("  Sensor breakdown:")
+            for sd in conv.get("sensor_details",[]):
+                L.append(f"    {sd['name']:<16} {sd['direction']}  conf={sd['confidence']:.2f}")
+        else:
+            row("Convergence",conv.get("message","not available"))
+
+        # ── CIS STATUS ──
+        cis = ssv.get("cis_sensor", {})
+        total_eps = len(self.cis_episodes)
+        maturity_pct = int(min(total_eps / cfg.CIS_MAX_EPISODES * 100, 100))
+        comp_spread = ssv.get("component_spread", 0.0)
+        L.append("")
+        if cis.get("active"):
+            if cis.get("mode") == "instability":
+                row("CIS (Contradiction Insight)", "⚠ STRUCTURAL INSTABILITY")
+                L.append(f"    {cis.get('message','')}")
+            elif cis.get("mode") == "historical_resolution":
+                row("CIS (Contradiction Insight)", f"ACTIVE — direction {cis.get('direction','?')} conf={cis.get('confidence',0):.2f}")
+                L.append(f"    Mode: historical_resolution  matches: {cis.get('match_count',0)} episodes  entropy: {cis.get('entropy',0):.2f}")
+                if cis.get("avg_reorg", 0) > 0:
+                    L.append(f"    Avg. reorganization score: {cis['avg_reorg']:.1f}/3")
+                probs = cis.get("probs", {})
+                if probs:
+                    L.append(f"    Historical distribution: {probs}")
+            elif cis.get("mode") == "silent_disagreement":
+                row("CIS (Contradiction Insight)", "SILENT DISAGREEMENT (verbose on)")
+                L.append(f"    {cis.get('note','')}")
+        else:
+            reason = cis.get("reason", "?")
+            cs_val = cis.get("contradiction_strength", ssv.get("contradiction_strength", 0.0))
+            ep_count = cis.get("episode_count", total_eps)
+            pend = len(self.cis_pending) + len(self.cis_pending_mild) + len(self.cis_pending_component)
+            mild_pend = len(self.cis_pending_mild)
+            comp_pend = len(self.cis_pending_component)
+            if reason == "disabled":
+                row("CIS (Contradiction Insight)", "OFF (disabled)")
+            elif reason == "insufficient_data":
+                row("CIS (Contradiction Insight)", f"learning — {cis.get('match_count',0)} similar episodes (need {cfg.CIS_MIN_MATCHES})")
+            elif reason == "direction_mismatch":
+                row("CIS (Contradiction Insight)", "silent — historical direction disagrees with consensus (use V to reveal)")
+            else:
+                row("CIS (Contradiction Insight)", f"no signal — {reason}")
+            L.append(f"    Contradiction strength: {cs_val:.2f} (threshold {cfg.CIS_CONTRADICTION_THRESHOLD})  episodes: {ep_count}  pending: {pend}")
+            if mild_pend > 0:
+                L.append(f"    Mild tensions pending: {mild_pend}  (pre‑tension threshold {cfg.CIS_MILD_TENSION_MIN})")
+        L.append(f"    Component spread: {comp_spread:.2f} (threshold {cfg.CIS_COMPONENT_SPREAD_MIN})  component pending: {len(self.cis_pending_component)}")
+        L.append(f"    Memory maturity: {maturity_pct}% ({total_eps}/{cfg.CIS_MAX_EPISODES} episodes)")
+
+        mir=self.mirror_analysis()
+        L.append("")
+        row("Mirror symmetry",f"{mir['similarity']:.2f}  {mir['interpretation']}")
+        if mir.get("best_match"): row("Best pattern",f"{mir['best_match']} ({mir['matched_hits']}x)")
+
+        notes=ssv.get("sensor_notes",[])
+        if notes:
+            sec("ALIGNMENT / CONTRADICTION")
+            for n in notes: L.append(f"  {n}")
+
+        cs2=ssv.get("contradiction_strength",0.0); ch2=ssv.get("reconciliation_hint")
+        if cs2>0.3:
+            L.append(""); L.append(f"  Contradiction strength: {cs2:.2f}")
+            if ch2: L.append(f"  Hint: {ch2}")
+
+        dna=ssv.get("dna_profile",{})
+        if dna and "distribution" in dna:
+            sec("MARKET DNA")
+            row("Dominant",f"{dna['dominant_state']}  conf={dna['confidence']:.2f}")
+            stab=f"{dna['stability']:.2f}" if dna.get('stability') is not None else "N/A"
+            row("Entropy/Stab/Pres",f"{dna['entropy']:.2f} / {stab} / {dna.get('pressure','?')}")
+            row("Age / Persistence",f"{dna.get('age','?')} / {dna.get('persistence','?')}")
+            ma=dna.get("moving_average",{})
+            if ma: row("MA dominant",max(ma,key=ma.get))
+            L.append("  Distribution:")
+            for arch,prob in sorted(dna["distribution"].items(),key=lambda x:x[1],reverse=True):
+                bar="█"*int(prob*24); L.append(f"  {arch:<14} {prob:.3f}  {bar}")
+            vel=dna.get("velocity")
+            if vel:
+                L.append("  Velocity:")
+                for arch,v in sorted(vel.items(),key=lambda x:abs(x[1]),reverse=True):
+                    if abs(v)>0.001: L.append(f"  {arch:<14} {'+' if v>=0 else ''}{v:.4f}")
+            L.append(f"  {dna.get('interpretation','')}")
+
+        cc=ssv["combined_confidence"]
+        sec("STRUCTURAL CONFIDENCE")
+        bar="█"*int(cc["overall"]*24)
+        L.append(f"  Overall:  {cc['overall']:.2f}  {bar}")
+        row("Match",f"{cc['match']:.2f}")
+        row("Density",f"{cc['density']:.2f}")
+        row("Entropy",f"{cc['entropy']:.2f}")
+        row("Epistemic",f"{cc['epistemic']:.2f}")
+        row("Regime stab",f"{cc['stability']:.2f}")
+
+        comp=ssv["completion_hypothesis"]
+        sec("COMPLETION HYPOTHESIS")
+        row("Direct evidence",f"{comp['direct_evidence']:.2f}")
+        row("Graph completion",f"{comp['graph_completion']:.2f}")
+        cs3=comp["completion_strength"]
+        bar="█"*int(cs3*24)
+        L.append(f"  Strength: {cs3:.2f}  {bar}  (risk {comp['completion_risk']:.2f})")
+        if comp.get("inferences"):
+            L.append("  Inferences:")
+            for inf in comp["inferences"]: L.append(f"    · {inf}")
+
+        sec("VECTOR FIELD")
+        for z,v in sorted(vf.items(),key=lambda x:_zone_val(x[0])):
+            sym="↑" if v["net_direction"]>0.1 else "↓" if v["net_direction"]<-0.1 else "↔"
+            hi=" ◀ current" if z==zone else ""
+            L.append(f"  {z:<12} {sym} net={v['net_direction']:+.2f}  mag={v['magnitude']:.2f}  {v['classification']:<10}{hi}")
+
+        sec(f"TRANSITIONS FROM {zone}")
+        an=self._cluster(zone)
+        if an["transitions"]:
+            for t,prob in an["transitions"].items():
+                arr="↑" if _zone_val(t)>_zone_val(zone) else "↓" if _zone_val(t)<_zone_val(zone) else "→"
+                med=self.median_price(t)
+                ms=f"  med≈{med:.2f}" if med else ""
+                st=self.ct.avg_steps(zone,t)
+                L.append(f"  {arr} {t:<12} {int(prob*100):>3}%{ms}{'  '+str(st)+' steps' if st else ''}")
+        else:
+            L.append("  (no transitions recorded)")
+
+        if dmap and dmap.get("path_to_equilibrium"):
+            sec("STATE DISTANCE MAP")
+            row("Nearest attractor",str(dmap.get("nearest_attractor","?")))
+            row("Nearest repeller",str(dmap.get("nearest_repeller","?")))
+            row("Path to equilibrium"," → ".join(dmap["path_to_equilibrium"]))
+            row("Steps",str(dmap["equilibrium_steps"]))
+
+        sec("PATTERNS")
+        L.append(f"  Dominant: {ssv['dominant_pattern']}  ({ssv['pattern_freq']}x)")
+        L.append(f"  Total stored: {len(self.patterns)}")
+
+        # ── EPISTEMIC EDGES ──
+        top_edges = []
+        for n in self.nodes.values():
+            for lv, e in n.links.items():
+                if e.epistemic_weight > 0:
+                    top_edges.append((n.value, lv, e.epistemic_weight))
+        top_edges.sort(key=lambda x: x[2], reverse=True)
+        if top_edges:
+            sec("TOP EPISTEMIC TRANSITIONS (L)")
+            for i, (a, b, w) in enumerate(top_edges[:3], 1):
+                L.append(f"  {i}. {a[:12]:<12} → {b[:12]:<12}  epistemic_weight={w:.4f}")
+
+        rule("═"); L.append("")
+        return "\n".join(L)
+
+    def status_report(self):
+        W=54
+        L=[]
+        L.append("")
+        L.append(" ┌"+"─"*W+"┐")
+        L.append(f" │  NLPGM {VERSION:<{W-9}}│")
+        L.append(f" │  nodes={len(self.nodes)}  patterns={len(self.patterns)}  cycles={self.cycles:<{W-43}}│")
+        L.append(f" │  mod={'ON' if self.use_mod else 'OFF'}  λ={self.lam}  log={'ON' if self.use_log else 'OFF'}  merge-rp={'ON' if self.merge_rp else 'OFF':<{W-44}}│")
+        comp_count = sum(1 for ep in self.cis_episodes if ep.get("type")=="component")
+        L.append(f" │  CIS episodes={len(self.cis_episodes)} (comp={comp_count})  pending={len(self.cis_pending)+len(self.cis_pending_mild)+len(self.cis_pending_component)}  verbose={'ON' if self.cis_verbose else 'OFF':<{W-20}}│")
+        L.append(" └"+"─"*W+"┘")
+        if not self.nodes: L.append("  (empty)"); return "\n".join(L)
+        all_zones=sorted(set(n.price_zone for n in self.nodes.values() if n.price_zone!="Z?"),key=_zone_val)
+        if all_zones:
+            L.append("\n  ZONES:")
+            for z in all_zones:
+                an=self._cluster(z)
+                pr=an["transitions"]
+                dom=f"→{an['dominant']}({int(an['dominant_prob']*100)}%)" if an.get("dominant") else ""
+                L.append(f"  {z:<12} nodes={an['node_count']}  [{an['regime']}]{dom}")
+        if self._recent:
+            L.append(f"\n  RECENT TRANSITIONS ({len(self._recent)}):")
+            L.append(f"  {'→'.join(self._recent[-12:])}")
+        if self.patterns:
+            L.append(f"\n  TOP PATTERNS:")
+            for _,p in sorted(self.patterns.items(),key=lambda x:x[1].hits,reverse=True)[:5]:
+                pt="DIR" if p.start_zone=="DIR?" else "MAG"
+                L.append(f"  [{pt}][{p.hits}x] {p.display}  age={fmt_age(p.age())}")
+        L.append("")
+        return "\n".join(L)
+
+    def save(self):
+        data={"nlpgm_version":VERSION,"cycles":self.cycles,
+              "nodes":{k:v.to_dict() for k,v in self.nodes.items()},
+              "patterns":{k:v.to_dict() for k,v in self.patterns.items()},
+              "cluster_transitions":self.ct.to_dict(),
+              "recent_transitions":self._recent,"last_step_price":self._last_step_price,
+              "v1_4_step_counter":self._step_counter,"v1_4_last_zone":self.last_zone,
+              "v1_5_use_modulation":self.use_mod,"v1_5_lambda":self.lam,
+              "v1_5_1_log_space":self.use_log,"v1_5_1_merge_rp":self.merge_rp,
+              "_last_strand":self._last_strand,"_last_dna_distribution":self._last_dna,
+              "_dna_stability_valid":self._dna_valid,"_dna_age":self._dna_age,
+              "_dna_velocity":self._dna_vel,"price_history":self.price_hist,
+              "cis_verbose":self.cis_verbose,
+              "cis_episodes":self.cis_episodes,
+              "cis_pending":self.cis_pending,
+              "cis_pending_mild":self.cis_pending_mild,
+              "cis_pending_component":self.cis_pending_component,
+              "_global_step":self._global_step}
+        try:
+            with open(cfg.TEMP_FILE,"w") as f: json.dump(data,f,indent=2)
+            if os.path.exists(cfg.SAVE_FILE): shutil.copy2(cfg.SAVE_FILE,cfg.BACKUP_FILE)
+            os.replace(cfg.TEMP_FILE,cfg.SAVE_FILE)
+            return f"Saved · {len(self.nodes)} nodes · {len(self.patterns)} patterns"
+        except Exception as ex: return f"Save failed: {ex}"
+
+    def load(self):
+        if not os.path.exists(cfg.SAVE_FILE): return "No save file — starting clean"
+        try:
+            with open(cfg.SAVE_FILE) as f: data=json.load(f)
+            sv=data.get("nlpgm_version","?")
+            if sv!=VERSION: _log("LOAD",f"version mismatch: file={sv} current={VERSION}")
+            self.cycles=data.get("cycles",0); self.nodes={}; self.patterns={}
+            self.ct=ClusterTransitions(); self._recent=data.get("recent_transitions",[])
+            self._last_step_price=data.get("last_step_price")
+            self._step_counter=data.get("v1_4_step_counter",0)
+            self.last_zone=data.get("v1_4_last_zone")
+            self.use_mod=data.get("v1_5_use_modulation",False)
+            self.lam=data.get("v1_5_lambda",0.5)
+            self.use_log=data.get("v1_5_1_log_space",False)
+            self.merge_rp=data.get("v1_5_1_merge_rp",False)
+            self.cis_verbose=data.get("cis_verbose",cfg.CIS_VERBOSE)
+            self.cis_episodes=data.get("cis_episodes",[])
+            self.cis_pending=data.get("cis_pending",[])
+            self.cis_pending_mild=data.get("cis_pending_mild",[])
+            self.cis_pending_component=data.get("cis_pending_component",[])
+            self._global_step=data.get("_global_step",0)
+            if "cluster_transitions" in data: self.ct.load(data["cluster_transitions"])
+            for sig,pd in data.get("patterns",{}).items():
+                p=PatternNode(pd.get("transitions",[]),sig,pd.get("start_zone","Z?"))
+                p.hits=pd.get("hits",1); p.created_at=pd.get("created_at",0.0)
+                self.patterns[sig]=p
+            li=0
+            for val,nd in data.get("nodes",{}).items():
+                dr=nd.get("dna",{}); st=nd.get("strand_type")
+                if st is None: st=li%2
+                if isinstance(dr,int): dr={"category":dr,"strand_type":st,"price_zone":nd.get("price_zone","Z?"),"fingerprint":"","path_signature":"","display":f"{dr:08b}"}
+                elif isinstance(dr,dict):
+                    if dr.get("strand_type") is None: dr["strand_type"]=st
+                    if "price_zone" not in dr: dr["price_zone"]=nd.get("price_zone","Z?")
+                n=Node(nd["value"],hits=nd.get("hits",0),dna=dr,price=nd.get("price"),volatility=nd.get("volatility"),strand_type=st)
+                if "created_at" in nd: n.created_at=nd["created_at"]
+                self.nodes[val]=n; self._last_strand=st; li+=1
+            self._last_strand=data.get("_last_strand",self._last_strand)
+            self._last_dna=data.get("_last_dna_distribution"); self._dna_valid=data.get("_dna_stability_valid",False)
+            self._dna_age=data.get("_dna_age",0); self._dna_vel=data.get("_dna_velocity")
+            self.price_hist=data.get("price_history",[]); self._agree_hist=[]
+            for val,nd in data.get("nodes",{}).items():
+                n=self.nodes[val]
+                for lv,ed in nd.get("links",{}).items():
+                    if lv in self.nodes:
+                        e=Edge(ed.get("strength",0.5),hits=ed.get("hits",0),price_delta=ed.get("price_delta"),
+                               cross_zone=ed.get("cross_zone",False),transition=ed.get("transition"))
+                        for k in ("epistemic_count","mu_entropy","mu_contradiction","mu_confidence","epistemic_weight"):
+                            if k in ed:
+                                setattr(e, k, ed[k])
+                        if "created_at" in ed: e.created_at=ed["created_at"]
+                        n.links[lv]=e
+                n.refresh_dna(self.nodes)
+            return f"Loaded · {len(self.nodes)} nodes · {len(self.patterns)} patterns"
+        except Exception as ex: return f"Load failed: {ex}"
+
+
+# ─────────────────────────────────────────────
+# CLASSIFY (unchanged)
+# ─────────────────────────────────────────────
+
+def classify(results, db=None):
+    if not results: return "INVALID",results
+    top=results[0]; second=results[1] if len(results)>1 else None
+    if top["total"]<cfg.CONFIDENCE_NONE: return "NO_MATCH",results
+    if second and abs(top["total"]-second["total"])<cfg.RESONANCE_THRESHOLD and db:
+        n1=db.nodes.get(top["value"]); n2=db.nodes.get(second["value"])
+        if n1 and n2:
+            sim=dna_sim(n1.dna,n2.dna) if isinstance(n1.dna,dict) and isinstance(n2.dna,dict) else 0.5
+            if sim<0.3 or sim>0.7: top["total"]=round(min(top["total"]+0.10,1.0),4); return "RESOLVED_MATCH",results
+            if n1.strand_type is not None and n2.strand_type is not None and n1.strand_type!=n2.strand_type:
+                top["total"]=round(min(top["total"]+0.08,1.0),4); return "RESOLVED_MATCH",results
+            if n1.price_zone and n2.price_zone and n1.price_zone==n2.price_zone:
+                top["total"]=round(min(top["total"]+0.06,1.0),4); return "RESOLVED_MATCH",results
+        if n1 and second["value"] in n1.links and n1.links[second["value"]].strength>=cfg.AGRR_MIN_STRENGTH:
+            top["total"]=round(min(top["total"]+n1.links[second["value"]].strength*0.15,1.0),4); return "RESOLVED_MATCH",results
+    if second and abs(top["total"]-second["total"])<cfg.RESONANCE_THRESHOLD: return "AMBIGUOUS",results
+    if top["total"]>cfg.CONFIDENCE_HIGH:  return "HIGH",results
+    if top["total"]>cfg.CONFIDENCE_MEDIUM: return "MEDIUM",results
+    if top["total"]>cfg.CONFIDENCE_LOW:   return "LOW",results
+    return "NO_MATCH",results
+
+
+# ─────────────────────────────────────────────
+# CLI (unchanged)
+# ─────────────────────────────────────────────
+
+def _menu():
+    print("\n ┌────────────────────────────────────────────────────┐")
+    print(f" │  NLPGM {VERSION:<45}│")
+    print(" ├────────────────────────────────────────────────────┤")
+    print(" │  R  ·  Reconstruct (structural report)             │")
+    print(" │  B  ·  Batch add prices                            │")
+    print(" │  D  ·  Run decay cycle                             │")
+    print(" │  S  ·  Status / graph summary                      │")
+    print(" │  W  ·  Save                                        │")
+    print(" │  M  ·  Toggle modulation                           │")
+    print(" │  L  ·  Toggle log-space                            │")
+    print(" │  P  ·  Toggle merge regime+pattern                 │")
+    print(" │  V  ·  Toggle CIS verbose (show silent disagreements)│")
+    print(" │  E  ·  Evolve edges (reconcile epistemic weights)  │")
+    print(" │  0  ·  Set lambda                                  │")
+    print(" │  X  ·  Exit                                        │")
+    print(" └────────────────────────────────────────────────────┘")
+
+def main():
+    db = MemoryDB()
+    _log("BOOT", db.load())
+
+    while True:
+        _menu()
+        c = input("\n  Select > ").strip().upper()
+
+        if c == "R":
+            q = input("  Query  > ").strip()
+            if not q: continue
+            _log("LSR", f"reconstructing for: {q}")
+            print(db.structural_report(q))
+
+        elif c == "B":
+            print("  Paste prices (empty line to finish):")
+            lines=[]
+            while True:
+                line=input("  ") 
+                if not line.strip(): break
+                lines.append(line)
+            if lines:
+                result=db.batch_add("\n".join(lines))
+                _log("BATCH",result)
+                _log("SAVE",db.save())
+
+        elif c == "D":
+            _log("DECAY",db.decay_cycle())
+            _log("SAVE",db.save())
+
+        elif c == "S":
+            print(db.status_report())
+
+        elif c == "W":
+            _log("SAVE",db.save())
+
+        elif c == "M":
+            db.use_mod=not db.use_mod
+            _log("MOD",f"{'ON' if db.use_mod else 'OFF'}  λ={db.lam}")
+
+        elif c == "L":
+            db.use_log=not db.use_log
+            _log("LOG-SPACE",f"{'ON' if db.use_log else 'OFF'}")
+
+        elif c == "P":
+            db.merge_rp=not db.merge_rp
+            _log("MERGE-RP",f"{'ON' if db.merge_rp else 'OFF'}")
+
+        elif c == "V":
+            db.cis_verbose = not db.cis_verbose
+            _log("CIS-VERBOSE", f"{'ON' if db.cis_verbose else 'OFF'}")
+
+        elif c == "E":
+            if db.last_r_output:
+                db.L_reconcile(db.last_r_output)
+                _log("EVOLVE", "Reconciled edges from last reconstruction.")
+            else:
+                _log("EVOLVE", "No reconstruction data available. Run R first.")
+
+        elif c == "0":
+            try:
+                v=float(input("  Lambda (0.0–1.0) > ").strip())
+                db.lam=max(0.0,min(1.0,v))
+                _log("LAMBDA",f"set to {db.lam}")
+            except ValueError:
+                _log("ERR","Invalid number")
+
+        elif c == "X":
+            _log("SAVE",db.save())
+            _log("EXIT","Goodbye")
+            break
+
+        else:
+            _log("ERR","Unknown option")
+
+if __name__ == "__main__":
+    main()
+
+                #/end/#

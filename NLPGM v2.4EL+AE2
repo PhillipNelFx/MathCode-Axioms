@@ -20,7 +20,7 @@ Mathcode‑aligned refinements (v4.4.4 → V2.3EL):
   • T13 optimal forward‑trace horizon (dynamic stop)
   • Axiom‑traceable scale tags in report
 
-Adaptive Edge Fix (V2.3EL+AE1):
+Adaptive Edge Fix (V2.4EL+AE2):
   - Weight reinforces on repeat transitions (reinforce‑or‑create in batch_add)
   - Confidence/entropy deltas computed in why‑vectors (weighted‑additive formula)
   - L_reconcile picks highest‑strength edge
@@ -2234,6 +2234,74 @@ class MemoryDB:
             for i, (a, b, w) in enumerate(top_edges[:3], 1):
                 L.append(f"  {i}. {a[:12]:<12} → {b[:12]:<12}  epistemic_weight={w:.4f}")
 
+        dna=ssv["dna_profile"]
+        sec("MARKET DNA")
+        row("Dominant",f"{dna['dominant_state']} conf={dna['confidence']:.2f}")
+        stab=f"{dna['stability']:.2f}" if dna.get('stability') is not None else "N/A"
+        row("Entropy/Stab/Pres",f"{dna['entropy']:.2f} / {stab} / {dna.get('pressure','?')}")
+        row("Age / Persistence",f"{dna.get('age','?')} / {dna.get('persistence','?')}")
+        ma=dna.get("moving_average",{})
+        if ma: row("MA dominant",max(ma,key=ma.get))
+        L.append("  Distribution:")
+        for arch,prob in sorted(dna["distribution"].items(),key=lambda x:x[1],reverse=True):
+            bar="█"*int(prob*24); L.append(f"    {arch:<14}{prob:.3f}{bar}")
+        vel=dna.get("velocity")
+        if vel:
+            L.append("  Velocity:")
+            for arch,v in sorted(vel.items(),key=lambda x:abs(x[1]),reverse=True):
+                if abs(v)>0.001: L.append(f"    {arch:<14}{'+' if v>=0 else ''}{v:.4f}")
+        L.append(f"  {dna.get('interpretation','')}")
+
+        cc=ssv["combined_confidence"]
+        sec("STRUCTURAL CONFIDENCE")
+        bar="█"*int(cc["overall"]*24)
+        L.append(f"  Overall: {cc['overall']:.2f}{bar}")
+        row("Match",f"{cc['match']:.2f}")
+        row("Density",f"{cc['density']:.2f}")
+        row("Entropy",f"{cc['entropy']:.2f}")
+        row("Epistemic",f"{cc['epistemic']:.2f}")
+        row("Regime stab",f"{cc['stability']:.2f}")
+
+        comp=ssv["completion_hypothesis"]
+        sec("COMPLETION HYPOTHESIS")
+        row("Direct evidence",f"{comp['direct_evidence']:.2f}")
+        row("Graph completion",f"{comp['graph_completion']:.2f}")
+        cs3=comp["completion_strength"]
+        bar="█"*int(cs3*24)
+        L.append(f"  Strength: {cs3:.2f}{bar} (risk {comp['completion_risk']:.2f})")
+        if comp.get("inferences"):
+            L.append("  Inferences:")
+            for inf in comp["inferences"]: L.append(f"    · {inf}")
+
+        sec("VECTOR FIELD")
+        for z,v in sorted(vf.items(),key=lambda x:_zone_val(x[0])):
+            sym="↑" if v["net_direction"]>0.1 else "↓" if v["net_direction"]<-0.1 else "↔"
+            hi=" ◀ current" if z==zone else ""
+            L.append(f"  {z:<12}{sym} net={v['net_direction']:+.2f} mag={v['magnitude']:.2f}  {v['classification']:<10}{hi}")
+
+        sec(f"TRANSITIONS FROM {zone}")
+        an=self._cluster(zone)
+        if an["transitions"]:
+            for t,prob in an["transitions"].items():
+                arr="↑" if _zone_val(t)>_zone_val(zone) else "↓" if _zone_val(t)<_zone_val(zone) else "→"
+                med=self.median_price(t)
+                ms=f" med≈{med:.2f}" if med else ""
+                st=self.ct.avg_steps(zone,t)
+                L.append(f"  {arr}{t:<12}{int(prob*100):>3}%{ms}  {' '+str(st)+' steps' if st else ''}")
+        else:
+            L.append("    (no transitions recorded)")
+
+        if dmap and dmap.get("path_to_equilibrium"):
+            sec("STATE DISTANCE MAP")
+            row("Nearest attractor",str(dmap.get("nearest_attractor","?")))
+            row("Nearest repeller",str(dmap.get("nearest_repeller","?")))
+            row("Path to equilibrium"," → ".join(dmap["path_to_equilibrium"]))
+            row("Steps",str(dmap["equilibrium_steps"]))
+
+        sec("PATTERNS")
+        L.append(f"  Dominant: {ssv['dominant_pattern']} ({ssv['pattern_freq']}x)")
+        L.append(f"  Total stored: {len(self.patterns)}")
+
         rule("═"); L.append("")
         return "\n".join(L)
 
@@ -2494,5 +2562,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-                #/end/#

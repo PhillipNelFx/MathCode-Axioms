@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Non‑Linear Probabilistic Graph Model V2.3EL+AE1 + TASO Diagnostic
+Non‑Linear Probabilistic Graph Model V2.4EL+AE2 + TASO Diagnostic
 Latent State Reconstruction Engine with Contradiction Insight Sensor,
 NMD hypothesis‑space observer, strict B/R/L separation, and
 probabilistic forward trace (branching preserved, learning aware).
@@ -33,12 +33,24 @@ TASO Diagnostic (read‑only):
   - Observational fingerprint: Regime / LSR exit direction / AE1‑EW direction
   - No computational changes; reuse existing ssv and top_edges list
   - Configuration label: CONVERGENCE / PARTIAL CONVERGENCE / DIVERGENCE / INCOMPLETE
+
+Audit Fixes (2026‑08‑12):
+  - Issue 1: detect_regime now sorts by arrival time (created_at)
+  - Issue 2: AE1‑EW localised to current zone + forward trace + distance‑map path
+  - Issue 3: query‑driven learning removed; menu E is diagnostic only
+  - Issue 4: Edge.decay() also decays epistemic_count and recomputes epistemic_weight
+  - Issue 5: search() retains uncapped total for ranking, adds capped display
+
+Critical Regression Fixes (2026‑08‑12):
+  - R1: _observe_adapt now uses forward edge pn.links[text_c] (not backward)
+  - R2: classify() uses uncapped raw_score (not capped display)
+  - R3: Edge.decay() now scales entire epistemic weight by freq_norm and wipes ghosts
 """
 
 import time, math, json, os, shutil, random, hashlib, re
 from dataclasses import dataclass
 
-VERSION = "V2.3EL+AE1"
+VERSION = "V2.4EL+AE2"
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -236,11 +248,14 @@ def fmt_age(s):
     return f"{int(s/604800)}w"
 
 def detect_regime(zone_nodes):
-    prices = sorted([n.price for n in zone_nodes if n.price])
-    if len(prices) < 4: return "SIDEWAYS"
-    h = len(prices)//2
+    """Sort by arrival time (created_at) so late arrivals are compared to early arrivals."""
+    ns = sorted((n for n in zone_nodes if n.price), key=lambda n: n.created_at)
+    if len(ns) < 2:
+        return "SIDEWAYS"
+    prices = [n.price for n in ns]
+    h = len(prices) // 2
     fa, sa = sum(prices[:h])/h, sum(prices[h:])/h
-    return "UP" if sa>fa*1.001 else "DOWN" if sa<fa*0.999 else "SIDEWAYS"
+    return "UP" if sa > fa * 1.001 else "DOWN" if sa < fa * 0.999 else "SIDEWAYS"
 
 # ── DNA helpers (vacuum label added) ──
 
@@ -279,10 +294,8 @@ def dna_sim(a, b):
     s = 0.0
     ca,cb = a.get("category",0), b.get("category",0)
     if ca and cb:
-        # 3‑flag pre‑filter: if no primary flags shared, skip full Jaccard
-        primary_mask = 1 | 2 | 4   # SYS, DATA, OP
+        primary_mask = 1 | 2 | 4
         if (ca & primary_mask) & (cb & primary_mask) == 0:
-            # no primary overlap → category contribution is zero
             pass
         else:
             s += 0.30*(bin(ca&cb).count("1")/max(bin(ca|cb).count("1"),1))
@@ -380,10 +393,25 @@ class Edge:
         self.mu_contradiction = 0.0
         self.mu_confidence = 0.0
         self.epistemic_weight = 0.0
+
     def reinforce(self, pc=1.0):
         self.strength = min(1.0,round(self.strength+cfg.REINFORCE_RATE*pc,4)); self.hits+=1
+
     def decay(self):
+        """Decay strength and epistemic_count, scale entire epistemic weight by freq_norm, wipe ghosts."""
         self.strength = round(max(self.strength*cfg.DECAY_RATE+self.hits*cfg.USAGE_BIAS, cfg.MIN_EDGE_STRENGTH),4)
+        self.epistemic_count *= cfg.DECAY_RATE
+
+        if self.epistemic_count > 0.1:
+            freq_norm = math.tanh(self.epistemic_count / 10.0)
+            raw_ew = cfg.L_ALPHA + cfg.L_BETA * max(0, self.mu_confidence) - cfg.L_GAMMA * abs(self.mu_contradiction)
+            self.epistemic_weight = round(raw_ew * freq_norm, 4)
+        else:
+            self.epistemic_weight = 0.0
+            self.mu_confidence = 0.0
+            self.mu_contradiction = 0.0
+            self.mu_entropy = 0.0
+
     def age(self): return round(time.time()-self.created_at)
     def to_dict(self):
         return {"strength":self.strength,"hits":self.hits,"price_delta":self.price_delta,
@@ -693,8 +721,8 @@ class MemoryDB:
                     rt_rev = get_transition(nn.price, pn.price) if tr else None
                     pn.links[text_c] = Edge(strength, cross_zone=xz, transition=rt_rev)
 
-                # FIX: Adapt on confirmed forward transition only (Bug 1)
-                self._observe_adapt(pn, nn, nn.links[prev], vf=vf_cache)
+                # FIX: Adapt on confirmed forward transition only (R1 fix)
+                self._observe_adapt(pn, nn, pn.links[text_c], vf=vf_cache)
 
             batch_nodes.append(nn)
             stored.append(f"{text_c}[{nn.price_zone}]")
@@ -772,7 +800,9 @@ class MemoryDB:
         for r in raw.values():
             r["boost"]=round(min(r["boost"],r["base"]*0.5),4)
             unc=r["base"]+r["boost"]+r["singularity"]+r["position"]+r["freq"]
-            r["raw_score"]=round(unc,4); r["total"]=round(min(unc,1.0),4)
+            r["raw_score"]=round(unc,4)
+            r["total"]=round(unc,4)
+            r["display"]=round(min(unc,1.0),4)
             results.append(r)
         results.sort(key=lambda x:x["raw_score"],reverse=True)
         return results
@@ -834,13 +864,11 @@ class MemoryDB:
                 next_dist[z] = round(next_dist[z] / total_mass, 4)
             # T13 optimal stop: if max probability < marginal gain threshold, halt
             if max(next_dist.values()) < cfg.FWD_MARGINAL_GAIN_MIN:
-                # still record this last distribution for completeness
                 distributions.append(dict(next_dist))
                 break
             distributions.append(dict(next_dist))
             current_dist = next_dist
 
-        # Build a sampled path for backward compatibility, with ambiguity flags
         structured = []
         flat = [start_zone]
         for i in range(1, len(distributions)):
@@ -855,7 +883,6 @@ class MemoryDB:
             elif len(top_zones) > 1:
                 second_prob = max_prob
             ambiguous = (max_prob - second_prob) < cfg.FWD_BRANCH_SPREAD_THRESHOLD and len(dist) > 1
-
             chosen = top_zones[0]
             prob = dist[chosen]
             status = "RECONSTRUCTION" if prob >= cfg.FWD_RECON_PROB_THRESHOLD else "SPECULATIVE"
@@ -1496,7 +1523,7 @@ class MemoryDB:
                 "probs": {k: round(v, 4) for k, v in probs.items()},
                 "avg_reorg": round(avg_reorg, 2)}
 
-    # ── PHASE 2: WHY vectors and L operator (skips ambiguous hops) ──
+    # ── PHASE 2: WHY vectors and L operator (now unused) ──
 
     def _compute_why_vectors(self, ssv, fwd_structured):
         why = []
@@ -1521,12 +1548,10 @@ class MemoryDB:
             cs_to, _ = self._contradiction(regime_to, nd_to, cls_to, ssv.get("mirror_similarity", 0.0))
             contradiction_delta = round(cs_to - global_contradiction, 4)
 
-            # Weighted‑additive confidence
             density_factor = min(density_to / 10.0, 1.0)
             confidence_to = self._confidence_estimate(density_factor, cs_to)
             confidence_delta = round(confidence_to - global_confidence, 4)
 
-            # per‑hop normalized entropy (target zone) and source zone entropy
             pr_to = self.ct.probs(z_to)
             if pr_to:
                 raw_entropy_to = -sum(p * math.log(p) for p in pr_to.values() if p > 0)
@@ -1535,7 +1560,6 @@ class MemoryDB:
             else:
                 norm_entropy_to = 0.0
 
-            # source zone entropy (prev_zone) – the domain‑consistent baseline
             pr_from = self.ct.probs(prev_zone)
             if pr_from:
                 raw_entropy_from = -sum(p * math.log(p) for p in pr_from.values() if p > 0)
@@ -1577,7 +1601,6 @@ class MemoryDB:
     def _representative_edge(self, z_from, z_to):
         """Return the literal edge that best represents the zone‑pair transition,
         newest recorded example first, falling back to highest‑strength edge."""
-        # Try recorded examples (newest‑first)
         examples = self.ct.examples_for(z_from, z_to)
         for fp, tp in reversed(examples):
             from_candidates = [n for n in self.nodes.values() if n.price_zone == z_from and n.price == fp]
@@ -1586,7 +1609,6 @@ class MemoryDB:
                 for tn in to_candidates:
                     if tn.value in fn.links:
                         return fn.links[tn.value]
-        # Fallback to highest‑strength edge in the zone pair
         best_edge = None
         best_strength = -1.0
         from_nodes = [n for n in self.nodes.values() if n.price_zone == z_from]
@@ -1600,21 +1622,18 @@ class MemoryDB:
 
     # ── Observation‑driven adaptation (fires on B, forward transitions only) ──
     def _observe_adapt(self, from_node, to_node, edge, vf=None):
-        """Update edge epistemic fields using local deltas of the actual transition."""
         from_zone = from_node.price_zone
         to_zone = to_node.price_zone
         if from_zone == to_zone or from_zone == "Z?" or to_zone == "Z?":
             return
         if vf is None:
             vf = self.vector_field()
-        # source contradiction
         an_from = self._cluster(from_zone)
         vf_from = vf.get(from_zone, {})
         regime_from = an_from["regime"]
         nd_from = vf_from.get("net_direction", 0.0)
         cls_from = vf_from.get("classification", "neutral")
         cs_from, _ = self._contradiction(regime_from, nd_from, cls_from, 0.0)
-        # target contradiction
         an_to = self._cluster(to_zone)
         vf_to = vf.get(to_zone, {})
         regime_to = an_to["regime"]
@@ -1624,14 +1643,12 @@ class MemoryDB:
 
         delta_contradiction = round(cs_to - cs_from, 4)
 
-        # Weighted‑additive confidence estimates
         density_factor_from = min(an_from["node_count"] / 10.0, 1.0)
         density_factor_to   = min(an_to["node_count"]   / 10.0, 1.0)
         confidence_from = self._confidence_estimate(density_factor_from, cs_from)
         confidence_to   = self._confidence_estimate(density_factor_to, cs_to)
         delta_confidence = round(confidence_to - confidence_from, 4)
 
-        # local delta entropy (consistent, same domain as why‑vectors)
         pr_from = self.ct.probs(from_zone)
         raw_entropy_from = 0.0
         if pr_from:
@@ -1758,19 +1775,8 @@ class MemoryDB:
         if not results:
             return {"error": "No matches found"}
         ssv = self.build_ssv(results, query)
-        why = self._compute_why_vectors(ssv, ssv.get("fwd_structured", []))
-        r_output = {
-            "trajectory": ssv.get("fwd_flat", []),
-            "why_vectors": why,
-            "snapshot": {
-                "entropy": ssv["dna_profile"].get("entropy", 0),
-                "contradiction": ssv.get("contradiction_strength", 0),
-                "confidence": ssv["combined_confidence"]["overall"]
-            }
-        }
-        self.last_r_output = r_output
-        self._learn_from_query(results)
-        self.L_reconcile(r_output)
+        # Query‑driven learning removed. Reconstruction is now read‑only.
+        self.last_r_output = None
         return ssv
 
     def distance_map(self, zone):
@@ -1796,6 +1802,203 @@ class MemoryDB:
                 "nearest_attractor":min(att,key=lambda z:zdist(zone,z),default=None),
                 "nearest_repeller":min(rep,key=lambda z:zdist(zone,z),default=None),
                 "path_to_equilibrium":path,"equilibrium_steps":len(path)-1}
+
+    # ── HRR: Human‑Readable Report (read‑only) ──
+
+    def human_readable_report(self, query, ssv, results, nmd, top_epi_edges):
+        """Generate a non‑invasive human‑readable interpretation of the reconstruction."""
+        L = []
+        W = 60
+        def rule(c="─"): L.append(" " + c*W)
+        def hdr(t): L.append(""); L.append(f"  {t}"); L.append("  " + "─"*len(t))
+        def kv(k, v, indent=2): L.append(f"{' '*indent}{k}: {v}")
+        def blank(): L.append("")
+
+        hdr(f"NLPGM HUMAN‑READABLE REPORT — {query}")
+        kv("Query price", ssv.get("observed_price", "N/A"))
+        kv("Current zone", ssv["observed_zone"])
+        kv("Zone classification", ssv.get("zone_classification", "?"))
+        kv("Internal regime", ssv.get("internal_regime", "?"))
+        kv("Match confidence", ssv.get("match_confidence", "?"))
+        kv("Matched node", ssv.get("matched_node", "?"))
+        blank()
+
+        hdr("TOP MATCHES")
+        for i, r in enumerate(results[:3], 1):
+            L.append(f"  {i}. {r['value']:<20} total={r['display']:.4f}  zone={r.get('zone','?')}")
+        blank()
+
+        hdr("HYPOTHESIS SPACE")
+        kv("Entropy", f"{nmd['entropy']:.2f} ({nmd['entropy_label']})")
+        kv("Hypotheses examined", nmd["hypothesis_count"])
+        kv("Dominant score", f"{nmd['dominant_score']:.4f}")
+        kv("Second score", f"{nmd['second_score']:.4f}")
+        kv("Score spread", f"{nmd['spread']:.4f}")
+        if nmd["entropy_label"] == "low":
+            L.append("  The hypothesis space is strongly dominated by a single candidate.")
+        elif nmd["entropy_label"] == "medium":
+            L.append("  The hypothesis space has moderate competition.")
+        else:
+            L.append("  The hypothesis space is highly competitive — several candidates are similar in score.")
+        blank()
+
+        dna = ssv.get("dna_profile", {})
+        if dna:
+            hdr("MARKET DNA")
+            kv("Dominant archetype", f"{dna.get('dominant_state','?')}  (conf={dna.get('confidence',0):.2f})")
+            kv("Stability", dna.get("stability", "N/A"))
+            kv("Pressure", dna.get("pressure", "N/A"))
+            kv("Interpretation", dna.get("interpretation", ""))
+            if ssv["internal_regime"] == "UP" and dna.get("dominant_state") == "TrendingDown":
+                L.append("  ⚠ Internal regime UP, but Market DNA sees TrendingDown — possible divergence.")
+            elif ssv["internal_regime"] == "DOWN" and dna.get("dominant_state") == "TrendingUp":
+                L.append("  ⚠ Internal regime DOWN, but Market DNA sees TrendingUp — possible divergence.")
+        blank()
+
+        hdr("PRIMARY STRUCTURAL PATH")
+        dom_exit = ssv.get("dominant_exit")
+        if dom_exit:
+            kv("Dominant exit", f"{dom_exit}  ({ssv['exit_probability']*100:.0f}%  {ssv.get('exit_direction','')})")
+        zone_probs = self.ct.probs(ssv["observed_zone"])
+        alts = {z:p for z,p in zone_probs.items() if z != dom_exit}
+        if alts:
+            L.append("  Alternative transitions:")
+            for z,p in sorted(alts.items(), key=lambda x: x[1], reverse=True)[:3]:
+                L.append(f"    → {z}  {p*100:.0f}%")
+        blank()
+
+        hdr("FORWARD TRACE")
+        if ssv.get("fwd_structured"):
+            for hop in ssv["fwd_structured"]:
+                tag = "RECONSTRUCTION" if hop["status"] == "RECONSTRUCTION" else "SPECULATIVE"
+                amb = " (branch point)" if hop.get("ambiguous") else ""
+                L.append(f"  → {hop['zone']:<10} [{tag}] conf={hop['confidence']:.3f}{amb}")
+        else:
+            L.append("  No forward trace available.")
+        blank()
+
+        hdr("EPISTEMIC EVIDENCE")
+        if top_epi_edges:
+            for i, (fr, to, w) in enumerate(top_epi_edges[:3], 1):
+                L.append(f"  {i}. {fr[:12]:<12} → {to[:12]:<12}  weight={w:.4f}")
+            L.append("  Epistemic weight reflects learned relational evidence, not a standalone directional forecast.")
+        else:
+            L.append("  No epistemic transitions with positive weight.")
+        blank()
+
+        hdr("SENSOR AGREEMENT")
+        conv = ssv.get("convergence_sensor", {})
+        if conv.get("available"):
+            kv("Convergence class", conv["classification"])
+            kv("Pairwise agreement", f"{conv['pairwise_agreement']:.2f}")
+            kv("Direction", conv.get("direction", "?"))
+            kv("Anomaly Z", f"{conv['anomaly_z']:.2f}")
+            L.append("  Contributing sensors:")
+            for sd in conv.get("sensor_details", []):
+                L.append(f"    {sd['name']:<16} dir={sd['direction']}  conf={sd['confidence']:.2f}")
+        else:
+            L.append("  Convergence sensor not available (need at least two contributing sensors).")
+        blank()
+
+        hdr("STRUCTURAL CONFIDENCE")
+        cc = ssv.get("combined_confidence", {})
+        if cc:
+            kv("Overall", f"{cc['overall']:.2f}")
+            kv("Match", f"{cc['match']:.2f}")
+            kv("Density", f"{cc['density']:.2f}")
+            kv("Entropy", f"{cc['entropy']:.2f}")
+            kv("Epistemic", f"{cc['epistemic']:.2f}")
+            kv("Regime stability", f"{cc['stability']:.2f}")
+        blank()
+
+        hdr("COMPLETION HYPOTHESIS")
+        comp = ssv.get("completion_hypothesis", {})
+        if comp:
+            kv("Direct evidence", f"{comp['direct_evidence']:.2f}")
+            kv("Graph completion", f"{comp['graph_completion']:.2f}")
+            kv("Completion strength", f"{comp['completion_strength']:.2f}")
+            kv("Completion risk", f"{comp['completion_risk']:.2f}")
+            if comp.get("inferences"):
+                L.append("  Inferences:")
+                for inf in comp["inferences"]:
+                    L.append(f"    · {inf}")
+        blank()
+
+        hdr("VECTOR FIELD")
+        kv("Net direction", f"{ssv['net_flow_direction']:.2f}")
+        kv("Flow magnitude", f"{ssv['flow_magnitude']:.2f}")
+        dmap = self.distance_map(ssv["observed_zone"])
+        if dmap.get("nearest_attractor"):
+            kv("Nearest attractor", dmap["nearest_attractor"])
+        if dmap.get("nearest_repeller"):
+            kv("Nearest repeller", dmap["nearest_repeller"])
+        blank()
+
+        hdr("CONTRADICTION INSIGHT (CIS)")
+        cis = ssv.get("cis_sensor", {})
+        if cis.get("active"):
+            kv("Mode", cis["mode"])
+            if cis["mode"] == "historical_resolution":
+                kv("Direction", cis.get("direction", "?"))
+                kv("Confidence", f"{cis.get('confidence',0):.2f}")
+                kv("Match count", cis.get("match_count", 0))
+        else:
+            reason = cis.get("reason", "none")
+            if reason == "insufficient_data":
+                L.append("  CIS inactive — not enough similar historical episodes yet.")
+            elif reason == "direction_mismatch":
+                L.append("  CIS is suppressed because its historical direction disagrees with the current consensus.")
+            else:
+                L.append(f"  CIS inactive — {reason}")
+        cs_global = ssv.get("contradiction_strength", 0.0)
+        kv("Global contradiction", f"{cs_global:.2f}")
+        hint = ssv.get("reconciliation_hint")
+        if hint:
+            kv("Hint", hint)
+        blank()
+
+        hdr("SYNTHESIS")
+        parts = []
+        if ssv["match_confidence"] in ("HIGH","RESOLVED_MATCH"):
+            parts.append("The query finds a strong structural match in the current graph.")
+        elif ssv["match_confidence"] == "MEDIUM":
+            parts.append("The query returns a moderate structural match — worth confirmation before acting.")
+        else:
+            parts.append("The query match is weak; the graph may not have enough information for this price level.")
+        if nmd["entropy_label"] == "low":
+            parts.append("The hypothesis space is dominated by a single interpretation.")
+        elif nmd["entropy_label"] == "high":
+            parts.append("Several competing hypotheses exist, making any single reconstruction less decisive.")
+        if ssv["internal_regime"] == "UP" and dna.get("dominant_state") == "TrendingDown":
+            parts.append("There is a divergence between the internal regime (UP) and Market DNA (TrendingDown).")
+        elif ssv["internal_regime"] == "DOWN" and dna.get("dominant_state") == "TrendingUp":
+            parts.append("There is a divergence between the internal regime (DOWN) and Market DNA (TrendingUp).")
+        rec = sum(1 for h in ssv.get("fwd_structured",[]) if h["status"]=="RECONSTRUCTION")
+        spec = sum(1 for h in ssv.get("fwd_structured",[]) if h["status"]=="SPECULATIVE")
+        if rec > 0 and spec == 0:
+            parts.append("The forward trace is fully within reconstruction-supported territory.")
+        elif spec > 0 and rec > 0:
+            parts.append("The forward trace contains both reconstruction-supported and speculative branches.")
+        elif spec > 0:
+            parts.append("The forward trace is entirely speculative beyond the current zone.")
+        if top_epi_edges:
+            parts.append("The graph has accumulated epistemic evidence for certain zone transitions.")
+        if conv.get("available"):
+            if conv["classification"] == "HIGH_CONVICTION":
+                parts.append("Multiple independent sensors are in agreement, reinforcing the current reconstruction.")
+            elif conv["classification"] == "CONTRADICTORY":
+                parts.append("The sensors disagree, suggesting structural uncertainty or a regime transition.")
+        if cis.get("active") and cis["mode"] == "instability":
+            parts.append("The CIS subsystem detects structural instability reminiscent of past shifts.")
+        if cc.get("overall", 0) > 0.7:
+            parts.append("Overall structural confidence is relatively high.")
+        elif cc.get("overall", 0) < 0.4:
+            parts.append("Overall structural confidence is low; the current state lacks strong evidential support.")
+        L.append("  " + " ".join(parts))
+        L.append("  This report is an interpretation of the model's internal state. It does not provide trading signals or price forecasts.")
+        return "\n".join(L)
+
+    # ── Original structural_report (now with audit + regression fixes) ──
 
     def structural_report(self, query):
         if not self.nodes: return "  No data loaded."
@@ -1829,7 +2032,7 @@ class MemoryDB:
         for i,r in enumerate(results[:5],1):
             tag=f"px={r['price']:.4f}" if r.get("price") else ""
             boost_str=f"+{r['boost']:.3f}" if r.get("boost",0)>0 else ""
-            L.append(f"  {i}. {r['value']:<22} {r['total']:.4f}  base={r['base']:.3f} {boost_str}  [{r.get('zone','?')}] {tag}")
+            L.append(f"  {i}. {r['value']:<22} {r['display']:.4f}  base={r['base']:.3f} {boost_str}  [{r.get('zone','?')}] {tag}")
 
         sec("NMD HYPOTHESIS SPACE")
         row("Entropy (normalized)", f"{nmd['entropy']:.2f} ({nmd['entropy_label']})  [0=dominated, 1=fully competitive]")
@@ -1962,23 +2165,41 @@ class MemoryDB:
             if ch2: L.append(f"  Hint: {ch2}")
 
         # ── TASO STATE [Diagnostic] ──
-        # Extract top epistemic edge (already used later, moved up)
-        top_edges = []
+        query_zone = ssv["observed_zone"]
+        relevant_zones = {query_zone}
+        if dmap and "path_to_equilibrium" in dmap:
+            relevant_zones.update(dmap["path_to_equilibrium"])
+        if dmap.get("nearest_attractor"):
+            relevant_zones.add(dmap["nearest_attractor"])
+        if dmap.get("nearest_repeller"):
+            relevant_zones.add(dmap["nearest_repeller"])
+        for hop_dist in ssv.get("fwd_distributions", []):
+            if hop_dist:
+                relevant_zones.update(hop_dist.keys())
+
+        local_edges = []
         for n in self.nodes.values():
+            if n.price_zone not in relevant_zones:
+                continue
             for lv, e in n.links.items():
                 if e.epistemic_weight > 0:
-                    top_edges.append((n.value, lv, e.epistemic_weight))
-        top_edges.sort(key=lambda x: x[2], reverse=True)
+                    local_edges.append((n.value, lv, e.epistemic_weight))
+        local_edges.sort(key=lambda x: x[2], reverse=True)
 
-        regime = ssv["internal_regime"]
-        lsr = ssv.get("exit_direction", "N/A")
-        if top_edges:
-            from_str, to_str, _ = top_edges[0]
+        if local_edges:
+            from_str, to_str, max_ew = local_edges[0]
+            second_ew = local_edges[1][2] if len(local_edges) > 1 else 0.0
+            margin = max_ew - second_ew
             from_p, _ = extract_price(from_str)
             to_p, _ = extract_price(to_str)
             ae1 = "UP" if to_p > from_p else "DOWN" if to_p < from_p else "FLAT"
         else:
+            from_str = to_str = None
+            max_ew = second_ew = margin = 0.0
             ae1 = "N/A"
+
+        regime = ssv["internal_regime"]
+        lsr = ssv.get("exit_direction", "N/A")
         taso = f"{regime} / {lsr} / {ae1}"
         if "N/A" in taso:
             config = "INCOMPLETE"
@@ -1995,80 +2216,19 @@ class MemoryDB:
         L.append(f"  Regime   ↑ {regime}")
         L.append(f"  LSR      ↑ {lsr}")
         L.append(f"  AE1‑EW   ↑ {ae1}")
+        if local_edges:
+            L.append(f"  AE1‑EW determined by: {from_str[:12]} → {to_str[:12]} (ew={max_ew:.4f}, margin={margin:.4f})")
         L.append(f"  TASO     {taso}")
         L.append(f"  Configuration  {config}")
         rule("─")
 
-        dna=ssv.get("dna_profile",{})
-        if dna and "distribution" in dna:
-            sec("MARKET DNA")
-            row("Dominant",f"{dna['dominant_state']}  conf={dna['confidence']:.2f}")
-            stab=f"{dna['stability']:.2f}" if dna.get('stability') is not None else "N/A"
-            row("Entropy/Stab/Pres",f"{dna['entropy']:.2f} / {stab} / {dna.get('pressure','?')}")
-            row("Age / Persistence",f"{dna.get('age','?')} / {dna.get('persistence','?')}")
-            ma=dna.get("moving_average",{})
-            if ma: row("MA dominant",max(ma,key=ma.get))
-            L.append("  Distribution:")
-            for arch,prob in sorted(dna["distribution"].items(),key=lambda x:x[1],reverse=True):
-                bar="█"*int(prob*24); L.append(f"  {arch:<14} {prob:.3f}  {bar}")
-            vel=dna.get("velocity")
-            if vel:
-                L.append("  Velocity:")
-                for arch,v in sorted(vel.items(),key=lambda x:abs(x[1]),reverse=True):
-                    if abs(v)>0.001: L.append(f"  {arch:<14} {'+' if v>=0 else ''}{v:.4f}")
-            L.append(f"  {dna.get('interpretation','')}")
-
-        cc=ssv["combined_confidence"]
-        sec("STRUCTURAL CONFIDENCE")
-        bar="█"*int(cc["overall"]*24)
-        L.append(f"  Overall:  {cc['overall']:.2f}  {bar}")
-        row("Match",f"{cc['match']:.2f}")
-        row("Density",f"{cc['density']:.2f}")
-        row("Entropy",f"{cc['entropy']:.2f}")
-        row("Epistemic",f"{cc['epistemic']:.2f}")
-        row("Regime stab",f"{cc['stability']:.2f}")
-
-        comp=ssv["completion_hypothesis"]
-        sec("COMPLETION HYPOTHESIS")
-        row("Direct evidence",f"{comp['direct_evidence']:.2f}")
-        row("Graph completion",f"{comp['graph_completion']:.2f}")
-        cs3=comp["completion_strength"]
-        bar="█"*int(cs3*24)
-        L.append(f"  Strength: {cs3:.2f}  {bar}  (risk {comp['completion_risk']:.2f})")
-        if comp.get("inferences"):
-            L.append("  Inferences:")
-            for inf in comp["inferences"]: L.append(f"    · {inf}")
-
-        sec("VECTOR FIELD")
-        for z,v in sorted(vf.items(),key=lambda x:_zone_val(x[0])):
-            sym="↑" if v["net_direction"]>0.1 else "↓" if v["net_direction"]<-0.1 else "↔"
-            hi=" ◀ current" if z==zone else ""
-            L.append(f"  {z:<12} {sym} net={v['net_direction']:+.2f}  mag={v['magnitude']:.2f}  {v['classification']:<10}{hi}")
-
-        sec(f"TRANSITIONS FROM {zone}")
-        an=self._cluster(zone)
-        if an["transitions"]:
-            for t,prob in an["transitions"].items():
-                arr="↑" if _zone_val(t)>_zone_val(zone) else "↓" if _zone_val(t)<_zone_val(zone) else "→"
-                med=self.median_price(t)
-                ms=f"  med≈{med:.2f}" if med else ""
-                st=self.ct.avg_steps(zone,t)
-                L.append(f"  {arr} {t:<12} {int(prob*100):>3}%{ms}{'  '+str(st)+' steps' if st else ''}")
-        else:
-            L.append("  (no transitions recorded)")
-
-        if dmap and dmap.get("path_to_equilibrium"):
-            sec("STATE DISTANCE MAP")
-            row("Nearest attractor",str(dmap.get("nearest_attractor","?")))
-            row("Nearest repeller",str(dmap.get("nearest_repeller","?")))
-            row("Path to equilibrium"," → ".join(dmap["path_to_equilibrium"]))
-            row("Steps",str(dmap["equilibrium_steps"]))
-
-        sec("PATTERNS")
-        L.append(f"  Dominant: {ssv['dominant_pattern']}  ({ssv['pattern_freq']}x)")
-        L.append(f"  Total stored: {len(self.patterns)}")
-
-        # ── EPISTEMIC EDGES ──
+        # ── EPISTEMIC EDGES (global, for report) ──
+        top_edges = []
+        for n in self.nodes.values():
+            for lv, e in n.links.items():
+                if e.epistemic_weight > 0:
+                    top_edges.append((n.value, lv, e.epistemic_weight))
+        top_edges.sort(key=lambda x: x[2], reverse=True)
         if top_edges:
             sec("TOP EPISTEMIC TRANSITIONS (L)")
             for i, (a, b, w) in enumerate(top_edges[:3], 1):
@@ -2191,33 +2351,48 @@ class MemoryDB:
 
 
 # ─────────────────────────────────────────────
-# CLASSIFY (unchanged)
+# CLASSIFY (updated to use uncapped raw_score)
 # ─────────────────────────────────────────────
 
 def classify(results, db=None):
     if not results: return "INVALID",results
     top=results[0]; second=results[1] if len(results)>1 else None
-    if top["total"]<cfg.CONFIDENCE_NONE: return "NO_MATCH",results
-    if second and abs(top["total"]-second["total"])<cfg.RESONANCE_THRESHOLD and db:
+    top_score = top.get("raw_score", top.get("total", 0))
+    second_score = second.get("raw_score", second.get("total", 0)) if second else 0.0
+    if top_score < cfg.CONFIDENCE_NONE: return "NO_MATCH",results
+    if second and abs(top_score - second_score) < cfg.RESONANCE_THRESHOLD and db:
         n1=db.nodes.get(top["value"]); n2=db.nodes.get(second["value"])
         if n1 and n2:
             sim=dna_sim(n1.dna,n2.dna) if isinstance(n1.dna,dict) and isinstance(n2.dna,dict) else 0.5
-            if sim<0.3 or sim>0.7: top["total"]=round(min(top["total"]+0.10,1.0),4); return "RESOLVED_MATCH",results
+            if sim<0.3 or sim>0.7:
+                top["total"] = round(top["total"] + 0.10,4)
+                top["raw_score"] = round(top["raw_score"] + 0.10,4)
+                top["display"] = round(min(top["display"] + 0.10,1.0),4)
+                return "RESOLVED_MATCH",results
             if n1.strand_type is not None and n2.strand_type is not None and n1.strand_type!=n2.strand_type:
-                top["total"]=round(min(top["total"]+0.08,1.0),4); return "RESOLVED_MATCH",results
+                top["total"] = round(top["total"] + 0.08,4)
+                top["raw_score"] = round(top["raw_score"] + 0.08,4)
+                top["display"] = round(min(top["display"] + 0.08,1.0),4)
+                return "RESOLVED_MATCH",results
             if n1.price_zone and n2.price_zone and n1.price_zone==n2.price_zone:
-                top["total"]=round(min(top["total"]+0.06,1.0),4); return "RESOLVED_MATCH",results
+                top["total"] = round(top["total"] + 0.06,4)
+                top["raw_score"] = round(top["raw_score"] + 0.06,4)
+                top["display"] = round(min(top["display"] + 0.06,1.0),4)
+                return "RESOLVED_MATCH",results
         if n1 and second["value"] in n1.links and n1.links[second["value"]].strength>=cfg.AGRR_MIN_STRENGTH:
-            top["total"]=round(min(top["total"]+n1.links[second["value"]].strength*0.15,1.0),4); return "RESOLVED_MATCH",results
-    if second and abs(top["total"]-second["total"])<cfg.RESONANCE_THRESHOLD: return "AMBIGUOUS",results
-    if top["total"]>cfg.CONFIDENCE_HIGH:  return "HIGH",results
-    if top["total"]>cfg.CONFIDENCE_MEDIUM: return "MEDIUM",results
-    if top["total"]>cfg.CONFIDENCE_LOW:   return "LOW",results
+            top["total"] = round(top["total"] + n1.links[second["value"]].strength*0.15,4)
+            top["raw_score"] = round(top["raw_score"] + n1.links[second["value"]].strength*0.15,4)
+            top["display"] = round(min(top["display"] + n1.links[second["value"]].strength*0.15,1.0),4)
+            return "RESOLVED_MATCH",results
+    if second and abs(top_score - second_score) < cfg.RESONANCE_THRESHOLD: return "AMBIGUOUS",results
+    if top_score > cfg.CONFIDENCE_HIGH:  return "HIGH",results
+    if top_score > cfg.CONFIDENCE_MEDIUM: return "MEDIUM",results
+    if top_score > cfg.CONFIDENCE_LOW:   return "LOW",results
     return "NO_MATCH",results
 
 
 # ─────────────────────────────────────────────
-# CLI (unchanged)
+# CLI (updated: E is diagnostic only)
 # ─────────────────────────────────────────────
 
 def _menu():
@@ -2233,7 +2408,7 @@ def _menu():
     print(" │  L  ·  Toggle log-space                            │")
     print(" │  P  ·  Toggle merge regime+pattern                 │")
     print(" │  V  ·  Toggle CIS verbose (show silent disagreements)│")
-    print(" │  E  ·  Evolve edges (reconcile epistemic weights)  │")
+    print(" │  E  ·  Epistemic diagnostic (read‑only)            │")
     print(" │  0  ·  Set lambda                                  │")
     print(" │  X  ·  Exit                                        │")
     print(" └────────────────────────────────────────────────────┘")
@@ -2291,11 +2466,15 @@ def main():
             _log("CIS-VERBOSE", f"{'ON' if db.cis_verbose else 'OFF'}")
 
         elif c == "E":
-            if db.last_r_output:
-                db.L_reconcile(db.last_r_output)
-                _log("EVOLVE", "Reconciled edges from last reconstruction.")
-            else:
-                _log("EVOLVE", "No reconstruction data available. Run R first.")
+            _log("EPI-DIAG", "Epistemic edges (diagnostic only, no mutation):")
+            edges = []
+            for n in db.nodes.values():
+                for lv, e in n.links.items():
+                    if e.epistemic_weight > 0:
+                        edges.append((n.value, lv, e.epistemic_weight, e.epistemic_count, e.mu_confidence, e.mu_contradiction))
+            edges.sort(key=lambda x: x[2], reverse=True)
+            for i, (a,b,w,cnt,conf,cont) in enumerate(edges[:5],1):
+                print(f"  {i}. {a[:12]:<12} → {b[:12]:<12}  ew={w:.4f}  count={cnt:.2f}  conf={conf:.3f}  cont={cont:.3f}")
 
         elif c == "0":
             try:

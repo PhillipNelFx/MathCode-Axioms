@@ -50,7 +50,7 @@ Critical Regression Fixes (2026‑08‑12):
 import time, math, json, os, shutil, random, hashlib, re
 from dataclasses import dataclass
 
-VERSION = "V2.4EL+AE2"
+VERSION = "V2.4EL+AE2 <Σ>"
 
 # ─────────────────────────────────────────────
 # CONFIG

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+# LOTMAP v0.2 — Pydroid 3 single-file edition
+# Python 3.8+, standard library only. Offline; no packages or extra data files.
+# Daily Lotto model: choose 5 distinct numbers from 1..36.
+# Historical draws must be entered oldest first. Demo data is illustrative only.
+# LOTMAP maps combinations; it does not predict lottery results.
+
+import itertools
+import math
+import random
+from collections import Counter
+
+N, R = 36, 5
+TOTAL = math.comb(N, R)
+HISTORICAL_DRAWS = []  # Optional: [(3, 9, 14, 22, 31), ...], oldest first.
+DEMO_DRAWS = [
+    (3, 9, 14, 22, 31), (3, 11, 14, 27, 35),
+    (2, 8, 17, 25, 36), (2, 8, 19, 25, 36)
+]
+
+
+def canon(draw):
+    x = tuple(draw)
+    if len(x) != R or any(not isinstance(v, int) for v in x):
+        raise ValueError("Enter exactly five integers.")
+    if len(set(x)) != R:
+        raise ValueError("Numbers must be distinct.")
+    if any(v < 1 or v > N for v in x):
+        raise ValueError("Numbers must be from 1 to 36.")
+    return tuple(sorted(x))
+
+
+def universe():
+    return itertools.combinations(range(1, N + 1), R)
+
+
+def mask(draw):
+    m = 0
+    for v in canon(draw):
+        m |= 1 << (v - 1)
+    return m
+
+
+def decode_mask(m):
+    if not isinstance(m, int) or m < 0 or m >= (1 << N):
+        raise ValueError("Invalid 36-bit mask.")
+    if bin(m).count("1") != R:
+        raise ValueError("A state mask must have exactly five set bits.")
+    return tuple(i + 1 for i in range(N) if (m >> i) & 1)
+
+
+def gaps(draw):
+    x = canon(draw)
+    return ((x[0] - 1,) +
+            tuple(x[i] - x[i - 1] - 1 for i in range(1, R)) +
+            (N - x[-1],))
+
+
+def from_gaps(g):
+    if len(g) != R + 1 or any(not isinstance(v, int) or v < 0 for v in g):
+        raise ValueError("A gap vector needs six non-negative integers.")
+    if sum(g) != N - R:
+        raise ValueError("Gap components must sum to 31.")
+    x = [1 + g[0]]
+    for v in g[1:-1]:
+        x.append(x[-1] + v + 1)
+    return canon(x)
+
+
+def jdist(a, b):
+    return R - bin(mask(a) & mask(b)).count("1")
+
+
+def sumdist(a, b):
+    return abs(sum(canon(a)) - sum(canon(b))) / 155.0
+
+
+def gapdist(a, b):
+    return sum(abs(x-y) for x, y in zip(gaps(a), gaps(b))) / 62.0
+
+
+def rangesig(draw):
+    x = canon(draw)
+    return (sum(1 <= v <= 12 for v in x),
+            sum(13 <= v <= 24 for v in x),
+            sum(25 <= v <= 36 for v in x))
+
+
+def rangedist(a, b):
+    x, y = rangesig(a), rangesig(b)
+    return sum(abs(i-j) for i, j in zip(x, y)) / 10.0
+
+
+def composite(a, b, weights=(0.70, 0.15, 0.10, 0.05)):
+    alpha, beta, gamma, delta = weights
+    if any(w < 0 for w in weights) or alpha <= 0:
+        raise ValueError("Weights must be non-negative; alpha must be positive.")
+    if not math.isclose(sum(weights), 1.0, abs_tol=1e-12):
+        raise ValueError("Weights must sum to one.")
+    return (alpha*jdist(a, b)/R + beta*gapdist(a, b)
+            + gamma*sumdist(a, b) + delta*rangedist(a, b))
+
+
+def ladder_count(d):
+    return math.comb(R, d) * math.comb(N-R, d) if 0 <= d <= R else 0
+
+
+def ladder():
+    return [(d, ladder_count(d), ladder_count(d)/TOTAL) for d in range(R+1)]
+
+
+def header():
+    print("\n" + "="*54)
+    print("LOTMAP v0.2 — PYDROID SINGLE-FILE EDITION")
+    print("="*54)
+    print("Daily Lotto model: 5 distinct numbers from 1..36")
+    print("Complete universe: {:,}".format(TOTAL))
+    print("Johnson graph: J(36,5) | Degree: 155")
+    print("Offline | Standard library only | No extra files")
+    print("-"*54)
+
+
+def show_framework():
+    header()
+    print("\nJOHNSON LADDER")
+    print("Distance | States from reference | Probability")
+    for d, count, p in ladder():
+        print("{:8d} | {:22,d} | {:10.6%}".format(d, count, p))
+    print("\nGap vector has six non-negative parts summing to 31.")
+    print("Every state has 5 x 31 = 155 one-number-replacement neighbours.")
+    print("Theoretical probabilities assume independent uniform draws.")
+
+
+def verify_universe():
+    # Exhaustive pass, but no large set is retained in memory.
+    count = 0
+    for c in universe():
+        count += 1
+        if decode_mask(mask(c)) != c:
+            raise AssertionError("Binary mask round-trip failed: " + str(c))
+        if from_gaps(gaps(c)) != c:
+            raise AssertionError("Gap-vector round-trip failed: " + str(c))
+    if count != TOTAL:
+        raise AssertionError("Universe count mismatch.")
+    return count
+
+
+def verify_graph_metrics():
+    samples = [(1,2,3,4,5), (3,9,14,22,31),
+               (7,13,19,25,36), (32,33,34,35,36)]
+    for c in samples:
+        s, neighbours = set(c), set()
+        for old in c:
+            for new in range(1, N+1):
+                if new not in s:
+                    neighbours.add(tuple(sorted((s-{old}) | {new})))
+        if len(neighbours) != 155:
+            raise AssertionError("Johnson degree check failed.")
+
+    triples = [
+        ((3,9,14,22,31), (3,11,14,27,35), (2,8,17,25,36)),
+        ((1,2,3,4,5), (6,7,8,9,10), (32,33,34,35,36))
+    ]
+    metrics = (jdist, gapdist, sumdist, rangedist, composite)
+    for a, b, c in triples:
+        for f in metrics:
+            if not math.isclose(f(a,a), 0.0, abs_tol=1e-12):
+                raise AssertionError(f.__name__ + " identity failed")
+            if not math.isclose(f(a,b), f(b,a), abs_tol=1e-12):
+                raise AssertionError(f.__name__ + " symmetry failed")
+            if f(a,b) > f(a,c)+f(c,b)+1e-12:
+                raise AssertionError(f.__name__ + " triangle check failed")
+
+
+def verify():
+    print("\nExhaustively checking all 376,992 combinations...")
+    count = verify_universe()
+    print("[PASS] Universe count:", format(count, ","))
+    print("[PASS] Binary state identity round-trip.")
+    print("[PASS] Six-part gap-vector round-trip.")
+    verify_graph_metrics()
+    print("[PASS] Sampled Johnson graph degree = 155.")
+    print("[PASS] Deterministic distance sanity checks.")
+    print("Note: general metric properties follow from the definitions;")
+    print("these finite checks are implementation sanity checks, not proofs.")
+
+
+def analyse(draws, label="HISTORICAL TRANSITIONS"):
+    history = [canon(x) for x in draws]
+    print("\n" + label)
+    if len(history) < 2:
+        print("Enter at least two draws.")
+        return
+    observed = Counter()
+    print("Index | Previous -> Current | J-distance | Shared | Out | In")
+    for i in range(1, len(history)):
+        a, b = history[i-1], history[i]
+        shared = sorted(set(a) & set(b))
+        out = sorted(set(a) - set(b))
+        incoming = sorted(set(b) - set(a))
+        d = jdist(a, b)
+        observed[d] += 1
+        print("{} | {} -> {} | {} | {} | {} | {}".format(
+            i, a, b, d, shared, out, incoming))
+    ntrans = len(history)-1
+    print("\nObserved vs independent-uniform theoretical baseline")
+    print("d | Observed | Expected count | Theoretical probability")
+    for d, count, p in ladder():
+        print("{} | {} | {:.3f} | {:.6%}".format(
+            d, observed[d], ntrans*p, p))
+    print("Expected counts are a null-model reference, not predictions.")
+
+
+def read_draw(prompt):
+    raw = input(prompt).strip().replace(",", " ")
+    return canon([int(v) for v in raw.split()])
+
+
+def enter_history():
+    print("\nEnter draws oldest first; five numbers per line.")
+    print("Example: 3 9 14 22 31. Blank line ends entry.")
+    draws = []
+    while True:
+        raw = input("Draw {}: ".format(len(draws)+1)).strip()
+        if not raw:
+            break
+        try:
+            draws.append(canon([int(v) for v in raw.replace(",", " ").split()]))
+        except ValueError as e:
+            print("Invalid draw:", e)
+    if draws:
+        analyse(draws, "USER-ENTERED HISTORY")
+    else:
+        print("No draws entered.")
+
+
+def compare():
+    try:
+        a = read_draw("Combination A (five numbers): ")
+        b = read_draw("Combination B (five numbers): ")
+    except ValueError as e:
+        print("Invalid input:", e)
+        return
+    print("\nA:", a, " mask:", mask(a), " gaps:", gaps(a))
+    print("B:", b, " mask:", mask(b), " gaps:", gaps(b))
+    print("Shared numbers:", sorted(set(a) & set(b)))
+    print("Johnson distance:", jdist(a,b))
+    print("Gap distance:      {:.6f}".format(gapdist(a,b)))
+    print("Sum distance:      {:.6f}".format(sumdist(a,b)))
+    print("Range distance:    {:.6f}".format(rangedist(a,b)))
+    print("Composite distance:{:.6f}".format(composite(a,b)))
+
+
+def simulate():
+    raw = input("Number of independent pairs (default 10000, max 2000000): ").strip()
+    try:
+        n = int(raw) if raw else 10000
+        if not 1 <= n <= 2000000:
+            raise ValueError
+    except ValueError:
+        print("Enter an integer from 1 to 2,000,000.")
+        return
+    rng, observed = random.Random(), Counter()
+    for _ in range(n):
+        a = tuple(sorted(rng.sample(range(1,N+1), R)))
+        b = tuple(sorted(rng.sample(range(1,N+1), R)))
+        observed[jdist(a,b)] += 1
+    print("\nSIMULATION: {:,} independent pairs".format(n))
+    print("d | Simulated | Expected | Difference")
+    for d, count, p in ladder():
+        expected = n*p
+        print("{} | {} | {:.1f} | {:+.1f}".format(
+            d, observed[d], expected, observed[d]-expected))
+    print("Simulation tests the null model; it does not forecast draws.")
+
+
+def main():
+    while True:
+        header()
+        print("1. Mathematical framework and ladder")
+        print("2. Run exhaustive verification")
+        print("3. Compare two combinations")
+        print("4. Enter and analyse historical draws")
+        print("5. Run illustrative demo (not real results)")
+        print("6. Simulate independent transitions")
+        print("0. Exit")
+        choice = input("\nSelect option: ").strip()
+        if choice == "1":
+            show_framework()
+        elif choice == "2":
+            verify()
+        elif choice == "3":
+            compare()
+        elif choice == "4":
+            enter_history()
+        elif choice == "5":
+            analyse(DEMO_DRAWS, "ILLUSTRATIVE DEMO — NOT REAL RESULTS")
+        elif choice == "6":
+            simulate()
+        elif choice == "0":
+            print("LOTMAP closed.")
+            break
+        else:
+            print("Unknown option.")
+        input("\nPress Enter to return to menu...")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nLOTMAP stopped.")

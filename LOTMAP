@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
-# LOTMAP v0.2 — Pydroid 3 single-file edition
+# LOTMAP v0.4.1 — Pydroid 3 single-file edition
 # Python 3.8+, standard library only. Offline; no packages or extra data files.
 # Daily Lotto model: choose 5 distinct numbers from 1..36.
 # Historical draws must be entered oldest first. Demo data is illustrative only.
 # LOTMAP maps combinations; it does not predict lottery results.
+#
+# v0.4 keeps every v0.2 and v0.3 mathematical definition and adds:
+#   E. Realised-draw audit: full-universe structural rank + percentile (PIT)
+#   F. CTDM shell-level probabilities and lift over the null
+#   G. CTDM evidence (log Bayes factor vs the fair-lottery null)
+#   H. Null-nested HMM emissions (exponential tilting of the null)
+#   I. Percentile-based rolling-origin test (valid, powerful under the null)
+# v0.4.1: option 9 is ~10x faster (same maths) and shows a live progress bar.
+# Fixes: hard-coded candidate bound removed; CTDM kappa shrinkage raised;
+#        legacy HMM emissions retained only as HMM_B_LEGACY for comparison.
+#
+# No combined score is produced. Structural, CTDM and HMM outputs remain separate.
+# Lottery outcomes remain independent-uniform under the fair-lottery null model.
 
 import itertools
 import math
 import random
-from collections import Counter
+import sys
+import time
+from collections import Counter, defaultdict
 
 N, R = 36, 5
 TOTAL = math.comb(N, R)
@@ -18,6 +33,17 @@ DEMO_DRAWS = [
     (2, 8, 17, 25, 36), (2, 8, 19, 25, 36)
 ]
 
+# User experiment: ten draws entered in v0.3, then Daily Lotto draw 2810.
+EXPERIMENT_HISTORY = [
+    (5, 9, 11, 18, 29), (4, 16, 22, 28, 33), (6, 10, 12, 15, 29),
+    (17, 21, 26, 30, 35), (6, 14, 25, 26, 35), (16, 21, 22, 24, 31),
+    (9, 18, 24, 31, 32), (2, 10, 28, 31, 32), (6, 8, 10, 17, 24),
+    (3, 8, 20, 26, 29)
+]
+EXPERIMENT_REALISED = (4, 11, 19, 25, 35)
+
+# -------------------- LOTMAP v0.2 BASELINE FUNCTIONS --------------------
+# Unchanged definitions and formulas.
 
 def canon(draw):
     x = tuple(draw)
@@ -111,7 +137,7 @@ def ladder():
 
 def header():
     print("\n" + "="*54)
-    print("LOTMAP v0.2 — PYDROID SINGLE-FILE EDITION")
+    print("LOTMAP v0.2 — BASELINE")
     print("="*54)
     print("Daily Lotto model: 5 distinct numbers from 1..36")
     print("Complete universe: {:,}".format(TOTAL))
@@ -129,10 +155,12 @@ def show_framework():
     print("\nGap vector has six non-negative parts summing to 31.")
     print("Every state has 5 x 31 = 155 one-number-replacement neighbours.")
     print("Theoretical probabilities assume independent uniform draws.")
+    print("Key fact: P(J<=2 from a given draw) = {:.4%}; P(J>=4) = {:.4%}.".format(
+        sum(ladder_count(k) for k in range(3))/float(TOTAL),
+        sum(ladder_count(k) for k in (4, 5))/float(TOTAL)))
 
 
 def verify_universe():
-    # Exhaustive pass, but no large set is retained in memory.
     count = 0
     for c in universe():
         count += 1
@@ -216,18 +244,23 @@ def read_draw(prompt):
     return canon([int(v) for v in raw.split()])
 
 
-def enter_history():
-    print("\nEnter draws oldest first; five numbers per line.")
-    print("Example: 3 9 14 22 31. Blank line ends entry.")
+def read_draw_list(minimum_note, limit=None):
+    print(minimum_note)
     draws = []
-    while True:
-        raw = input("Draw {}: ".format(len(draws)+1)).strip()
+    while limit is None or len(draws) < limit:
+        raw = input("Draw {} (blank ends): ".format(len(draws)+1)).strip()
         if not raw:
             break
         try:
             draws.append(canon([int(v) for v in raw.replace(",", " ").split()]))
         except ValueError as e:
             print("Invalid draw:", e)
+    return draws
+
+
+def enter_history():
+    draws = read_draw_list("\nEnter draws oldest first; five numbers per line.\n"
+                           "Example: 3 9 14 22 31. Blank line ends entry.")
     if draws:
         analyse(draws, "USER-ENTERED HISTORY")
     else:
@@ -274,15 +307,826 @@ def simulate():
     print("Simulation tests the null model; it does not forecast draws.")
 
 
+# -------------------------- v0.3/v0.4 CONFIGURATION --------------------------
+
+V04_VERSION = "0.4"
+HISTORY_SIZE = 10
+CANDIDATE_RADIUS = 2
+RECENCY_HALF_LIFE = 5.0
+CTDM_KAPPA = 20.0   # prior strength in pseudo-transitions (v0.3 used 1.0)
+HMM_STATES = ("COMPACT", "MODERATE", "DISPERSED")
+STRUCT_WEIGHTS = (0.70, 0.15, 0.10, 0.05)
+
+
+def null_distance_probabilities():
+    return tuple(ladder_count(k) / float(TOTAL) for k in range(R + 1))
+
+
+def tilted_emissions(thetas=(-0.5, 0.0, 0.5)):
+    """Null-nested emissions: B_s(k) proportional to p0(k)*exp(theta_s*k).
+    theta = 0 reproduces the fair-lottery distance law exactly."""
+    p0 = null_distance_probabilities()
+    rows = []
+    for th in thetas:
+        raw = [p0[k] * math.exp(th * k) for k in range(R + 1)]
+        z = sum(raw)
+        rows.append(tuple(x / z for x in raw))
+    return tuple(rows)
+
+
+# Explicit illustrative parameters, NOT fitted estimates.
+HMM_PI = (1.0/3.0, 1.0/3.0, 1.0/3.0)
+HMM_A = (
+    (0.70, 0.25, 0.05),
+    (0.15, 0.70, 0.15),
+    (0.05, 0.25, 0.70)
+)
+HMM_B = tilted_emissions()
+# v0.3 emissions kept for comparison only. They put 7-40% mass on J=0/1, versus
+# a null probability of about 0.0003%/0.04%, so they were not null-nested.
+HMM_B_LEGACY = (
+    (0.40, 0.30, 0.16, 0.08, 0.04, 0.02),
+    (0.10, 0.20, 0.40, 0.20, 0.08, 0.02),
+    (0.02, 0.04, 0.08, 0.16, 0.30, 0.40)
+)
+
+
+def v03_header():
+    print("\n" + "=" * 62)
+    print("LOTMAP v0.4.1 — LOCAL STATE INTELLIGENCE + AUDIT")
+    print("=" * 62)
+    print("Daily Lotto | 5 distinct numbers from 1..36")
+    print("Universe: {:,} | Johnson graph J(36,5) | Degree: 155".format(TOTAL))
+    print("Offline | Python standard library only | No external data")
+    print("Structural / CTDM / HMM outputs remain separate.")
+    print("-" * 62)
+
+
+def require_history(draws, exact=None, minimum=None):
+    history = [canon(d) for d in draws]
+    if exact is not None and len(history) != exact:
+        raise ValueError("Exactly {} chronological draws are required.".format(exact))
+    if minimum is not None and len(history) < minimum:
+        raise ValueError("At least {} chronological draws are required.".format(minimum))
+    return history
+
+
+def recency_weights(length=HISTORY_SIZE, half_life=RECENCY_HALF_LIFE):
+    if length < 1 or half_life <= 0:
+        raise ValueError("Length and half-life must be positive.")
+    raw = [2.0 ** (-(length - 1 - i) / float(half_life))
+           for i in range(length)]
+    total = sum(raw)
+    return tuple(x / total for x in raw)
+
+
+def generate_radius_neighbourhood(anchor, radius=CANDIDATE_RADIUS):
+    """Yield unique states within Johnson distance <= radius of anchor."""
+    anchor = canon(anchor)
+    if not isinstance(radius, int) or radius < 0 or radius > R:
+        raise ValueError("Radius must be an integer from 0 to 5.")
+    selected = set(anchor)
+    outside = [v for v in range(1, N + 1) if v not in selected]
+    yield anchor
+    for distance in range(1, radius + 1):
+        for removed in itertools.combinations(anchor, distance):
+            remaining = selected.difference(removed)
+            for added in itertools.combinations(outside, distance):
+                yield tuple(sorted(remaining.union(added)))
+
+
+def radius_ball_size(radius=CANDIDATE_RADIUS):
+    return sum(ladder_count(k) for k in range(radius + 1))
+
+
+def generate_candidates(history, radius=CANDIDATE_RADIUS):
+    """Union radius-r neighbourhoods; masks deduplicate states and track anchors."""
+    history = require_history(history, exact=HISTORY_SIZE)
+    anchor_indices = defaultdict(list)
+    for index, anchor in enumerate(history):
+        for candidate in generate_radius_neighbourhood(anchor, radius):
+            cm = mask(candidate)
+            if not anchor_indices[cm] or anchor_indices[cm][-1] != index:
+                anchor_indices[cm].append(index)
+    return anchor_indices
+
+
+def structural_candidate_rows(history, candidate_map, half_life=RECENCY_HALF_LIFE):
+    """Return rows with structural metrics; compatibility is not probability."""
+    history = require_history(history, exact=HISTORY_SIZE)
+    weights = recency_weights(len(history), half_life)
+    rows = []
+    for cm, anchors in candidate_map.items():
+        candidate = decode_mask(cm)
+        distances = [jdist(candidate, d) for d in history]
+        j_weighted = sum(w * d / float(R) for w, d in zip(weights, distances))
+        g_weighted = sum(w * gapdist(candidate, d) for w, d in zip(weights, history))
+        s_weighted = sum(w * sumdist(candidate, d) for w, d in zip(weights, history))
+        r_weighted = sum(w * rangedist(candidate, d) for w, d in zip(weights, history))
+        weighted_distance = (0.70*j_weighted + 0.15*g_weighted
+                             + 0.10*s_weighted + 0.05*r_weighted)
+        rows.append({
+            "draw": candidate,
+            "mask": cm,
+            "anchor_count": len(anchors),
+            "anchor_indices": tuple(anchors),
+            "anchor_recurrence": len(anchors) / float(HISTORY_SIZE),
+            "min_j": min(distances),
+            "mean_j": sum(distances) / float(HISTORY_SIZE),
+            "weighted_distance": weighted_distance,
+            "structural_score": 1.0 - weighted_distance
+        })
+    rows.sort(key=lambda x: (
+        -x["structural_score"], -x["anchor_count"],
+        x["weighted_distance"], x["min_j"], x["draw"]))
+    return rows
+
+
+# ------------------------------ CTDM (Engine B) ------------------------------
+
+def ctdm_fit(history, kappa=CTDM_KAPPA):
+    """Null-centred Dirichlet posterior predictive for categorical J-distance.
+    Prior = Dirichlet(kappa * p0); predictive_k = (n_k + kappa*p0_k)/(n + kappa)."""
+    history = require_history(history, exact=HISTORY_SIZE)
+    if kappa <= 0:
+        raise ValueError("CTDM kappa must be positive.")
+    distances = [jdist(history[i], history[i+1])
+                 for i in range(len(history)-1)]
+    counts = Counter(distances)
+    p0 = null_distance_probabilities()
+    predictive = tuple(
+        (counts[k] + kappa*p0[k]) / (len(distances) + kappa)
+        for k in range(R+1)
+    )
+    if not math.isclose(sum(predictive), 1.0, abs_tol=1e-12):
+        raise AssertionError("CTDM predictive probabilities do not sum to one.")
+    return {
+        "distances": tuple(distances),
+        "counts": tuple(counts[k] for k in range(R+1)),
+        "null": p0,
+        "predictive": predictive,
+        "kappa": kappa
+    }
+
+
+def ctdm_shell_table(ctdm):
+    """Per-shell predictive mass, per-state probability and lift over null.
+    Within a J-shell every state shares q_k / |shell_k|, so the state
+    probabilities sum to one over the FULL universe (not just candidates)."""
+    rows = []
+    for k in range(R + 1):
+        q, p0 = ctdm["predictive"][k], ctdm["null"][k]
+        rows.append({
+            "k": k, "shell_size": ladder_count(k), "null_mass": p0,
+            "mass": q, "per_state": q / ladder_count(k),
+            "lift": q / p0
+        })
+    return rows
+
+
+def ctdm_log_bayes_factor(counts, kappa=CTDM_KAPPA):
+    """log[ Dirichlet-multinomial marginal / null-multinomial ] for one fixed
+    ordered sequence of distances. Under the null, E[BF] = 1, so log BF is
+    typically negative; values near 0 or below mean no evidence for structure."""
+    p0 = null_distance_probabilities()
+    n = sum(counts)
+    log_m = math.lgamma(kappa) - math.lgamma(kappa + n)
+    for k in range(R + 1):
+        a = kappa * p0[k]
+        log_m += math.lgamma(a + counts[k]) - math.lgamma(a)
+    log_null = sum(counts[k] * math.log(p0[k]) for k in range(R + 1))
+    return log_m - log_null
+
+
+# ------------------------------ HMM (Engine C) ------------------------------
+
+def validate_probability_vector(values, length, label):
+    if len(values) != length or any(x < 0 for x in values):
+        raise ValueError(label + " has invalid dimensions or negative values.")
+    if not math.isclose(sum(values), 1.0, abs_tol=1e-10):
+        raise ValueError(label + " must sum to one.")
+
+
+def validate_hmm_parameters(pi=HMM_PI, transition=HMM_A, emission=HMM_B):
+    validate_probability_vector(pi, 3, "HMM initial distribution")
+    if len(transition) != 3 or len(emission) != 3:
+        raise ValueError("HMM requires three transition and emission rows.")
+    for row in transition:
+        validate_probability_vector(row, 3, "HMM transition row")
+    for row in emission:
+        validate_probability_vector(row, 6, "HMM emission row")
+    means = [sum(k*p for k, p in enumerate(row)) for row in emission]
+    if not (means[0] < means[1] < means[2]):
+        raise ValueError("HMM emission means must order COMPACT < MODERATE < DISPERSED.")
+    return True
+
+
+def hmm_forward(observations, pi=HMM_PI, transition=HMM_A, emission=HMM_B):
+    """Scaled forward recursion; parameters are illustrative and not estimated."""
+    validate_hmm_parameters(pi, transition, emission)
+    if not observations or any(not isinstance(x, int) or x < 0 or x > 5
+                               for x in observations):
+        raise ValueError("HMM observations must be a non-empty sequence in 0..5.")
+    alpha = [pi[i] * emission[i][observations[0]] for i in range(3)]
+    scale = sum(alpha)
+    if scale <= 0:
+        raise ValueError("HMM sequence has zero likelihood.")
+    log_likelihood = math.log(scale)
+    alpha = [x / scale for x in alpha]
+    for observation in observations[1:]:
+        nxt = [
+            emission[j][observation] *
+            sum(alpha[i] * transition[i][j] for i in range(3))
+            for j in range(3)
+        ]
+        scale = sum(nxt)
+        if scale <= 0:
+            raise ValueError("HMM sequence has zero likelihood.")
+        log_likelihood += math.log(scale)
+        alpha = [x / scale for x in nxt]
+    posterior_last = tuple(alpha)
+    next_regime = tuple(
+        sum(posterior_last[i] * transition[i][j] for i in range(3))
+        for j in range(3)
+    )
+    next_observation = tuple(
+        sum(next_regime[j] * emission[j][k] for j in range(3))
+        for k in range(6)
+    )
+    return {
+        "log_likelihood": log_likelihood,
+        "last_regime_posterior": posterior_last,
+        "next_regime": next_regime,
+        "next_distance": next_observation
+    }
+
+
+def hmm_log_bayes_vs_null(observations, **kw):
+    """Log-likelihood ratio of the HMM against the iid null distance law."""
+    p0 = null_distance_probabilities()
+    hmm = hmm_forward(observations, **kw)
+    return hmm["log_likelihood"] - sum(math.log(p0[k]) for k in observations)
+
+
+# --------------------- STRUCTURAL SCORING OVER THE UNIVERSE ---------------------
+
+def make_structural_scorer(history, half_life=RECENCY_HALF_LIFE):
+    """Fast weighted composite distance for any VALID SORTED 5-tuple.
+    Identical formula to structural_candidate_rows (verified in verify_v04)."""
+    history = require_history(history, exact=HISTORY_SIZE)
+    weights = recency_weights(len(history), half_life)
+    a_j, a_g, a_s, a_r = STRUCT_WEIGHTS
+    hm = [mask(d) for d in history]
+    hg = [gaps(d) for d in history]
+    hs = [sum(d) for d in history]
+    hr = [rangesig(d) for d in history]
+    packed = list(zip(weights, hm, hg, hs, hr))
+
+    def weighted_distance(c):
+        cm = 0
+        for v in c:
+            cm |= 1 << (v - 1)
+        g0, g1, g2, g3, g4, g5 = (c[0]-1, c[1]-c[0]-1, c[2]-c[1]-1,
+                                  c[3]-c[2]-1, c[4]-c[3]-1, N-c[4])
+        s = c[0]+c[1]+c[2]+c[3]+c[4]
+        r0 = r1 = 0
+        for v in c:
+            if v <= 12:
+                r0 += 1
+            elif v <= 24:
+                r1 += 1
+        r2 = R - r0 - r1
+        total = 0.0
+        for w, m, g, hsum, rr in packed:
+            j = (R - bin(cm & m).count("1")) / float(R)
+            gd = (abs(g0-g[0]) + abs(g1-g[1]) + abs(g2-g[2]) +
+                  abs(g3-g[3]) + abs(g4-g[4]) + abs(g5-g[5])) / 62.0
+            sd = abs(s - hsum) / 155.0
+            rd = (abs(r0-rr[0]) + abs(r1-rr[1]) + abs(r2-rr[2])) / 10.0
+            total += w * (a_j*j + a_g*gd + a_s*sd + a_r*rd)
+        return total
+    return weighted_distance
+
+
+def structural_percentile(history, realised, sample=None, rng=None,
+                          half_life=RECENCY_HALF_LIFE, show_progress=False):
+    """Mid-rank percentile u of `realised` among states ranked by structural
+    score. u near 0 = near the top of the ranking; under the fair-lottery null
+    (realised independent of history) u is uniform on (0,1).
+    sample=None scores all 376,992 states exactly; otherwise a Monte-Carlo
+    sample of that many random states (standard error ~ sqrt(u(1-u)/sample))."""
+    scorer = make_structural_scorer(history, half_life)
+    realised = canon(realised)
+    target = scorer(realised)
+    eps = 1e-12
+    better = ties = 0
+    if sample is None:
+        total = TOTAL
+        for i, c in enumerate(universe()):
+            d = scorer(c)
+            if d < target - eps:
+                better += 1
+            elif d <= target + eps:
+                ties += 1
+            if show_progress and i and i % 50000 == 0:
+                print("  scored {:,} / {:,}".format(i, TOTAL))
+        rank_best, rank_worst = better + 1, better + ties
+    else:
+        rng = rng or random.Random()
+        total = sample
+        for _ in range(sample):
+            c = tuple(sorted(rng.sample(range(1, N + 1), R)))
+            d = scorer(c)
+            if d < target - eps:
+                better += 1
+            elif d <= target + eps:
+                ties += 1
+        rank_best = rank_worst = None
+    u = (better + 0.5 * ties) / float(total)
+    return {"score": 1.0 - target, "weighted_distance": target, "u": u,
+            "rank_best": rank_best, "rank_worst": rank_worst,
+            "better": better, "ties": ties, "total": total}
+
+
+# ------------------------------ REALISED-DRAW AUDIT ------------------------------
+
+def realised_draw_audit(history, realised, exact=True, sample=20000):
+    """Compare what LOTMAP ranked with what actually happened."""
+    history = require_history(history, exact=HISTORY_SIZE)
+    realised = canon(realised)
+    cmap = generate_candidates(history)
+    in_candidates = mask(realised) in cmap
+    j_all = [jdist(realised, d) for d in history]
+    j_latest = j_all[-1]
+    ctdm = ctdm_fit(history)
+    table = ctdm_shell_table(ctdm)
+    hmm = hmm_forward(ctdm["distances"])
+    p0 = null_distance_probabilities()
+    hmm_lift = hmm["next_distance"][j_latest] / p0[j_latest]
+    ctdm_lift = table[j_latest]["lift"]
+    top_rows = structural_candidate_rows(history, cmap)[:6]
+
+    print("\nREALISED-DRAW AUDIT")
+    print("Realised draw:", realised)
+    print("Latest history draw:", history[-1])
+    print("J-distance to each of the ten anchors:", tuple(j_all))
+    print("Latest-anchor J = {} (null probability of this shell: {:.4%})".format(
+        j_latest, p0[j_latest]))
+    print("Closest anchor J = {} | radius-2 retrieval needs J <= 2".format(min(j_all)))
+    print("Inside radius-2 candidate set: {}".format("YES" if in_candidates else "NO"))
+    print("Null chance a fresh draw lands in this candidate set: {:.4%}".format(
+        len(cmap)/float(TOTAL)))
+    print("Null chance of hitting any one of the top 6: {:.6%}".format(6.0/TOTAL))
+    print("Top-6 structural picks:")
+    for i, row in enumerate(top_rows, 1):
+        shared = len(set(row["draw"]) & set(realised))
+        print("  {}. {} score {:.6f} | numbers shared with realised: {}".format(
+            i, row["draw"], row["structural_score"], shared))
+
+    if exact:
+        print("\nScoring all {:,} states (can take 1-3 minutes on a phone)...".format(TOTAL))
+        res = structural_percentile(history, realised, show_progress=True)
+        print("Structural score of realised draw: {:.6f}".format(res["score"]))
+        print("Full-universe structural rank: {:,} of {:,}".format(
+            res["rank_best"], TOTAL))
+        print("Percentile u (0 = top, 1 = bottom): {:.4f}".format(res["u"]))
+    else:
+        res = structural_percentile(history, realised, sample=sample)
+        print("\nSampled percentile u (n={:,}): {:.4f}".format(sample, res["u"]))
+    print("Under the null, u is uniform; a single u says almost nothing.")
+
+    print("\nCTDM / HMM scoring of the realised distance J = {}".format(j_latest))
+    print("CTDM lift over null: {:.4f}  (log {:+.4f})".format(
+        ctdm_lift, math.log(ctdm_lift)))
+    print("HMM  lift over null: {:.4f}  (log {:+.4f})".format(
+        hmm_lift, math.log(hmm_lift)))
+    print("CTDM state probability: {:.4e} vs null {:.4e}".format(
+        table[j_latest]["per_state"], 1.0/TOTAL))
+    print("Lift > 1 means the model gave this shell more mass than the null.")
+    return {"in_candidates": in_candidates, "j_all": j_all, "percentile": res,
+            "ctdm_lift": ctdm_lift, "hmm_lift": hmm_lift}
+
+
+# ------------------------------ ANALYSIS REPORT ------------------------------
+
+def analyse_v03(history, top_n=20, half_life=RECENCY_HALF_LIFE):
+    """Run the three independent engines on exactly ten historical draws."""
+    history = require_history(history, exact=HISTORY_SIZE)
+    candidates = generate_candidates(history, CANDIDATE_RADIUS)
+    structural = structural_candidate_rows(history, candidates, half_life)
+    ctdm = ctdm_fit(history)
+    table = ctdm_shell_table(ctdm)
+    transition_distances = ctdm["distances"]
+    hmm = hmm_forward(transition_distances)
+    p0 = null_distance_probabilities()
+
+    print("\nLOTMAP v0.4 — TEN-DRAW RECONSTRUCTION")
+    print("History: oldest -> newest")
+    for i, draw in enumerate(history, 1):
+        print("{:2d}. {}".format(i, draw))
+    print("\nCANDIDATE RETRIEVAL")
+    print("Radius: {} | Unique candidates: {:,}".format(
+        CANDIDATE_RADIUS, len(candidates)))
+    print("Upper-bound generated entries: {:,}".format(
+        HISTORY_SIZE * radius_ball_size(CANDIDATE_RADIUS)))
+    print("Universe coverage: {:.4%}".format(len(candidates)/float(TOTAL)))
+    print("Radius-2 shells hold only {:.4%} of null mass per anchor;".format(
+        radius_ball_size(2)/float(TOTAL)))
+    print("most fresh draws sit at J=4 or 5 from every recent draw.")
+    print("\nENGINE A — STRUCTURAL LSR")
+    print("Rank | Combination | Score | Anchors | Min J | Mean J")
+    for rank, row in enumerate(structural[:max(1, top_n)], 1):
+        print("{:4d} | {} | {:.6f} | {:2d}/10 | {} | {:.3f}".format(
+            rank, row["draw"], row["structural_score"],
+            row["anchor_count"], row["min_j"], row["mean_j"]))
+    spread = structural[0]["structural_score"] - structural[min(len(structural), 20) - 1]["structural_score"]
+    print("Score spread rank 1 to {}: {:.6f}".format(min(len(structural), 20), spread))
+    print("Structural score = 1 - recency-weighted composite distance.")
+    print("It is compatibility, not probability.")
+
+    print("\nENGINE B — CTDM (kappa = {})".format(ctdm["kappa"]))
+    print("Observed transition distances:", transition_distances)
+    print("d | Count | Null | CTDM | Lift | Per-state prob")
+    for row in table:
+        print("{} | {:3d} | {:9.4%} | {:9.4%} | {:6.3f} | {:.3e}".format(
+            row["k"], ctdm["counts"][row["k"]], row["null_mass"],
+            row["mass"], row["lift"], row["per_state"]))
+    print("Every state in a shell shares that shell's per-state probability;")
+    print("the table sums to 1 over the full universe, not only candidates.")
+    print("Log Bayes factor vs null: {:+.4f} (<= 0 means no evidence of structure)".format(
+        ctdm_log_bayes_factor(ctdm["counts"], ctdm["kappa"])))
+    print("CTDM is categorical transition-distance modelling, not a state Markov chain.")
+
+    print("\nENGINE C — EXPLORATORY HMM")
+    print("Status: EXPLORATORY — null-nested tilted emissions; not fitted.")
+    print("Last regime posterior:", ["{:.4f}".format(x)
+                                     for x in hmm["last_regime_posterior"]])
+    print("Next regime distribution:", ["{:.4f}".format(x)
+                                         for x in hmm["next_regime"]])
+    print("Next distance distribution (HMM | null | lift):")
+    for k, probability in enumerate(hmm["next_distance"]):
+        print("  J={} : {:.6%} | {:.6%} | {:.3f}".format(
+            k, probability, p0[k], probability / p0[k]))
+    print("HMM log-likelihood ratio vs null: {:+.4f}".format(
+        hmm_log_bayes_vs_null(list(transition_distances))))
+    print("No combined score or calibrated lottery probability is produced.")
+
+    print("\nINTERPRETATION")
+    print("- Every combination in the full universe retains null probability 1/{:,}.".format(TOTAL))
+    print("- Candidate extraction and ranking do not change lottery odds.")
+    print("- HMM parameters require larger-history estimation and diagnostics.")
+    print("- Predictive value remains unproven until held-out testing (option 10/12).")
+    return {
+        "history": history, "candidate_map": candidates,
+        "structural": structural, "ctdm": ctdm, "hmm": hmm
+    }
+
+
+# --------------------------- NULL AND OUT-OF-SAMPLE TESTS ---------------------------
+
+ANIMATE = True   # set False if your terminal shows broken progress lines
+
+
+def format_seconds(seconds):
+    seconds = int(max(0, round(seconds)))
+    return "{}m{:02d}s".format(seconds // 60, seconds % 60)
+
+
+class ProgressBar(object):
+    """Live spinner + bar + elapsed + ETA. ETA = elapsed * (1 - f) / f, where f
+    is the completed fraction. Lines stay under ~40 characters so they do not
+    wrap on a narrow phone terminal (wrapping would break the carriage return)."""
+    FRAMES = "|/-\\"
+
+    def __init__(self, total, animate=True, width=10):
+        self.total = float(total)
+        self.animate = animate
+        self.width = width
+        self.start = time.time()
+        self.last = 0.0
+        self.prev_len = 0
+
+    def update(self, done, force=False):
+        now = time.time()
+        if not force and now - self.last < 0.2:
+            return
+        self.last = now
+        frac = max(0.0, min(1.0, done / self.total))
+        elapsed = now - self.start
+        eta = elapsed * (1.0 - frac) / frac if frac > 0.002 else None
+        filled = int(round(frac * self.width))
+        line = "{} [{}] {:3d}% {} ETA {}".format(
+            self.FRAMES[int(now * 6) % 4],
+            "#" * filled + "-" * (self.width - filled),
+            int(frac * 100), format_seconds(elapsed),
+            format_seconds(eta) if eta is not None else "...")
+        if self.animate:
+            pad = " " * max(0, self.prev_len - len(line))
+            sys.stdout.write("\r" + line + pad)
+            sys.stdout.flush()
+            self.prev_len = len(line)
+        elif force:
+            print(line)
+
+    def finish(self):
+        self.update(self.total, force=True)
+        if self.animate:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+
+def null_top_score_fast(history, candidate_map, tick=None):
+    """Top structural score via the verified fast scorer. Mathematically equal
+    to structural_candidate_rows(...)[0]['structural_score'] (see verify_v03)."""
+    scorer = make_structural_scorer(history)
+    best = None
+    count = len(candidate_map)
+    for i, cm in enumerate(candidate_map):
+        d = scorer(decode_mask(cm))
+        if best is None or d < best:
+            best = d
+        if tick is not None and i % 1500 == 0:
+            tick(i / float(count))
+    return 1.0 - best
+
+
+def full_pipeline_null_simulation(repetitions=100, seed=None, animate=None):
+    """Run candidate extraction and structural scoring on independent
+    ten-draw null histories. Reports candidate count and top structural score.
+    Shows a live progress bar so a long run is visibly alive."""
+    if not isinstance(repetitions, int) or not 1 <= repetitions <= 2000:
+        raise ValueError("Repetitions must be an integer from 1 to 2,000.")
+    animate = ANIMATE if animate is None else animate
+    rng = random.Random(seed)
+    candidate_counts, top_scores, max_recurrences = [], [], []
+    print("\nRunning {:,} null replications...".format(repetitions))
+    bar = ProgressBar(repetitions, animate)
+    bar.update(0, force=True)
+    for rep in range(repetitions):
+        history = [tuple(sorted(rng.sample(range(1, N+1), R)))
+                   for _ in range(HISTORY_SIZE)]
+        cmap = generate_candidates(history)
+        top = null_top_score_fast(
+            history, cmap, tick=lambda f, r=rep: bar.update(r + f))
+        candidate_counts.append(len(cmap))
+        top_scores.append(top)
+        max_recurrences.append(max(len(v) for v in cmap.values()))
+        bar.update(rep + 1, force=not animate)
+    bar.finish()
+    candidate_counts.sort()
+    top_scores.sort()
+    max_recurrences.sort()
+
+    def quantile(values, q):
+        index = int(round((len(values)-1)*q))
+        return values[index]
+
+    print("\nFULL-PIPELINE INDEPENDENT-UNIFORM NULL SIMULATION")
+    print("Replications: {:,} | Seed: {}".format(repetitions, seed))
+    print("Candidate count: mean {:.1f}; 5%-95% interval [{}, {}]".format(
+        sum(candidate_counts)/float(repetitions),
+        quantile(candidate_counts, 0.05), quantile(candidate_counts, 0.95)))
+    print("Maximum recurrence: mean {:.3f}; 5%-95% interval [{}, {}]".format(
+        sum(max_recurrences)/float(repetitions),
+        quantile(max_recurrences, 0.05), quantile(max_recurrences, 0.95)))
+    print("Top structural score: mean {:.6f}; 5%-95% interval [{:.6f}, {:.6f}]".format(
+        sum(top_scores)/float(repetitions),
+        quantile(top_scores, 0.05), quantile(top_scores, 0.95)))
+    print("These are null reference distributions, not evidence of predictability.")
+    return {"candidate_counts": candidate_counts, "top_scores": top_scores,
+            "max_recurrences": max_recurrences}
+
+
+def rolling_origin_backtest(draws, top_k=100):
+    """Original top-K hit test (kept). Null hit rate is only K/376,992, so
+    this needs thousands of windows to say anything; prefer option 12."""
+    history = require_history(draws, minimum=HISTORY_SIZE + 1)
+    if not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("Top K must be a positive integer.")
+    results = []
+    for target_index in range(HISTORY_SIZE, len(history)):
+        training = history[target_index-HISTORY_SIZE:target_index]
+        held_out = history[target_index]
+        cmap = generate_candidates(training)
+        rows = structural_candidate_rows(training, cmap)
+        top = rows[:top_k]
+        hit = any(row["draw"] == held_out for row in top)
+        results.append({
+            "target_index": target_index, "held_out": held_out,
+            "candidate_count": len(cmap), "hit": hit,
+            "rank": next((i+1 for i, row in enumerate(rows)
+                          if row["draw"] == held_out), None)
+        })
+    hits = sum(1 for row in results if row["hit"])
+    print("\nROLLING-ORIGIN TOP-K TEST")
+    print("Top K: {} | Evaluation windows: {}".format(top_k, len(results)))
+    for row in results:
+        print("Target draw {}: {} | candidates {:,} | rank {} | {}".format(
+            row["target_index"]+1, row["held_out"], row["candidate_count"],
+            row["rank"] if row["rank"] is not None else "OUTSIDE CANDIDATES",
+            "HIT" if row["hit"] else "MISS"))
+    print("Hits: {}/{} ({:.2%})".format(hits, len(results), hits/float(len(results))))
+    print("Null hit rate for K unique candidates: K/{:,} = {:.6%}".format(
+        TOTAL, min(top_k, TOTAL)/float(TOTAL)))
+    return results
+
+
+def ks_statistic(values):
+    xs = sorted(values)
+    n = len(xs)
+    return max(max((i+1)/float(n) - x, x - i/float(n)) for i, x in enumerate(xs))
+
+
+def rolling_origin_percentile(draws, sample=20000, seed=None):
+    """Percentile (PIT) backtest. For every window: rank the NEXT draw among all
+    states by structural score (Monte-Carlo sample), and score CTDM/HMM on the
+    realised distance. Under the fair-lottery null each u is i.i.d. uniform, so
+    the mean-u z-test and KS test are valid even with overlapping windows."""
+    history = require_history(draws, minimum=HISTORY_SIZE + 1)
+    rng = random.Random(seed)
+    p0 = null_distance_probabilities()
+    us, ctdm_ll, hmm_ll, retrieved = [], [], [], 0
+    print("\nROLLING-ORIGIN PERCENTILE TEST (sample {:,} states per window)".format(sample))
+    for t in range(HISTORY_SIZE, len(history)):
+        training = history[t-HISTORY_SIZE:t]
+        held = history[t]
+        res = structural_percentile(training, held, sample=sample, rng=rng)
+        k = jdist(training[-1], held)
+        ctdm = ctdm_fit(training)
+        c_lift = ctdm["predictive"][k] / p0[k]
+        h = hmm_forward(ctdm["distances"])
+        h_lift = h["next_distance"][k] / p0[k]
+        in_c = mask(held) in generate_candidates(training)
+        retrieved += 1 if in_c else 0
+        us.append(res["u"])
+        ctdm_ll.append(math.log(c_lift))
+        hmm_ll.append(math.log(h_lift))
+        print("Draw {}: u={:.3f} | J={} | in candidates: {} | CTDM log-lift {:+.3f} | HMM {:+.3f}".format(
+            t+1, res["u"], k, "Y" if in_c else "N", ctdm_ll[-1], hmm_ll[-1]))
+    n = len(us)
+    mean_u = sum(us)/float(n)
+    z = (mean_u - 0.5) / math.sqrt(1.0/12.0/n)
+    print("\nWindows: {}".format(n))
+    print("Mean u: {:.4f} (null 0.5000, z = {:+.2f}); u < 0.5 means better than chance".format(mean_u, z))
+    print("KS distance to uniform: {:.4f} (approx 5% critical value {:.4f})".format(
+        ks_statistic(us), 1.36/math.sqrt(n)))
+    print("Candidate-set retrieval: {}/{} ({:.1%}); null expectation about 12%".format(
+        retrieved, n, retrieved/float(n)))
+    print("Mean CTDM log-lift: {:+.4f} | Mean HMM log-lift: {:+.4f}".format(
+        sum(ctdm_ll)/n, sum(hmm_ll)/n))
+    print("Under the null the expected log-lift is <= 0 (it equals minus KL).")
+    print("Positive means across many windows would be the first sign of structure.")
+    return {"u": us, "ctdm": ctdm_ll, "hmm": hmm_ll}
+
+
+# ------------------------------ VERIFICATION ------------------------------
+
+def verify_v03():
+    print("\nLOTMAP v0.4 IMPLEMENTATION VERIFICATION")
+    expected_shells = (1, 155, 4650, 44950, 157325, 169911)
+    actual_shells = tuple(ladder_count(k) for k in range(6))
+    assert actual_shells == expected_shells
+    assert sum(actual_shells) == TOTAL == 376992
+
+    anchors = [(1,2,3,4,5), (3,9,14,22,31), (32,33,34,35,36)]
+    for anchor in anchors:
+        neighbourhood = list(generate_radius_neighbourhood(anchor, 2))
+        assert len(neighbourhood) == radius_ball_size(2) == 4806
+        assert len(set(neighbourhood)) == 4806
+        assert all(jdist(anchor, c) <= 2 for c in neighbourhood)
+
+    history = [
+        (1,2,3,4,5), (2,7,13,21,30), (4,9,16,24,35),
+        (1,8,17,26,36), (3,11,19,25,32), (5,12,18,27,34),
+        (6,14,20,28,33), (7,15,22,29,36), (8,16,23,30,35),
+        (9,17,24,31,34)
+    ]
+    cmap = generate_candidates(history)
+    assert 1 <= len(cmap) <= HISTORY_SIZE * 4806
+    assert all(1 <= len(v) <= 10 for v in cmap.values())
+    rows = structural_candidate_rows(history, cmap)
+    assert len(rows) == len(cmap)
+    assert all(-1e-12 <= x["structural_score"] <= 1+1e-12 for x in rows)
+    assert rows == sorted(rows, key=lambda x: (
+        -x["structural_score"], -x["anchor_count"],
+        x["weighted_distance"], x["min_j"], x["draw"]))
+
+    # Fast scorer must equal the reference scorer.
+    scorer = make_structural_scorer(history)
+    for row in rows[:25] + rows[-25:]:
+        assert math.isclose(scorer(row["draw"]), row["weighted_distance"], abs_tol=1e-12)
+
+    # Fast null-simulation path equals the reference top score and recurrence.
+    assert math.isclose(null_top_score_fast(history, cmap), rows[0]["structural_score"], abs_tol=1e-12)
+    assert max(len(v) for v in cmap.values()) == max(r["anchor_count"] for r in rows)
+
+    ctdm = ctdm_fit(history)
+    assert math.isclose(sum(ctdm["null"]), 1.0, abs_tol=1e-12)
+    assert math.isclose(sum(ctdm["predictive"]), 1.0, abs_tol=1e-12)
+    table = ctdm_shell_table(ctdm)
+    assert math.isclose(sum(r["per_state"] * r["shell_size"] for r in table), 1.0, abs_tol=1e-12)
+    # kappa -> infinity recovers the null: log BF -> 0.
+    assert abs(ctdm_log_bayes_factor(ctdm["counts"], 1e9)) < 1e-4
+
+    assert validate_hmm_parameters()
+    for p, q in zip(HMM_B[1], null_distance_probabilities()):
+        assert math.isclose(p, q, abs_tol=1e-12)   # MODERATE emission == null
+    hmm = hmm_forward(ctdm["distances"])
+    assert math.isclose(sum(hmm["last_regime_posterior"]), 1.0, abs_tol=1e-10)
+    assert math.isclose(sum(hmm["next_regime"]), 1.0, abs_tol=1e-10)
+    assert math.isclose(sum(hmm["next_distance"]), 1.0, abs_tol=1e-10)
+
+    # Percentile bookkeeping on a sample.
+    res = structural_percentile(history, (1,2,3,4,5), sample=500, rng=random.Random(1))
+    assert 0.0 <= res["u"] <= 1.0
+
+    for bad in [[], [(1,2,3,4,5)] * 9]:
+        try:
+            generate_candidates(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid history length was accepted.")
+    print("[PASS] Johnson shell counts and total universe.")
+    print("[PASS] Radius-two neighbourhood = 4,806 states per anchor.")
+    print("[PASS] Candidate union, deduplication and anchor tracking.")
+    print("[PASS] Structural scores bounded and deterministically sorted.")
+    print("[PASS] Fast universe scorer equals reference scorer.")
+    print("[PASS] Fast null-simulation path equals reference results.")
+    print("[PASS] CTDM normalization, shell probabilities sum to 1, BF -> 0 as kappa grows.")
+    print("[PASS] HMM normalization; MODERATE emission equals the null exactly.")
+    print("[PASS] Percentile routine bounded; invalid histories rejected.")
+    print("Note: executable implementation tests, not predictive validation.")
+
+
+# ------------------------------ INPUT AND MENU ------------------------------
+
+def enter_v03_history():
+    draws = read_draw_list("\nEnter exactly ten draws oldest first; five numbers per line.\n"
+                           "Blank line ends entry.", limit=HISTORY_SIZE)
+    if len(draws) != HISTORY_SIZE:
+        print("LOTMAP analysis requires exactly ten draws.")
+        return
+    analyse(draws, "USER-ENTERED HISTORY — v0.2 TRANSITION VIEW")
+    analyse_v03(draws)
+
+
+def run_demo_v03():
+    demo = DEMO_DRAWS + [
+        (1, 7, 16, 24, 33), (4, 10, 18, 27, 35),
+        (2, 12, 20, 29, 34), (5, 13, 21, 28, 36),
+        (6, 15, 22, 30, 32), (8, 17, 23, 31, 35)
+    ]
+    print("Illustrative data only — these are not actual lottery results.")
+    analyse(demo, "ILLUSTRATIVE TEN-DRAW DEMO — NOT REAL RESULTS")
+    analyse_v03(demo)
+
+
+def audit_menu(replay):
+    if replay:
+        history, realised = EXPERIMENT_HISTORY, EXPERIMENT_REALISED
+    else:
+        history = read_draw_list("\nEnter exactly ten history draws, oldest first.", limit=HISTORY_SIZE)
+        if len(history) != HISTORY_SIZE:
+            print("Exactly ten history draws are required.")
+            return
+        try:
+            realised = read_draw("Realised next draw (five numbers): ")
+        except ValueError as exc:
+            print("Invalid draw:", exc)
+            return
+    raw = input("Exact full-universe rank? y = exact (slow), n = sampled (fast) [n]: ").strip().lower()
+    realised_draw_audit(history, realised, exact=(raw == "y"))
+
+
+def percentile_menu():
+    draws = read_draw_list("\nEnter at least eleven draws oldest first.")
+    if len(draws) < HISTORY_SIZE + 1:
+        print("At least eleven valid draws are required.")
+        return
+    raw = input("States sampled per window (default 20000): ").strip()
+    try:
+        rolling_origin_percentile(draws, int(raw) if raw else 20000)
+    except ValueError as exc:
+        print("Test error:", exc)
+
+
 def main():
     while True:
-        header()
-        print("1. Mathematical framework and ladder")
-        print("2. Run exhaustive verification")
-        print("3. Compare two combinations")
-        print("4. Enter and analyse historical draws")
-        print("5. Run illustrative demo (not real results)")
-        print("6. Simulate independent transitions")
+        v03_header()
+        print("1. Mathematical framework and Johnson ladder (v0.2)")
+        print("2. Run original exhaustive v0.2 verification")
+        print("3. Compare two combinations (v0.2)")
+        print("4. Enter and analyse historical draws (v0.2)")
+        print("5. Run original illustrative demo (four draws)")
+        print("6. Simulate independent transitions (v0.2)")
+        print("7. Run LOTMAP ten-draw reconstruction")
+        print("8. Run implementation verification (v0.4)")
+        print("9. Full-pipeline independent-uniform null simulation")
+        print("10. Rolling-origin top-K backtest")
+        print("11. Audit a realised draw against a ten-draw history")
+        print("12. Rolling-origin PERCENTILE backtest (recommended)")
+        print("13. Replay my experiment (history + draw 2810)")
         print("0. Exit")
         choice = input("\nSelect option: ").strip()
         if choice == "1":
@@ -297,8 +1141,37 @@ def main():
             analyse(DEMO_DRAWS, "ILLUSTRATIVE DEMO — NOT REAL RESULTS")
         elif choice == "6":
             simulate()
+        elif choice == "7":
+            enter_v03_history()
+        elif choice == "8":
+            verify_v03()
+        elif choice == "9":
+            raw = input("Null replications (default 100, max 2000): ").strip()
+            seed_raw = input("Optional random seed (blank = random): ").strip()
+            try:
+                reps = int(raw) if raw else 100
+                seed = int(seed_raw) if seed_raw else None
+                full_pipeline_null_simulation(reps, seed)
+            except ValueError as exc:
+                print("Invalid simulation settings:", exc)
+        elif choice == "10":
+            draws = read_draw_list("Enter at least eleven draws oldest first.")
+            if len(draws) >= HISTORY_SIZE + 1:
+                raw_k = input("Top K (default 100): ").strip()
+                try:
+                    rolling_origin_backtest(draws, int(raw_k) if raw_k else 100)
+                except ValueError as exc:
+                    print("Backtest error:", exc)
+            else:
+                print("At least eleven valid draws are required.")
+        elif choice == "11":
+            audit_menu(False)
+        elif choice == "12":
+            percentile_menu()
+        elif choice == "13":
+            audit_menu(True)
         elif choice == "0":
-            print("LOTMAP closed.")
+            print("LOTMAP v0.4.1 closed.")
             break
         else:
             print("Unknown option.")

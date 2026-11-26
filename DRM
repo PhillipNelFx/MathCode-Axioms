@@ -1,0 +1,2546 @@
+#!/usr/bin/env python3
+"""
+DRM v0.3 (repair pass) — Displacement-Replacement Model
+=======================================================
+
+Standalone numerical research tool. Python 3.8+, stdlib only.
+
+REPAIR PASS NOTES
+-----------------
+This file is the repair-pass build. It is delivered under a new
+filename so the original is not overwritten. On first start it
+creates one-time .pre_repair.bak copies of the data files that
+already exist. Existing archive records are read as-is and are
+NOT reinterpreted under the new event-annotation policy.
+
+CORE EPISTEMIC RULES (unchanged)
+--------------------------------
+* T0 features use only information available at the observation.
+* T1+ outcomes are measured separately using later observations.
+* Live snapshots have no future outcome attached.
+* Similarity, frequencies, and measurements are descriptive only.
+
+REPAIR DELTAS
+-------------
+FIX-1  Menu option X runs the full historical research pass.
+FIX-2  Per-marker event annotation mode; only contemporaneous
+       knowledge enters T0 DNA. Legacy integer markers are read
+       as mode "unknown" and are excluded from T0 DNA.
+FIX-3  Instrument-aware pip size (JPY vs non-JPY). Unknown
+       instruments do not inherit a guessed value. FX pairs only;
+       metals, crypto, indices return None.
+FIX-4  Starting price (single- and multi-candle) is stored
+       separately from the reference anchor. Retracements to
+       anchor and to starting price are reported distinctly and
+       as signed progress toward the reference.
+FIX-5  Multi-candle cumulative displacement and duration are
+       descriptive fields only (no DNA or fingerprint change).
+FIX-6  return_mad_rw window slice corrected.
+FIX-7  Same-dataset distinct episodes may match; a module-level
+       MAX_MATCH_DISTANCE rejects weak matches.
+FIX-8  Optional timestamps; ordering/duplicate validation;
+       explicit oldest-to-newest confirmation when absent.
+FIX-9  Z and E displayed with precise, model-specific meaning.
+
+Live-quote anomaly warning (display only): a provisional
+percentage threshold produces a visible warning when the live
+quote differs unusually from the last completed close. The
+quote is not rejected and neither value is inferred wrong.
+
+MENU
+----
+B — Batch inject historical prices
+E — Annotate historical event positions (per-marker mode)
+R — Historical reconstruction at a selected observation
+L — Live reconstruction from a manually entered MT5 quote
+X — Run full historical research pass (build/update archive)
+H — Historical episode archive
+S — Archive summary
+D — Dataset status
+C — Configuration and DNA registry
+Q — Quit
+"""
+
+import hashlib
+import json
+import math
+import shutil
+import statistics
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "DRM v0.3 (repair pass)"
+MIN_OBSERVATIONS = 90
+MAX_BUFFER_CAPACITY = 150
+DEFAULT_TIMEFRAME = "D1"
+DEFAULT_PRICE_FIELD = "Close"
+EVENT_ANNOTATION_MODES = (
+    "contemporaneous",
+    "retrospective",
+    "unspecified",
+    "unknown",
+)
+EPSILON = 1e-12
+IDENTITY_TAIL = 12
+
+MULTI_CANDLE_WINDOW = 3
+MAX_MATCH_DISTANCE = 2.0
+LIVE_QUOTE_ANOMALY_PCT = 2.0
+BACKUP_SUFFIX = ".pre_repair.bak"
+
+DEFAULT_CONFIG = {
+    "displacement_window": 20,
+    "displacement_threshold": 3.0,
+    "reference_window": 20,
+    "extension_threshold": 2.0,
+    "recent_volatility_window": 10,
+    "baseline_volatility_window": 20,
+    "volatility_ratio_threshold": 1.5,
+    "path_window": 10,
+    "trend_window": 20,
+    "outcome_horizon": 20,
+    "replacement_thresholds": [0.5, 1.0],
+    "minimum_shared_features": 3,
+    "match_count": 3,
+    "z_scale_mode": "level_mad",
+    "min_anchor_distance_moves": 1.0,
+}
+
+DNA_FLAGS = {
+    "DISPLACEMENT": 1,
+    "BELOW_REFERENCE": 2,
+    "ABOVE_REFERENCE": 4,
+    "HIGH_VOLATILITY": 8,
+    "EVENT_CONTEXT": 16,
+    "TREND_ALIGNED": 32,
+    "EXTREME_EXTENSION": 64,
+    "UP_DISPLACEMENT": 128,
+    "DOWN_DISPLACEMENT": 256,
+}
+
+FINGERPRINT_SCALES = {
+    "D": 3.0,
+    "Z": 2.0,
+    "V": 1.5,
+    "E": 1.0,
+    "U": 1.0,
+}
+
+FX_CURRENCIES = frozenset({
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
+    "SEK", "NOK", "DKK", "PLN", "CZK", "HUF", "TRY", "ZAR",
+    "MXN", "SGD", "HKD", "CNH", "CNY", "ILS", "INR", "KRW",
+    "BRL", "RUB", "THB", "MYR", "PHP", "IDR", "TWD",
+})
+
+
+def config_hash(config):
+    encoded = json.dumps(config, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def get_storage_directory():
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        return Path.cwd()
+
+
+STORAGE_DIR = get_storage_directory()
+
+DATASET_FILE = STORAGE_DIR / "drm_v03_dataset.json"
+ARCHIVE_FILE = STORAGE_DIR / "drm_v03_episode_archive.json"
+REPORT_FILE = STORAGE_DIR / "drm_v03_last_report.json"
+LIVE_FILE = STORAGE_DIR / "drm_v03_live_snapshot.json"
+
+
+# ============================================================
+# BACKUP (one-time, per file, never overwrites an existing backup)
+# ============================================================
+
+def ensure_backup(path):
+    if not path.exists():
+        return
+    backup = path.with_suffix(path.suffix + BACKUP_SUFFIX)
+    if backup.exists():
+        return
+    try:
+        shutil.copy2(path, backup)
+        print(f"Backup created: {backup.name}")
+    except OSError as exc:
+        print(f"Warning: could not back up {path.name}: {exc}")
+
+
+def ensure_data_backups():
+    for path in (DATASET_FILE, ARCHIVE_FILE, REPORT_FILE, LIVE_FILE):
+        ensure_backup(path)
+
+
+# ============================================================
+# JSON STORAGE
+# ============================================================
+
+def read_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: could not read {path.name}: {exc}")
+        return default
+
+
+def write_json(path, data):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, allow_nan=False)
+    temporary.replace(path)
+
+
+# ============================================================
+# EVENT POSITION NORMALIZATION
+# ============================================================
+
+def normalize_event_positions(raw):
+    """
+    Normalize to list of {"position": int, "mode": str}.
+
+    Legacy list of ints -> each becomes mode "unknown" (FIX-2).
+    Only mode == "contemporaneous" may enter T0 event-context DNA.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("event_positions must be a list.")
+    result = []
+    for item in raw:
+        if isinstance(item, bool):
+            raise ValueError("Event positions must be integers.")
+        if isinstance(item, int):
+            result.append({"position": item, "mode": "unknown"})
+            continue
+        if isinstance(item, dict):
+            pos = item.get("position")
+            mode = item.get("mode", "unknown")
+            if isinstance(pos, bool) or not isinstance(pos, int):
+                raise ValueError("Event positions must be integers.")
+            if mode not in EVENT_ANNOTATION_MODES:
+                raise ValueError(
+                    f"Unknown event annotation mode: {mode}"
+                )
+            result.append({"position": pos, "mode": mode})
+            continue
+        raise ValueError("Invalid event position entry.")
+    return result
+
+
+def get_contemporaneous_positions(dataset):
+    """Return set of positions whose marker is explicitly contemporaneous."""
+    try:
+        events = normalize_event_positions(
+            dataset.get("event_positions")
+        )
+    except ValueError:
+        return set()
+    return {
+        e["position"] for e in events if e["mode"] == "contemporaneous"
+    }
+
+
+# ============================================================
+# INSTRUMENT-AWARE PIP SIZE (FIX-3)
+# ============================================================
+
+def instrument_pip_size(symbol):
+    """
+    Return the conventional pip size for the instrument, or None
+    if the convention cannot be inferred safely.
+
+    FX pairs (both halves are known currency codes):
+        quote == JPY -> 0.01
+        otherwise    -> 0.0001
+
+    Metals (XAU, XAG, XPT, XPD), crypto (BTC, ETH, ...),
+    indices, and any 6-letter symbol whose halves are not both
+    currencies return None. The caller must supply the size
+    explicitly or skip pip display.
+    """
+    s = str(symbol or "").strip().upper()
+    if len(s) != 6 or not s.isalpha():
+        return None
+    base, quote = s[:3], s[3:]
+    if base not in FX_CURRENCIES or quote not in FX_CURRENCIES:
+        return None
+    if quote == "JPY":
+        return 0.01
+    return 0.0001
+
+
+# ============================================================
+# INPUT, VALIDATION, AND DATASET PERSISTENCE
+# ============================================================
+
+def normalize_price(value):
+    price = float(value)
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("Prices must be finite positive numbers.")
+    return price
+
+
+def instrument_jump_threshold(symbol, default=0.5):
+    """
+    Per-instrument sanity threshold for adjacent log-price jumps.
+    Default retained at 0.5 (audit notes this is permissive; kept
+    for continuity because tightening here is a research decision).
+    """
+    return default
+
+
+def parse_sanity_warnings(prices, limit=None, symbol=None):
+    if limit is None:
+        limit = instrument_jump_threshold(symbol)
+    warnings = []
+    for i in range(1, len(prices)):
+        jump = abs(math.log(prices[i] / prices[i - 1]))
+        if jump > limit:
+            warnings.append((i + 1, prices[i - 1], prices[i]))
+    return warnings
+
+
+def dataset_hash(dataset):
+    canonical = {
+        "symbol": dataset["symbol"].strip().upper(),
+        "timeframe": dataset["timeframe"].strip().upper(),
+        "price_field": dataset["price_field"].strip().lower(),
+        "prices": [format(float(p), ".15g") for p in dataset["prices"]],
+        "timestamps": dataset.get("timestamps"),
+    }
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_dataset(dataset):
+    prices = dataset.get("prices", [])
+
+    if not MIN_OBSERVATIONS <= len(prices) <= MAX_BUFFER_CAPACITY:
+        raise ValueError(
+            f"Expected {MIN_OBSERVATIONS} to {MAX_BUFFER_CAPACITY} "
+            f"prices; received {len(prices)}."
+        )
+
+    for price in prices:
+        normalize_price(price)
+
+    for field in ("symbol", "timeframe", "price_field"):
+        if not str(dataset.get(field, "")).strip():
+            raise ValueError(f"{field} cannot be empty.")
+
+    try:
+        events = normalize_event_positions(
+            dataset.get("event_positions")
+        )
+    except ValueError as exc:
+        raise ValueError(f"Event markers invalid: {exc}")
+
+    for event in events:
+        if event["position"] < 1 or event["position"] > len(prices):
+            raise ValueError(
+                f"Event position {event['position']} is outside "
+                "the dataset."
+            )
+
+    mode = dataset.get("event_annotation_mode", "unspecified")
+    if mode not in EVENT_ANNOTATION_MODES:
+        raise ValueError(f"Unknown event annotation mode: {mode}")
+
+    timestamps = dataset.get("timestamps")
+    if timestamps is not None:
+        if not isinstance(timestamps, list):
+            raise ValueError("timestamps must be a list or null.")
+        if len(timestamps) != len(prices):
+            raise ValueError(
+                "timestamps length must match prices length."
+            )
+        if len(set(timestamps)) != len(timestamps):
+            raise ValueError("Duplicate timestamps detected.")
+
+
+def read_price_block(prompt="Paste daily prices, oldest to newest."):
+    print(prompt)
+    print("Press Enter on an empty line to finish.")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line)
+    return lines
+
+
+def parse_price_lines(lines):
+    prices = []
+    skipped = 0
+    for number, line in enumerate(lines, start=1):
+        normalized = line.replace(",", " ").replace(";", " ")
+        for token in normalized.split():
+            try:
+                value = float(token)
+            except ValueError:
+                if any(char.isdigit() for char in token):
+                    raise ValueError(
+                        f"Line {number}: cannot read '{token}' "
+                        "as a price."
+                    )
+                skipped += 1
+                continue
+            prices.append(normalize_price(value))
+    return prices, skipped
+
+
+def parse_timestamps(raw, expected_count):
+    """
+    Parse optional comma-separated timestamps (FIX-8).
+
+    Returns:
+        None  if the input string is blank.
+        list  of string timestamps otherwise.
+
+    Raises:
+        ValueError if the count differs from expected_count,
+        if duplicates are present, or if every entry parses as
+        an ISO datetime and the sequence is not strictly
+        ascending.
+
+    If not every entry parses as ISO, the raw strings are
+    returned without an order check (opaque labels cannot be
+    ordered).
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    parts = [p.strip() for p in text.replace(";", ",").split(",")]
+    parts = [p for p in parts if p]
+    if len(parts) != expected_count:
+        raise ValueError(
+            f"Expected {expected_count} timestamps; got "
+            f"{len(parts)}. Provide one timestamp per historical "
+            "observation, or leave blank to skip."
+        )
+    if len(set(parts)) != len(parts):
+        raise ValueError("Duplicate timestamps detected.")
+    try:
+        parsed = [datetime.fromisoformat(p) for p in parts]
+    except ValueError:
+        return parts
+    for i in range(1, len(parsed)):
+        if parsed[i] <= parsed[i - 1]:
+            raise ValueError(
+                f"Timestamps not strictly ascending at index "
+                f"{i + 1}."
+            )
+    return parts
+
+
+def collect_dataset():
+    print("\n=== B | BATCH INJECT HISTORICAL DATA ===")
+    print(
+        f"Accepted range: {MIN_OBSERVATIONS}–"
+        f"{MAX_BUFFER_CAPACITY} daily closes."
+    )
+
+    previous = read_json(DATASET_FILE, {}) or {}
+    default_symbol = str(previous.get("symbol", "")).strip().upper()
+
+    if default_symbol:
+        symbol = (
+            input(f"Instrument [{default_symbol}]: ").strip().upper()
+            or default_symbol
+        )
+    else:
+        symbol = input("Instrument (e.g. USDCAD): ").strip().upper()
+
+    if not symbol:
+        print("Rejected: instrument cannot be empty.")
+        return None
+
+    lines = read_price_block()
+    try:
+        prices, skipped = parse_price_lines(lines)
+    except ValueError as exc:
+        print(f"Dataset rejected: {exc}")
+        return None
+
+    if skipped:
+        print(
+            f"Skipped {skipped} non-numeric text item(s), "
+            "such as headers."
+        )
+
+    if not MIN_OBSERVATIONS <= len(prices) <= MAX_BUFFER_CAPACITY:
+        print(
+            f"Dataset rejected: received {len(prices)} prices; "
+            "expected 90–150."
+        )
+        return None
+
+    suspicious = parse_sanity_warnings(prices, symbol=symbol)
+    if suspicious:
+        print("\nWARNING: unusually large one-step jumps detected:")
+        for position, before, after in suspicious[:5]:
+            print(f"  observation {position}: {before} -> {after}")
+        print("Check for a decimal-comma or pasted-data problem.")
+        if (
+            input("Keep this dataset anyway? [y/N]: ").strip().lower()
+            != "y"
+        ):
+            print("Dataset rejected.")
+            return None
+
+    preview = ", ".join(f"{p:.8g}" for p in prices[-5:])
+    print(f"\nLast 5 prices (newest last): {preview}")
+
+    ts_raw = input(
+        "Optional timestamps (comma-separated, oldest first, "
+        "one per observation, blank to skip): "
+    )
+    try:
+        timestamps = parse_timestamps(ts_raw, len(prices))
+    except ValueError as exc:
+        print(f"Dataset rejected: {exc}")
+        return None
+
+    if timestamps is None:
+        print(
+            "No timestamps provided. Chronology cannot be "
+            "independently verified."
+        )
+        if (
+            input(
+                "Confirm the list is oldest-to-newest? [y/N]: "
+            ).strip().lower()
+            != "y"
+        ):
+            print("Dataset rejected.")
+            return None
+
+    dataset = {
+        "version": VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "timeframe": DEFAULT_TIMEFRAME,
+        "price_field": DEFAULT_PRICE_FIELD,
+        "prices": prices,
+        "timestamps": timestamps,
+        "event_positions": [],
+        "event_annotation_mode": "unspecified",
+    }
+
+    try:
+        validate_dataset(dataset)
+    except ValueError as exc:
+        print(f"Dataset rejected: {exc}")
+        return None
+
+    dataset["dataset_hash"] = dataset_hash(dataset)
+    write_json(DATASET_FILE, dataset)
+
+    print(
+        f"\nAccepted {len(prices)} closes for {symbol} (D1 Close)."
+    )
+    print(f"First: {prices[0]:.8g} | Last: {prices[-1]:.8g}")
+    print(f"Dataset hash: {dataset['dataset_hash']}")
+    print(
+        "Historical event markers were reset because a new "
+        "price series was loaded."
+    )
+    return dataset
+
+
+def load_current_dataset():
+    dataset = read_json(DATASET_FILE, None)
+    if not dataset:
+        return None
+    try:
+        validate_dataset(dataset)
+        if dataset.get("dataset_hash") != dataset_hash(dataset):
+            print("Stored dataset hash mismatch; dataset rejected.")
+            return None
+        dataset.setdefault("event_annotation_mode", "unspecified")
+        dataset["event_positions"] = normalize_event_positions(
+            dataset.get("event_positions")
+        )
+        return dataset
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        print(f"Stored dataset is invalid: {exc}")
+        return None
+
+
+def edit_event_markers():
+    dataset = load_current_dataset()
+    if dataset is None:
+        print("No valid dataset. Use B first.")
+        return
+
+    count = len(dataset["prices"])
+
+    print("\n=== E | ANNOTATE HISTORICAL EVENTS (per-marker mode) ===")
+    current = dataset.get("event_positions") or []
+    if current:
+        pretty = ", ".join(
+            f"{e['position']}:{e['mode'][0]}" for e in current
+        )
+    else:
+        pretty = "none"
+    print(f"Current event markers: {pretty}")
+    print(f"Use 1-based observation positions from 1 to {count}.")
+    print("Example positions: 15,36,67. Blank clears all markers.")
+
+    raw = input("Event positions: ").strip()
+
+    try:
+        positions = sorted({
+            int(part)
+            for part in raw.replace(" ", "").split(",")
+            if part
+        })
+    except ValueError:
+        print("Invalid positions; nothing changed.")
+        return
+
+    entries = []
+    if positions:
+        print(
+            "For each position, choose mode: "
+            "c=contemporaneous, r=retrospective, "
+            "u=unspecified"
+        )
+        for position in positions:
+            choice = input(
+                f"  position {position} mode [u]: "
+            ).strip().lower()
+            mode = {
+                "c": "contemporaneous",
+                "r": "retrospective",
+                "u": "unspecified",
+                "": "unspecified",
+            }.get(choice)
+            if mode is None:
+                print(
+                    f"Invalid mode for position {position}; "
+                    "nothing changed."
+                )
+                return
+            entries.append({"position": position, "mode": mode})
+
+    dataset["event_positions"] = entries
+    dataset["event_annotation_mode"] = "unspecified"
+
+    try:
+        validate_dataset(dataset)
+    except ValueError as exc:
+        print(f"Rejected: {exc}")
+        return
+
+    write_json(DATASET_FILE, dataset)
+
+    if entries:
+        print("Saved event markers:")
+        for entry in entries:
+            print(f"  position {entry['position']} -> {entry['mode']}")
+    else:
+        print("Saved event markers: none")
+
+    print(
+        "Only 'contemporaneous' markers enter T0 event-context DNA. "
+        "Retrospective and unspecified/unknown markers are retained "
+        "for T1+ analysis only."
+    )
+
+
+# ============================================================
+# NUMERICAL UTILITIES
+# ============================================================
+
+def sign(value):
+    return 1 if value > 0 else (-1 if value < 0 else 0)
+
+
+def median_or_none(values):
+    return statistics.median(values) if values else None
+
+
+def mad_scale(values):
+    if len(values) < 2:
+        return None
+    center = statistics.median(values)
+    scale = 1.4826 * statistics.median(
+        [abs(x - center) for x in values]
+    )
+    return None if scale <= EPSILON else scale
+
+
+def standard_deviation_or_none(values):
+    if len(values) < 2:
+        return None
+    value = statistics.pstdev(values)
+    return None if value <= EPSILON else value
+
+
+def safe_ratio(numerator, denominator):
+    if (
+        numerator is None
+        or denominator is None
+        or abs(denominator) <= EPSILON
+    ):
+        return None
+    return numerator / denominator
+
+
+def log_returns(prices):
+    returns = [None]
+    for i in range(1, len(prices)):
+        returns.append(math.log(prices[i] / prices[i - 1]))
+    return returns
+
+
+def hamming_distance(a, b):
+    return bin(int(a) ^ int(b)).count("1")
+
+
+# ============================================================
+# T0 FEATURE RECONSTRUCTION
+# ============================================================
+
+def reference_scale(prior_logs, returns, index, config):
+    """
+    Scale for Z.
+
+    level_mad    : robust level scale (default).
+    return_mad_rw: robust return scale * sqrt(sum((m/n)^2)).
+
+    FIX-6: the return slice for return_mad_rw uses exactly `n`
+    prior completed returns, matching the D window convention.
+    """
+    mode = config["z_scale_mode"]
+
+    if mode == "level_mad":
+        return mad_scale(prior_logs)
+
+    if mode == "return_mad_rw":
+        n = config["reference_window"]
+        window_returns = [
+            value
+            for value in returns[max(1, index - n):index]
+            if value is not None
+        ]
+        if len(window_returns) < n:
+            return None
+        sigma = mad_scale(window_returns)
+        if sigma is None:
+            return None
+        return sigma * math.sqrt(
+            sum((m / n) ** 2 for m in range(1, n + 1))
+        )
+
+    raise ValueError(f"Unknown z_scale_mode: {mode}")
+
+
+def calculate_features(prices, index, config):
+    """
+    T0 features. Only prices[0:index+1] are read.
+
+    Added in repair pass (FIX-4, FIX-5), descriptive only:
+        start_price_single, start_price_multi
+        multi_window_return, multi_window_duration
+        direction_run
+    """
+    if index < 1:
+        return None
+
+    observed = prices[:index + 1]
+    logs = [math.log(p) for p in observed]
+    returns = log_returns(observed)
+    current_return = returns[index]
+
+    d_window = config["displacement_window"]
+    z_window = config["reference_window"]
+    recent_window = config["recent_volatility_window"]
+    baseline_window = config["baseline_volatility_window"]
+    path_window = config["path_window"]
+    trend_window = config["trend_window"]
+
+    features = {
+        "index": index,
+        "price": prices[index],
+        "return": current_return,
+        "D": None,
+        "Z": None,
+        "V": None,
+        "E": None,
+        "U": sign(current_return),
+        "e": None,
+        "baseline_abs_return": None,
+        "reference_log_mean": None,
+        "reference_price": None,
+        "trend_direction": 0,
+        "event_context": False,
+        "start_price_single": None,
+        "start_price_multi": None,
+        "multi_window_return": None,
+        "multi_window_duration": None,
+        "direction_run": 0,
+    }
+
+    prior_returns = [
+        v
+        for v in returns[max(1, index - d_window):index]
+        if v is not None
+    ]
+    if len(prior_returns) >= d_window:
+        baseline = median_or_none([abs(v) for v in prior_returns])
+        features["baseline_abs_return"] = baseline
+        features["D"] = safe_ratio(abs(current_return), baseline)
+
+    prior_logs = logs[max(0, index - z_window):index]
+    if len(prior_logs) >= z_window:
+        center = statistics.fmean(prior_logs)
+        features["reference_log_mean"] = center
+        features["reference_price"] = math.exp(center)
+        features["e"] = logs[index] - center
+        scale = reference_scale(prior_logs, returns, index, config)
+        if scale is not None:
+            features["Z"] = features["e"] / scale
+
+    recent_start = max(1, index - recent_window + 1)
+    recent = [
+        v for v in returns[recent_start:index + 1] if v is not None
+    ]
+    baseline_end = recent_start
+    baseline_start = max(1, baseline_end - baseline_window)
+    baseline_returns = [
+        v
+        for v in returns[baseline_start:baseline_end]
+        if v is not None
+    ]
+    if (
+        len(recent) >= recent_window
+        and len(baseline_returns) >= baseline_window
+    ):
+        features["V"] = safe_ratio(
+            standard_deviation_or_none(recent),
+            standard_deviation_or_none(baseline_returns),
+        )
+
+    if index >= path_window:
+        segment = prices[index - path_window:index + 1]
+        path_length = sum(
+            abs(segment[j] - segment[j - 1])
+            for j in range(1, len(segment))
+        )
+        net_move = abs(segment[-1] - segment[0])
+        if path_length > EPSILON:
+            features["E"] = min(1.0, net_move / path_length)
+
+    prior_trend = logs[max(0, index - trend_window):index]
+    if len(prior_trend) >= trend_window:
+        features["trend_direction"] = sign(
+            prior_trend[-1] - prior_trend[0]
+        )
+
+    if index >= 1:
+        features["start_price_single"] = prices[index - 1]
+
+    if index >= MULTI_CANDLE_WINDOW:
+        start_multi = prices[index - MULTI_CANDLE_WINDOW]
+        features["start_price_multi"] = start_multi
+        features["multi_window_return"] = math.log(
+            prices[index] / start_multi
+        )
+        features["multi_window_duration"] = MULTI_CANDLE_WINDOW
+
+    run = 0
+    j = index
+    while j >= 1:
+        r = returns[j]
+        if r is None or r == 0:
+            break
+        if run == 0:
+            run = 1
+            prev_sign = sign(r)
+            j -= 1
+            continue
+        if sign(r) == prev_sign:
+            run += 1
+            j -= 1
+        else:
+            break
+    features["direction_run"] = run
+
+    return features
+
+
+def build_dna(features, contemporaneous_positions, config):
+    """
+    FIX-2: only explicitly contemporaneous event positions count
+    toward EVENT_CONTEXT in T0 DNA.
+    """
+    dna = 0
+
+    index = features["index"]
+    displacement_ratio = features["D"]
+    z_score = features["Z"]
+    extension = features["e"]
+    volatility = features["V"]
+    direction = features["U"]
+    trend = features["trend_direction"]
+
+    displacement = (
+        displacement_ratio is not None
+        and displacement_ratio >= config["displacement_threshold"]
+    )
+
+    conditions = {
+        "DISPLACEMENT": displacement,
+        "BELOW_REFERENCE": extension is not None and extension < 0,
+        "ABOVE_REFERENCE": extension is not None and extension > 0,
+        "HIGH_VOLATILITY": (
+            volatility is not None
+            and volatility >= config["volatility_ratio_threshold"]
+        ),
+        "EVENT_CONTEXT": (index + 1) in contemporaneous_positions,
+        "TREND_ALIGNED": (
+            direction != 0 and trend != 0 and direction == trend
+        ),
+        "EXTREME_EXTENSION": (
+            z_score is not None
+            and abs(z_score) >= config["extension_threshold"]
+        ),
+        "UP_DISPLACEMENT": displacement and direction > 0,
+        "DOWN_DISPLACEMENT": displacement and direction < 0,
+    }
+
+    for name, condition in conditions.items():
+        if condition:
+            dna |= DNA_FLAGS[name]
+
+    return dna
+
+
+def decode_dna(dna):
+    return [
+        name
+        for name, value in DNA_FLAGS.items()
+        if dna & value
+    ]
+
+
+def build_fingerprint(features):
+    return {
+        name: features.get(name)
+        for name in ("D", "Z", "V", "E", "U")
+    }
+
+
+# ============================================================
+# T1+ OUTCOME MEASUREMENT
+# ============================================================
+
+def classify_outcome(max_q, max_continuation):
+    tags = []
+    if max_continuation > 0:
+        tags.append("further_displacement")
+    if max_q <= 0:
+        tags.append("no_movement_toward_anchor")
+    elif max_q < 1.0:
+        tags.append("partial_replacement_only")
+    else:
+        tags.append("reached_anchor")
+        if max_q > 1.0:
+            tags.append("overshoot")
+    return tags
+
+
+def compute_retracement_ratio(endpoint, reference, futures):
+    """
+    Signed maximum progress toward `reference` over `futures`.
+
+    Sign convention:
+        > 0 -> future price moved toward the reference
+        = 0 -> no net progress
+        < 0 -> future price only moved farther from the reference
+
+    1.0 means the reference is reached; > 1.0 means overshoot.
+
+    Returns None if the reference is missing or coincides with
+    the endpoint (degenerate distance).
+    """
+    if reference is None:
+        return None
+    distance = abs(endpoint - reference)
+    if distance <= EPSILON:
+        return None
+    direction = sign(endpoint - reference)
+    if direction == 0:
+        return None
+    best = None
+    for future in futures:
+        q = direction * (endpoint - future) / distance
+        if best is None or q > best:
+            best = q
+    return best
+
+
+def calculate_outcome(prices, index, features, config):
+    anchor = features.get("reference_price")
+    endpoint = prices[index]
+
+    if anchor is None:
+        return {
+            "status": "unavailable",
+            "reason": "Insufficient reference history",
+        }
+
+    distance = abs(endpoint - anchor)
+    direction = sign(endpoint - anchor)
+
+    if distance <= EPSILON or direction == 0:
+        return {
+            "status": "unavailable",
+            "reason": "Displacement from anchor is too small",
+        }
+
+    floor = config.get("min_anchor_distance_moves")
+    if floor is not None:
+        baseline = features.get("baseline_abs_return")
+        offset = features.get("e")
+        if (
+            baseline is None
+            or offset is None
+            or abs(offset) < floor * baseline
+        ):
+            return {
+                "status": "unavailable",
+                "reason": (
+                    f"Endpoint is within {floor} typical daily "
+                    "move(s) of the anchor; ratios are unstable"
+                ),
+            }
+
+    requested = config["outcome_horizon"]
+    available = min(requested, len(prices) - index - 1)
+
+    if available <= 0:
+        return {
+            "status": "right_censored",
+            "reason": "No later observations",
+            "available_horizon": 0,
+            "requested_horizon": requested,
+        }
+
+    q_values = []
+    continuation_values = []
+    futures = []
+
+    for horizon in range(1, available + 1):
+        future = prices[index + horizon]
+        futures.append(future)
+        q_value = direction * (endpoint - future) / distance
+        continuation_value = direction * (future - endpoint) / distance
+        q_values.append(q_value)
+        continuation_values.append(continuation_value)
+
+    replacement_times = {}
+    for threshold in config["replacement_thresholds"]:
+        first_hit = next(
+            (
+                horizon
+                for horizon, q_value in enumerate(q_values, 1)
+                if q_value >= threshold
+            ),
+            None,
+        )
+        replacement_times[str(threshold)] = {
+            "observed": first_hit is not None,
+            "h": first_hit,
+            "observed_horizon": available,
+        }
+
+    max_q = max(q_values)
+    max_continuation = max(0.0, max(continuation_values))
+
+    result = {
+        "status": (
+            "complete" if available == requested else "right_censored"
+        ),
+        "anchor_price": anchor,
+        "endpoint_price": endpoint,
+        "displacement_size": distance,
+        "direction": direction,
+        "requested_horizon": requested,
+        "available_horizon": available,
+        "q_at_last_observation": q_values[-1],
+        "max_replacement": max_q,
+        "max_continuation": max_continuation,
+        "replacement_times": replacement_times,
+        "outcome_tags": classify_outcome(max_q, max_continuation),
+        "q_values": q_values,
+    }
+
+    start_single = features.get("start_price_single")
+    start_multi = features.get("start_price_multi")
+    result["start_price_single"] = start_single
+    result["start_price_multi"] = start_multi
+    result["retracement_to_start_single"] = compute_retracement_ratio(
+        endpoint, start_single, futures
+    )
+    result["retracement_to_start_multi"] = compute_retracement_ratio(
+        endpoint, start_multi, futures
+    )
+
+    return result
+
+
+def outcome_summary(outcome):
+    keys = (
+        "status",
+        "available_horizon",
+        "requested_horizon",
+        "max_replacement",
+        "max_continuation",
+        "replacement_times",
+        "outcome_tags",
+        "retracement_to_start_single",
+        "retracement_to_start_multi",
+    )
+    return {key: outcome.get(key) for key in keys}
+
+
+# ============================================================
+# HISTORICAL ARCHIVE AND MATCHING
+# ============================================================
+
+def make_episode_key(dataset, index, config_hash_value):
+    start = max(0, index - IDENTITY_TAIL + 1)
+    window = [
+        format(float(price), ".15g")
+        for price in dataset["prices"][start:index + 1]
+    ]
+    canonical = {
+        "config": config_hash_value,
+        "symbol": dataset["symbol"].strip().upper(),
+        "timeframe": dataset["timeframe"].strip().upper(),
+        "price_field": dataset["price_field"].strip().lower(),
+        "window": window,
+    }
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def numerical_fingerprint_distance(current, historical, config):
+    current_fp = current.get("fingerprint", {})
+    historical_fp = historical.get("fingerprint", {})
+
+    squared_distance = 0.0
+    shared = 0
+
+    for name in ("D", "Z", "V", "E", "U"):
+        a = current_fp.get(name)
+        b = historical_fp.get(name)
+        if a is None or b is None:
+            continue
+        squared_distance += (
+            (float(a) - float(b)) / FINGERPRINT_SCALES[name]
+        ) ** 2
+        shared += 1
+
+    if shared < config["minimum_shared_features"]:
+        return None, shared
+
+    distance = math.sqrt(squared_distance / shared)
+    return distance, shared
+
+
+def historical_matches(current, archive, config):
+    """
+    FIX-7: same-dataset distinct episodes may match; weak matches
+    beyond MAX_MATCH_DISTANCE are rejected. Overlap risk between
+    episodes from the same series is documented via the
+    `same_dataset` flag, not silently hidden.
+
+    A passing threshold does NOT establish that the candidate
+    episode and the current episode will share outcomes. It only
+    reports that their T0 fingerprints are numerically close
+    under the configured scaling. Outcome equivalence is not
+    implied.
+    """
+    direction = current["features"]["U"]
+
+    eligible = [
+        item
+        for item in archive
+        if item.get("dna") is not None
+        and item.get("config_hash") == current["config_hash"]
+        and item.get("episode_key") != current["episode_key"]
+    ]
+
+    compatible = [
+        item
+        for item in eligible
+        if (
+            direction != 0
+            and item.get("features", {}).get("U") == direction
+        )
+    ]
+
+    pool = compatible if compatible else eligible
+    mode = "direction-compatible" if compatible else "exploratory"
+
+    candidates = []
+    for item in pool:
+        distance, shared = numerical_fingerprint_distance(
+            current, item, config
+        )
+        if distance is None:
+            continue
+        if distance > MAX_MATCH_DISTANCE:
+            continue
+        candidates.append({
+            "episode_id": item.get("episode_id", "unknown"),
+            "symbol": item.get("symbol", "?"),
+            "distance": distance,
+            "hamming": hamming_distance(
+                current["dna"], item["dna"]
+            ),
+            "shared_features": shared,
+            "compatibility": mode,
+            "same_dataset": (
+                item.get("dataset_hash")
+                == current.get("dataset_hash")
+            ),
+            "outcome": outcome_summary(item.get("outcome", {})),
+        })
+
+    candidates.sort(key=lambda x: (x["distance"], x["hamming"]))
+    return candidates[:config["match_count"]]
+
+
+def merge_into_archive(archive, episodes):
+    positions = {
+        record.get("episode_key"): i
+        for i, record in enumerate(archive)
+    }
+
+    added = 0
+    upgraded = 0
+    unchanged = 0
+    notes = []
+
+    for episode in episodes:
+        stored = {
+            k: v
+            for k, v in episode.items()
+            if k != "historical_matches"
+        }
+        position = positions.get(episode["episode_key"])
+
+        if position is None:
+            archive.append(stored)
+            positions[episode["episode_key"]] = len(archive) - 1
+            added += 1
+            continue
+
+        old = archive[position]
+
+        if (
+            (old["dna"] ^ episode["dna"])
+            & DNA_FLAGS["EVENT_CONTEXT"]
+        ):
+            notes.append(
+                f"{old.get('episode_id')}: event marker differs; "
+                "archived T0 kept."
+            )
+
+        old_horizon = (old.get("outcome") or {}).get(
+            "available_horizon", 0
+        )
+        new_horizon = episode["outcome"].get("available_horizon", 0)
+
+        if new_horizon > old_horizon:
+            old["outcome"] = episode["outcome"]
+            old["outcome_updated_utc"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            old["outcome_source_dataset_hash"] = episode["dataset_hash"]
+            upgraded += 1
+        else:
+            unchanged += 1
+
+    return added, upgraded, unchanged, notes
+
+
+# ============================================================
+# ASCII DISPLAY HELPERS
+# ============================================================
+
+def bar(value, maximum, width=24,
+        positive_char="#", negative_char="-"):
+    if value is None:
+        return "N/A"
+    if not math.isfinite(float(value)):
+        return "N/A"
+    if maximum <= 0:
+        return " " * width
+    count = min(
+        width,
+        int(round(min(abs(value) / maximum, 1.0) * width)),
+    )
+    character = positive_char if value >= 0 else negative_char
+    return character * count + "." * (width - count)
+
+
+def fmt(value, digits=4):
+    if value is None:
+        return "N/A"
+    try:
+        if not math.isfinite(float(value)):
+            return "N/A"
+        return f"{value:.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def ascii_anchor_position(price, anchor, width=40):
+    if anchor is None or price is None or anchor <= 0:
+        print(
+            "  Position: unavailable (reference anchor not available)"
+        )
+        return
+    if price == anchor:
+        anchor_position = price_position = width // 2
+    elif price > anchor:
+        anchor_position = 8
+        price_position = min(
+            width - 1, 8 + max(1, int(width * 0.72))
+        )
+    else:
+        anchor_position = width - 9
+        price_position = max(
+            0, width - 9 - max(1, int(width * 0.72))
+        )
+    characters = ["-"] * width
+    characters[anchor_position] = "A"
+    characters[price_position] = "P"
+    print("  " + "".join(characters))
+    print("  " + " " * anchor_position + "A = anchor")
+    print("  " + " " * price_position + "P = current price")
+    side = (
+        "ABOVE"
+        if price > anchor
+        else ("BELOW" if price < anchor else "AT")
+    )
+    print(f"  Current quote is {side} the reference anchor.")
+
+
+def print_measurement_bars(features):
+    """
+    FIX-9: precise, model-specific labels for Z and E.
+    """
+    d = features.get("D")
+    z = features.get("Z")
+    v = features.get("V")
+    e = features.get("E")
+
+    print("\nMEASUREMENTS — ASCII SCALE "
+          "(bars are relative visual aids)")
+
+    print(
+        "  D displacement ratio  : "
+        + (
+            f"{fmt(d, 2)}  [{bar(d, 6)}]"
+            if d is not None
+            else "N/A (insufficient history)"
+        )
+    )
+
+    print(
+        "  Z standardized offset : "
+        + (
+            f"{fmt(z, 2)}  [{bar(z, 4)}]"
+            if z is not None
+            else "N/A (scale unavailable)"
+        )
+    )
+    print(
+        "      Z is a model-specific reference-relative "
+        "offset, not a probability or a conventional "
+        "return z-score."
+    )
+
+    print(
+        "  V relative volatility : "
+        + (
+            f"{fmt(v, 2)}  [{bar(v - 1, 2)}] "
+            "(center = 1.0 baseline)"
+            if v is not None
+            else "N/A (insufficient history)"
+        )
+    )
+
+    print(
+        "  E path efficiency     : "
+        + (
+            f"{fmt(e, 2)}  [{bar(e, 1)}]"
+            if e is not None
+            else "N/A (insufficient history)"
+        )
+    )
+    print(
+        "      E measures directness of the recent path "
+        "(0 = oscillatory, 1 = direct). It is not a "
+        "replacement measure."
+    )
+
+    ms = features.get("start_price_single")
+    mm = features.get("start_price_multi")
+    mwr = features.get("multi_window_return")
+    mwd = features.get("multi_window_duration")
+    dr = features.get("direction_run")
+
+    if ms is not None or mm is not None:
+        print("\n  Descriptive starting prices (FIX-4, FIX-5):")
+        print(
+            f"    start_price_single (previous close): "
+            f"{fmt(ms, 8)}"
+        )
+        print(
+            f"    start_price_multi  (close {MULTI_CANDLE_WINDOW} "
+            f"back)          : {fmt(mm, 8)}"
+        )
+        print(
+            f"    multi_window_return (log)          : "
+            f"{fmt(mwr, 6)}"
+        )
+        print(
+            f"    multi_window_duration (candles)    : "
+            f"{mwd if mwd is not None else 'N/A'}"
+        )
+        print(
+            f"    direction_run (consecutive candles): "
+            f"{dr if dr is not None else 0}"
+        )
+
+
+def print_outcome_visual(outcome):
+    print("\nT1+ OUTCOME VISUAL — OBSERVED AFTER T0")
+
+    if outcome.get("status") == "unavailable":
+        print(
+            "  Outcome: unavailable — "
+            + outcome.get("reason", "reason not supplied")
+        )
+        return
+
+    available = outcome.get("available_horizon", 0)
+    requested = outcome.get("requested_horizon", 0)
+
+    if available <= 0:
+        print(
+            f"  Outcome: {outcome.get('status')} "
+            f"(0/{requested} future observations)"
+        )
+        return
+
+    q = outcome.get("max_replacement")
+    continuation = outcome.get("max_continuation")
+
+    print(
+        f"  Follow-up: {available}/{requested} observations "
+        f"| status={outcome.get('status')}"
+    )
+
+    print(
+        f"  Signed max progress toward anchor   : {fmt(q, 3)}  "
+        f"[{bar(q, 1.5, 28)}]"
+    )
+    print(
+        "       Sign convention: positive = moved toward the "
+        "reference; 0 = no net progress; negative = only moved "
+        "further away. 1.0 = reference reached; >1 = overshoot."
+    )
+
+    rs = outcome.get("retracement_to_start_single")
+    rm = outcome.get("retracement_to_start_multi")
+
+    print(
+        f"  Signed max progress toward single-candle start : "
+        f"{fmt(rs, 3)}"
+    )
+    print(
+        f"  Signed max progress toward multi-candle start  : "
+        f"{fmt(rm, 3)}"
+    )
+    print(
+        "       Same sign convention. Each is measured against "
+        "its own start price, not against the anchor."
+    )
+
+    print(
+        f"  Max continuation ratio               : "
+        f"{fmt(continuation, 3)}  [{bar(continuation, 1.5, 28)}]"
+    )
+
+    for threshold, info in outcome.get(
+        "replacement_times", {}
+    ).items():
+        if info.get("observed"):
+            print(
+                f"  q={threshold} first reached at h={info.get('h')}"
+            )
+        else:
+            print(
+                f"  q={threshold} not observed within "
+                f"{info.get('observed_horizon')} observed step(s)"
+            )
+
+    print("  Tags: " + ", ".join(outcome.get("outcome_tags", [])))
+
+
+# ============================================================
+# HISTORICAL EPISODES
+# ============================================================
+
+def print_episode(number, episode):
+    features = episode["features"]
+    outcome = episode["outcome"]
+
+    print("\n" + "-" * 66)
+    print(
+        f"EPISODE {number}: {episode['episode_id']} "
+        f"| observation {episode['observation_number']}"
+    )
+    print(f"Endpoint price: {episode['price']:.8g}")
+    print(
+        f"DNA: {episode['dna']} "
+        f"({', '.join(episode['flags']) or 'no flags'})"
+    )
+
+    print("\nT0 fingerprint (features known at this observation):")
+    for key in ("D", "Z", "V", "E", "U"):
+        print(f"  {key}: {fmt(features.get(key), 5)}")
+
+    print(
+        f"  Anchor: {fmt(features.get('reference_price'), 8)}"
+        f" | e: {fmt(features.get('e'), 7)}"
+    )
+
+    print_measurement_bars(features)
+    print_outcome_visual(outcome)
+
+    matches = episode.get("historical_matches", [])
+
+    print("\nHistorical matches (ranked on T0 features only):")
+    if not matches:
+        print(
+            "  No sufficiently similar archived episode found "
+            f"(rejection threshold = {MAX_MATCH_DISTANCE:.2f})."
+        )
+        return
+
+    for match in matches:
+        result = match["outcome"]
+        if result.get("available_horizon") is not None:
+            horizon = (
+                f"{result.get('available_horizon')}/"
+                f"{result.get('requested_horizon')}"
+            )
+        else:
+            horizon = "n/a"
+
+        same = " | same-dataset" if match.get("same_dataset") else ""
+
+        print(
+            f"  {match['episode_id']} | {match['symbol']} "
+            f"| distance={match['distance']:.4f} "
+            f"| Hamming={match['hamming']} "
+            f"| shared={match['shared_features']} "
+            f"| {match['compatibility']}{same}"
+        )
+        print(
+            f"    outcome={result.get('status')} ({horizon}) "
+            f"| tags={result.get('outcome_tags') or ['none']}"
+        )
+
+    complete = sum(
+        1
+        for match in matches
+        if match["outcome"].get("status") == "complete"
+    )
+    print(
+        f"  Complete outcomes among matches: {complete}/{len(matches)}. "
+        "Similarity is not a forecast, and a passing threshold does "
+        "not imply that outcomes will match."
+    )
+
+
+def build_episode(dataset, index, features, dna,
+                  config_hash_value, data_hash, archive, config):
+    key = make_episode_key(dataset, index, config_hash_value)
+
+    episode = {
+        "episode_id": f"{key[:10]}-P{index + 1:03d}",
+        "episode_key": key,
+        "dataset_hash": data_hash,
+        "config_hash": config_hash_value,
+        "version": VERSION,
+        "symbol": dataset["symbol"],
+        "timeframe": dataset["timeframe"],
+        "price_field": dataset["price_field"],
+        "observation_number": index + 1,
+        "price": dataset["prices"][index],
+        "features": features,
+        "fingerprint": build_fingerprint(features),
+        "dna": dna,
+        "flags": decode_dna(dna),
+        "event_annotation_mode": (
+            "contemporaneous"
+            if features.get("event_context")
+            else None
+        ),
+        "outcome": calculate_outcome(
+            dataset["prices"], index, features, config
+        ),
+    }
+
+    episode["historical_matches"] = historical_matches(
+        episode, archive, config
+    )
+    return episode
+
+
+def run_research(dataset):
+    validate_dataset(dataset)
+
+    prices = dataset["prices"]
+    contemporaneous = get_contemporaneous_positions(dataset)
+    config = dict(DEFAULT_CONFIG)
+
+    config_digest = config_hash(config)
+    data_digest = dataset["dataset_hash"]
+
+    archive_data = read_json(ARCHIVE_FILE, {"episodes": []})
+    archive = archive_data.get("episodes", [])
+
+    print("\n" + "=" * 66)
+    print(f"{VERSION} — HISTORICAL RESEARCH REPORT")
+    print("=" * 66)
+    print(
+        f"Instrument: {dataset['symbol']} "
+        f"| Timeframe: {dataset['timeframe']} "
+        f"| Field: {dataset['price_field']}"
+    )
+    print(
+        f"Observations: {len(prices)} "
+        f"| Contemporaneous markers: "
+        f"{sorted(contemporaneous) if contemporaneous else 'None'}"
+    )
+    print(
+        f"Dataset hash: {data_digest} | Config hash: {config_digest}"
+    )
+
+    states = []
+    episodes = []
+
+    for index in range(len(prices)):
+        features = calculate_features(prices, index, config)
+        if features is None:
+            continue
+        features["event_context"] = (
+            index + 1
+        ) in contemporaneous
+        dna = build_dna(features, contemporaneous, config)
+        states.append({
+            "index": index,
+            "price": prices[index],
+            "features": features,
+            "dna": dna,
+            "flags": decode_dna(dna),
+            "fingerprint": build_fingerprint(features),
+        })
+        if dna & DNA_FLAGS["DISPLACEMENT"]:
+            episodes.append(
+                build_episode(
+                    dataset, index, features, dna,
+                    config_digest, data_digest, archive, config,
+                )
+            )
+
+    print(f"\nStates reconstructed: {len(states)}")
+    print(f"Displacement episodes: {len(episodes)}")
+
+    if not episodes:
+        print(
+            "No observations crossed the current displacement "
+            "threshold. This is a valid result."
+        )
+
+    for number, episode in enumerate(episodes, 1):
+        print_episode(number, episode)
+
+    added, upgraded, unchanged, notes = merge_into_archive(
+        archive, episodes
+    )
+
+    write_json(
+        ARCHIVE_FILE,
+        {"version": VERSION, "episodes": archive},
+    )
+
+    print(
+        f"\nArchive update: {added} added, "
+        f"{upgraded} outcome(s) upgraded, {unchanged} unchanged."
+    )
+    for note in notes:
+        print("Note: " + note)
+
+    report = {
+        "version": VERSION,
+        "run_utc": datetime.now(timezone.utc).isoformat(),
+        "symbol": dataset["symbol"],
+        "timeframe": dataset["timeframe"],
+        "price_field": dataset["price_field"],
+        "dataset_hash": data_digest,
+        "config_hash": config_digest,
+        "config": config,
+        "event_annotation_mode": "per_marker",
+        "contemporaneous_positions": sorted(contemporaneous),
+        "observation_count": len(prices),
+        "state_count": len(states),
+        "episode_count": len(episodes),
+        "episodes": episodes,
+        "states": [
+            {
+                "observation_number": s["index"] + 1,
+                "price": s["price"],
+                "features": s["features"],
+                "dna": s["dna"],
+                "flags": s["flags"],
+            }
+            for s in states
+        ],
+    }
+
+    write_json(REPORT_FILE, report)
+
+    print(f"Report saved: {REPORT_FILE.name}")
+    print(
+        "Reminder: observed history is descriptive; it does not "
+        "establish a future path."
+    )
+
+
+def reconstruct_historical_observation():
+    dataset = load_current_dataset()
+    if dataset is None:
+        print("No valid dataset. Use B first.")
+        return
+
+    prices = dataset["prices"]
+    print("\n=== R | HISTORICAL RECONSTRUCTION ===")
+    print(
+        f"Instrument: {dataset['symbol']} "
+        f"| observations: {len(prices)}"
+    )
+
+    raw = input(
+        f"Observation number to reconstruct [1–{len(prices)}]: "
+    ).strip()
+
+    try:
+        observation = int(raw)
+        if not 2 <= observation <= len(prices):
+            raise ValueError
+    except ValueError:
+        print(
+            "Enter a whole number between 2 and the dataset length."
+        )
+        return
+
+    index = observation - 1
+    config = dict(DEFAULT_CONFIG)
+
+    features = calculate_features(prices, index, config)
+    contemporaneous = get_contemporaneous_positions(dataset)
+    features["event_context"] = observation in contemporaneous
+
+    dna = build_dna(features, contemporaneous, config)
+
+    print("\n" + "=" * 66)
+    print(
+        f"HISTORICAL T0 RECONSTRUCTION — "
+        f"{dataset['symbol']} observation {observation}"
+    )
+    print("=" * 66)
+    print(f"Selected price: {prices[index]:.8g}")
+    print(
+        "T0 boundary: only observations 1 through "
+        f"{observation} build this fingerprint."
+    )
+    print(
+        f"Reference anchor (previous "
+        f"{config['reference_window']} closes): "
+        f"{fmt(features.get('reference_price'), 8)}"
+    )
+    print(
+        f"DNA: {dna} "
+        f"({', '.join(decode_dna(dna)) or 'no flags'})"
+    )
+
+    for key in ("D", "Z", "V", "E", "U"):
+        print(f"  {key}: {fmt(features.get(key), 5)}")
+
+    print_measurement_bars(features)
+
+    outcome = calculate_outcome(prices, index, features, config)
+    print_outcome_visual(outcome)
+
+    print(
+        "\nT0/T1 separation: later observations were not "
+        "used to calculate the T0 fingerprint."
+    )
+
+    if dna & DNA_FLAGS["DISPLACEMENT"]:
+        archive = read_json(
+            ARCHIVE_FILE, {"episodes": []}
+        ).get("episodes", [])
+        episode = build_episode(
+            dataset, index, features, dna,
+            config_hash(config), dataset["dataset_hash"],
+            archive, config,
+        )
+        print("\nHistorical matches:")
+        if not episode["historical_matches"]:
+            print(
+                "  No sufficiently similar archived episode found "
+                f"(rejection threshold = {MAX_MATCH_DISTANCE:.2f})."
+            )
+        for match in episode["historical_matches"]:
+            print(
+                f"  {match['episode_id']} "
+                f"| distance={match['distance']:.4f} "
+                f"| outcome={match['outcome'].get('status')}"
+            )
+    else:
+        print(
+            "\nThis observation does not cross the current "
+            "displacement threshold; it is still reconstructable."
+        )
+
+
+# ============================================================
+# LIVE RECONSTRUCTION — MANUAL MT5 QUOTE
+# ============================================================
+
+def calculate_live_features(dataset, live_price, config, pip_size):
+    """
+    Live snapshot uses completed daily closes as the historical
+    base. The manually entered quote is NOT appended to history.
+
+    FIX-3: pip_size is resolved by the caller; None suppresses
+    pip-displayed fields (percent fields remain available).
+    """
+    prices = dataset["prices"]
+
+    minimum_history = max(
+        config["reference_window"],
+        config["displacement_window"] + 1,
+    )
+    if len(prices) < minimum_history:
+        raise ValueError(
+            "Not enough historical closes for a live reconstruction."
+        )
+
+    live_price = normalize_price(live_price)
+
+    logs = [math.log(p) for p in prices]
+    returns = log_returns(prices)
+
+    last_close = prices[-1]
+    live_return = math.log(live_price / last_close)
+
+    reference_window = config["reference_window"]
+    prior_anchor_logs = logs[-reference_window:]
+    anchor_log_mean = statistics.fmean(prior_anchor_logs)
+    anchor = math.exp(anchor_log_mean)
+    extension = math.log(live_price) - anchor_log_mean
+
+    if config["z_scale_mode"] == "level_mad":
+        scale = mad_scale(prior_anchor_logs)
+    elif config["z_scale_mode"] == "return_mad_rw":
+        prior_returns = [
+            v for v in returns[1:] if v is not None
+        ][-reference_window:]
+        sigma = mad_scale(prior_returns)
+        if sigma is not None:
+            scale = sigma * math.sqrt(
+                sum(
+                    (m / reference_window) ** 2
+                    for m in range(1, reference_window + 1)
+                )
+            )
+        else:
+            scale = None
+    else:
+        scale = None
+
+    z_score = extension / scale if scale is not None else None
+
+    displacement_window = config["displacement_window"]
+    historical_returns = [
+        abs(v) for v in returns[1:] if v is not None
+    ]
+    baseline_returns = historical_returns[-displacement_window:]
+    baseline_abs_return = (
+        median_or_none(baseline_returns)
+        if len(baseline_returns) >= displacement_window
+        else None
+    )
+    d_live = safe_ratio(abs(live_return), baseline_abs_return)
+
+    recent_n = config["recent_volatility_window"]
+    baseline_n = config["baseline_volatility_window"]
+    all_returns = [v for v in returns[1:] if v is not None]
+
+    if recent_n > 1:
+        recent_historical = all_returns[-(recent_n - 1):]
+    else:
+        recent_historical = []
+
+    recent_with_live = recent_historical + [live_return]
+    baseline_end = max(0, len(all_returns) - (recent_n - 1))
+    baseline_start = max(0, baseline_end - baseline_n)
+    baseline_volatility_returns = all_returns[
+        baseline_start:baseline_end
+    ]
+
+    v_live = None
+    if (
+        len(recent_with_live) >= recent_n
+        and len(baseline_volatility_returns) >= baseline_n
+    ):
+        v_live = safe_ratio(
+            standard_deviation_or_none(recent_with_live),
+            standard_deviation_or_none(baseline_volatility_returns),
+        )
+
+    path_window = config["path_window"]
+    path_prices = prices[-path_window:] + [live_price]
+    if len(path_prices) > path_window + 1:
+        path_prices = path_prices[-(path_window + 1):]
+
+    e_live = None
+    if len(path_prices) >= path_window + 1:
+        path_length = sum(
+            abs(path_prices[i] - path_prices[i - 1])
+            for i in range(1, len(path_prices))
+        )
+        if path_length > EPSILON:
+            e_live = min(
+                1.0,
+                abs(path_prices[-1] - path_prices[0]) / path_length,
+            )
+
+    trend_window = config["trend_window"]
+    trend_logs = logs[-trend_window:]
+    trend = (
+        sign(trend_logs[-1] - trend_logs[0])
+        if len(trend_logs) >= trend_window
+        else 0
+    )
+
+    live_features = {
+        "index": len(prices),
+        "price": live_price,
+        "return": live_return,
+        "D": d_live,
+        "Z": z_score,
+        "V": v_live,
+        "E": e_live,
+        "U": sign(live_return),
+        "e": extension,
+        "baseline_abs_return": baseline_abs_return,
+        "reference_log_mean": anchor_log_mean,
+        "reference_price": anchor,
+        "trend_direction": trend,
+        "event_context": False,
+        "last_completed_close": last_close,
+        "live_return_pct": (live_price / last_close - 1.0) * 100.0,
+        "snapshot_type": "manual_live_quote",
+        "pip_size": pip_size,
+    }
+
+    if pip_size is not None:
+        live_features["live_return_pips"] = (
+            live_price - last_close
+        ) / pip_size
+        live_features["anchor_distance_pips"] = (
+            live_price - anchor
+        ) / pip_size
+
+    return live_features
+
+
+def print_live_report(dataset, features, quote_time):
+    price = features["price"]
+    anchor = features["reference_price"]
+    last_close = features["last_completed_close"]
+    pip_size = features.get("pip_size")
+
+    print("\n" + "=" * 66)
+    print(f"{VERSION} — LIVE PRICE RECONSTRUCTION")
+    print("=" * 66)
+    print(
+        f"Instrument: {dataset['symbol']} "
+        f"| Base series: D1 Close"
+    )
+    print(f"Quote time entered: {quote_time or 'not supplied'}")
+    print(f"Current MT5 quote: {price:.8g}")
+    print(f"Previous completed D1 close: {last_close:.8g}")
+    print(
+        f"Historical anchor (geometric mean of prior "
+        f"{DEFAULT_CONFIG['reference_window']} completed closes): "
+        f"{anchor:.8g}"
+    )
+
+    print("\n1) POSITION AGAINST HISTORICAL REFERENCE ANCHOR")
+    print(f"   Anchor: {anchor:.8g}")
+    print(f"   Quote : {price:.8g}")
+
+    if pip_size is not None:
+        print(
+            f"   Pip size used: {pip_size:g} "
+            f"(instrument-aware)"
+        )
+        print(
+            f"   Signed distance: "
+            f"{features['anchor_distance_pips']:+.1f} pips"
+        )
+    else:
+        print(
+            "   Signed distance in pips: N/A "
+            "(pip convention not set for this instrument)"
+        )
+        print(
+            f"   Signed distance (price units): "
+            f"{price - anchor:+.6g}"
+        )
+
+    ascii_anchor_position(price, anchor)
+    print("   Z extension: " + fmt(features.get("Z"), 4))
+    print("   Z scale mode: " + DEFAULT_CONFIG["z_scale_mode"])
+    print(
+        "   Note: Z is a model-specific reference-relative offset, "
+        "not a probability or a conventional return z-score."
+    )
+
+    print(
+        "\n2) LIVE MOVEMENT AGAINST PREVIOUS COMPLETED DAILY CLOSE"
+    )
+    print(f"   Previous close: {last_close:.8g}")
+    print(f"   Live quote     : {price:.8g}")
+
+    if pip_size is not None:
+        print(
+            f"   Change         : "
+            f"{features['live_return_pips']:+.1f} pips"
+        )
+    else:
+        print(
+            f"   Change (price) : "
+            f"{price - last_close:+.6g}"
+        )
+
+    print(
+        f"   Percent change : {features['live_return_pct']:+.4f}%"
+    )
+
+    pct_abs = abs(features["live_return_pct"])
+    if pct_abs > LIVE_QUOTE_ANOMALY_PCT:
+        print(
+            f"   ANOMALY: live quote differs from the last "
+            f"completed close by {pct_abs:.4f}%, which exceeds "
+            f"the provisional {LIVE_QUOTE_ANOMALY_PCT:.2f}% "
+            "warning threshold."
+        )
+        print(
+            "   Display warning only. The quote is not rejected, "
+            "and neither value is inferred to be wrong."
+        )
+
+    d_live = features.get("D")
+    print("   Provisional D_live: " + fmt(d_live, 4))
+    print(
+        "   "
+        + (
+            f"[{bar(d_live, 6)}]"
+            if d_live is not None
+            else "N/A — insufficient baseline returns"
+        )
+    )
+    print(
+        "   D_live is intraday/provisional; the time exposure is "
+        "not a full D1 interval even when it is labeled "
+        "against a full-D1 baseline."
+    )
+
+    print("\n3) OTHER LIVE-SNAPSHOT MEASUREMENTS")
+    print(
+        "   Relative volatility V_live: "
+        + fmt(features.get("V"), 4)
+    )
+    print(
+        "   Path efficiency E_live    : "
+        + fmt(features.get("E"), 4)
+    )
+    print(
+        "      E measures directness of the recent path; "
+        "it is not a replacement measure."
+    )
+
+    direction = features["U"]
+    direction_label = (
+        "UP" if direction > 0
+        else ("DOWN" if direction < 0 else "FLAT")
+    )
+    print(f"   Latest quote direction U  : {direction_label}")
+
+    trend = features["trend_direction"]
+    trend_label = (
+        "UP" if trend > 0
+        else ("DOWN" if trend < 0 else "FLAT/UNAVAILABLE")
+    )
+    print(f"   Prior trend direction     : {trend_label}")
+
+    print("\nINTERPRETATION BOUNDARIES")
+    side = (
+        "above" if price > anchor
+        else ("below" if price < anchor else "at")
+    )
+    print(
+        f"  • The quote is {side} the historical reference anchor."
+    )
+    print(
+        "  • Anchor distance and live daily-close movement "
+        "are different measurements."
+    )
+    print(
+        "  • A large anchor distance does not prove a reversal "
+        "is due."
+    )
+    print(
+        "  • A large D_live is provisional while the D1 candle "
+        "remains open; time exposure differs from a completed D1."
+    )
+    print(
+        "  • Replacement outcome: NOT MEASURED — no future "
+        "prices are available."
+    )
+    print(
+        "  • This snapshot does not alter or append to the "
+        "historical dataset."
+    )
+    print("=" * 66)
+
+
+def live_reconstruction():
+    dataset = load_current_dataset()
+    if dataset is None:
+        print("No valid historical dataset. Use B first.")
+        return
+
+    print("\n=== L | LIVE RECONSTRUCTION ===")
+    print(
+        f"Instrument: {dataset['symbol']} "
+        f"| last stored D1 close: {dataset['prices'][-1]:.8g}"
+    )
+    print(
+        "Paste/type the current price displayed by MT5. "
+        "Do not enter a spread or pip value."
+    )
+
+    pip_size = instrument_pip_size(dataset["symbol"])
+    if pip_size is None:
+        print(
+            f"Warning: unknown pip convention for "
+            f"'{dataset['symbol']}'. Enter a pip size explicitly, "
+            "or leave blank to skip pip display."
+        )
+        raw_pip = input("Pip size (e.g. 0.0001): ").strip()
+        if raw_pip:
+            try:
+                pip_size = normalize_price(raw_pip)
+            except (ValueError, TypeError):
+                print("Invalid pip size; pip display will be skipped.")
+                pip_size = None
+
+    raw = input("Current quote: ").strip()
+    try:
+        quote = normalize_price(raw)
+    except (ValueError, TypeError):
+        print(
+            "Invalid quote. Enter one positive price, e.g. 1.3796."
+        )
+        return
+
+    quote_time = input(
+        "Quote timestamp (optional, e.g. 2026-10-15 10:30 SAST): "
+    ).strip()
+
+    try:
+        features = calculate_live_features(
+            dataset, quote, dict(DEFAULT_CONFIG), pip_size
+        )
+    except (ValueError, TypeError, IndexError) as exc:
+        print(f"Live reconstruction failed: {exc}")
+        return
+
+    print_live_report(dataset, features, quote_time)
+
+    snapshot = {
+        "version": VERSION,
+        "mode": "manual_live_snapshot",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "quote_time_entered": quote_time or None,
+        "symbol": dataset["symbol"],
+        "timeframe_base": dataset["timeframe"],
+        "price_field_base": dataset["price_field"],
+        "dataset_hash": dataset["dataset_hash"],
+        "config": DEFAULT_CONFIG,
+        "pip_size": pip_size,
+        "features": features,
+        "epistemic_note": (
+            "Live snapshot only. No T1 outcome calculated or "
+            "implied."
+        ),
+    }
+
+    write_json(LIVE_FILE, snapshot)
+    print(f"Live snapshot saved separately: {LIVE_FILE.name}")
+    print(
+        "The quote was not added to the completed-close history."
+    )
+
+
+# ============================================================
+# DATASET STATUS, ARCHIVE, SUMMARY, CONFIGURATION
+# ============================================================
+
+def show_dataset_status():
+    dataset = load_current_dataset()
+    print("\n=== D | DATASET STATUS ===")
+
+    if dataset is None:
+        print("No valid dataset loaded.")
+        print(f"Expected file: {DATASET_FILE}")
+        return
+
+    print(f"Instrument: {dataset['symbol']}")
+    print(
+        f"Timeframe / field: "
+        f"{dataset['timeframe']} / {dataset['price_field']}"
+    )
+    print(f"Observations: {len(dataset['prices'])}")
+    print(f"First price: {dataset['prices'][0]:.8g}")
+    print(
+        f"Last completed close: {dataset['prices'][-1]:.8g}"
+    )
+
+    events = normalize_event_positions(
+        dataset.get("event_positions")
+    )
+    if events:
+        print("Event markers:")
+        for event in events:
+            print(
+                f"  position {event['position']} -> {event['mode']}"
+            )
+    else:
+        print("Event markers: none")
+
+    timestamps = dataset.get("timestamps")
+    if timestamps:
+        print(
+            f"Timestamps: present ({len(timestamps)} entries; "
+            f"first={timestamps[0]}, last={timestamps[-1]})"
+        )
+    else:
+        print("Timestamps: not provided (chronology not verified)")
+
+    print(f"Dataset hash: {dataset['dataset_hash']}")
+    print(
+        f"Created UTC: {dataset.get('created_utc', 'unknown')}"
+    )
+
+
+def show_archive():
+    episodes = read_json(
+        ARCHIVE_FILE, {"episodes": []}
+    ).get("episodes", [])
+
+    print("\n=== H | HISTORICAL EPISODE ARCHIVE ===")
+    print(f"Archived episodes: {len(episodes)}")
+
+    if not episodes:
+        print("No episodes stored yet.")
+        return
+
+    for episode in episodes[-50:]:
+        outcome = episode.get("outcome", {})
+        print(
+            f"{episode.get('episode_id', '?')} "
+            f"| {episode.get('symbol', '?')} "
+            f"| obs={episode.get('observation_number', '?')} "
+            f"| DNA={episode.get('dna', '?')} "
+            f"| {outcome.get('status', 'unknown')} "
+            f"({outcome.get('available_horizon', 0)}/"
+            f"{outcome.get('requested_horizon', '?')})"
+        )
+
+    if len(episodes) > 50:
+        print("Showing latest 50 archived episodes.")
+
+
+def show_summary():
+    config = DEFAULT_CONFIG
+    config_digest = config_hash(config)
+
+    episodes = [
+        item
+        for item in read_json(
+            ARCHIVE_FILE, {"episodes": []}
+        ).get("episodes", [])
+        if item.get("config_hash") == config_digest
+    ]
+
+    print("\n=== S | ARCHIVE SUMMARY ===")
+    print(f"Config hash: {config_digest}")
+    print(f"Episodes under this configuration: {len(episodes)}")
+
+    if not episodes:
+        return
+
+    counts = {}
+    for item in episodes:
+        status = item.get("outcome", {}).get("status", "unknown")
+        counts[status] = counts.get(status, 0) + 1
+
+    print(
+        "Outcome status: "
+        + ", ".join(f"{k}={v}" for k, v in counts.items())
+    )
+
+    complete = [
+        item["outcome"]
+        for item in episodes
+        if item.get("outcome", {}).get("status") == "complete"
+    ]
+
+    sample_size = len(complete)
+    if not sample_size:
+        print(
+            "No complete-follow-up episodes yet; no frequencies "
+            "reported."
+        )
+        return
+
+    print(
+        f"\nComplete follow-up only (n={sample_size}), "
+        f"horizon {config['outcome_horizon']}:"
+    )
+
+    for threshold in config["replacement_thresholds"]:
+        hits = [
+            outcome["replacement_times"][str(threshold)]["h"]
+            for outcome in complete
+            if outcome["replacement_times"][str(threshold)]["observed"]
+        ]
+        line = (
+            f"  q={threshold}: reached in {len(hits)}/{sample_size} "
+            f"({len(hits) / sample_size:.0%})"
+        )
+        if hits:
+            line += (
+                f"; median first-reach h={statistics.median(hits)}"
+            )
+        print(line)
+
+    continuation = [o["max_continuation"] for o in complete]
+    print(
+        "  Median max continuation C_H: "
+        f"{statistics.median(continuation):.3f}"
+    )
+
+    if sample_size < 30:
+        print(f"Caution: n={sample_size} is small.")
+
+    print(
+        "These are observed frequencies, not probabilities. "
+        "Overlapping episodes are not independent."
+    )
+
+
+def show_configuration():
+    print(f"\n=== C | {VERSION} CONFIGURATION ===")
+    print(f"Config hash: {config_hash(DEFAULT_CONFIG)}")
+
+    for key, value in DEFAULT_CONFIG.items():
+        print(f"{key}: {value}")
+
+    print("\nModule-level repair constants (provisional, not "
+          "empirically validated):")
+    print(f"  MULTI_CANDLE_WINDOW: {MULTI_CANDLE_WINDOW}")
+    print(f"  MAX_MATCH_DISTANCE: {MAX_MATCH_DISTANCE}")
+    print(
+        f"  LIVE_QUOTE_ANOMALY_PCT: {LIVE_QUOTE_ANOMALY_PCT} "
+        "(display-only warning)"
+    )
+
+    print("\nDNA registry:")
+    for name, value in DNA_FLAGS.items():
+        print(f"  {value:>3} | {name}")
+
+    print("\nEvent annotation modes:")
+    for mode in EVENT_ANNOTATION_MODES:
+        gate = (
+            "enters T0 DNA"
+            if mode == "contemporaneous"
+            else "T1+ only"
+        )
+        print(f"  {mode} — {gate}")
+
+    print("\nDisplay semantics:")
+    print(
+        "  Z: model-specific reference-relative standardized "
+        "offset. Not a probability, not a conventional return "
+        "z-score."
+    )
+    print(
+        "  E: path efficiency (0 = oscillatory, 1 = direct). "
+        "Not a replacement measure."
+    )
+    print(
+        "  Signed max progress: positive = moved toward the "
+        "reference; negative = moved only further away."
+    )
+
+    print(
+        "\nAll thresholds are provisional research settings. "
+        "MAX_MATCH_DISTANCE and LIVE_QUOTE_ANOMALY_PCT are "
+        "provisional and not empirically validated."
+    )
+    print(
+        "A passing similarity threshold is not evidence that "
+        "two episodes will share outcomes."
+    )
+    print(
+        "Changing model settings changes the config hash and "
+        "separates comparison pools."
+    )
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+def print_menu():
+    print("\n" + "=" * 58)
+    print(f"{VERSION} — DISPLACEMENT-REPLACEMENT MODEL")
+    print("=" * 58)
+    print("B  — Batch inject historical D1 closes (90–150)")
+    print("E  — Annotate historical event positions (per-marker)")
+    print("R  — Historical reconstruction at selected observation")
+    print("L  — Live reconstruction from manually entered MT5 quote")
+    print("X  — Run full historical research pass (build/update archive)")
+    print("H  — Historical episode archive")
+    print("S  — Archive summary (complete follow-up only)")
+    print("D  — Dataset status")
+    print("C  — Configuration and DNA registry")
+    print("Q  — Quit")
+    print("-" * 58)
+    print(
+        "T0 = initial-state measurements "
+        "| T1+ = later observed outcomes"
+    )
+    print(
+        "Live snapshot = current measurements only; "
+        "no future outcome."
+    )
+
+
+def main():
+    print(f"\n{VERSION}")
+    print(
+        "Standalone numerical research model "
+        "| Python standard library only"
+    )
+    print(
+        "Historical closes and manual live quotes "
+        "are stored/handled separately."
+    )
+    print(
+        "Repair pass: per-marker annotation, instrument-aware pip "
+        "size, distinct starting prices, corrected return_mad_rw "
+        "window, same-dataset matching with distance rejection, "
+        "data-integrity confirmations, and a provisional live-quote "
+        "anomaly warning."
+    )
+
+    ensure_data_backups()
+
+    while True:
+        print_menu()
+        choice = input("Select option: ").strip().upper()
+
+        if choice == "B":
+            collect_dataset()
+        elif choice == "E":
+            edit_event_markers()
+        elif choice == "R":
+            reconstruct_historical_observation()
+        elif choice == "L":
+            live_reconstruction()
+        elif choice == "X":
+            dataset = load_current_dataset()
+            if dataset is None:
+                print("No valid dataset. Use B first.")
+            else:
+                run_research(dataset)
+        elif choice == "H":
+            show_archive()
+        elif choice == "S":
+            show_summary()
+        elif choice == "D":
+            show_dataset_status()
+        elif choice == "C":
+            show_configuration()
+        elif choice == "Q":
+            print("DRM closed.")
+            break
+        else:
+            print(
+                "Unknown option. Select B, E, R, L, X, H, S, D, "
+                "C or Q."
+            )
+
+
+if __name__ == "__main__":
+    main()

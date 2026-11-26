@@ -1,0 +1,1144 @@
+import os
+import json
+import math
+import random
+import re
+import time
+
+# ============================================================
+# Xav 1.0 — FOUR-HEAD CATEGORY-BIASED ATTENTION
+# Renamed from NLPOM 5.0, logic untouched. Do not destroy this model.
+# Pure Python, zero dependencies (Pydroid 3 / Termux safe).
+#
+# Head 0 = NOUN   Head 1 = VERB   Head 2 = GREETING   Head 3 = PRONOUN
+#
+# Core idea (exact math):
+#   score_h[i][j] = (q_i . k_j)/sqrt(d) + beta_h * M_h[j] + mask[j]
+#   M_h[j]  = 1 if token at position j has category h, else 0
+#   mask[j] = -1e4 if position j is BOS padding, else 0
+#   beta_h is LEARNED (one scalar per head).
+# Backward:
+#   dS = A * (dA - sum(dA*A))          (softmax Jacobian)
+#   dQ = dS K / sqrt(d)    dK = dS^T Q / sqrt(d)
+#   dbeta_h = sum_ij dS[i][j] * M_h[j]
+# Constants (mask, M) have no gradient of their own.
+# ============================================================
+
+ROOT = "Xav"
+BRAIN_DIR = os.path.join(ROOT, "BrainFile")
+WEIGHTS_FILE = os.path.join(BRAIN_DIR, "xav_v1.json")
+
+# ---------------- Architecture ----------------
+# SCALED CONTEXT WINDOW: Increased from 6 to 50
+CONTEXT_SIZE = 20
+EMBED_DIM    = 32
+NUM_HEADS    = 4
+HEAD_DIM     = EMBED_DIM // NUM_HEADS
+HIDDEN_SIZE  = 48
+
+# ---------------- Optimisation ----------------
+LEARNING_RATE = 0.02
+LR_MIN        = 0.002          # cosine decay floor
+USE_GRAD_CLIP = True
+GRAD_CLIP_NORM = 5.0
+
+# ---------------- Head bias ----------------
+BETA_INIT    = 2.0
+USE_PAD_MASK = True            # heads ignore BOS padding
+MASK_NEG     = -1e4            # large enough for exp()=0, small enough to keep float precision
+
+# ---------------- Training ----------------
+DEFAULT_VAL_SPLIT   = 0.15
+MIN_SENTS_FOR_SPLIT = 10
+PRINT_EVERY         = 10
+
+# ---------------- Generation ----------------
+REP_WINDOW = 8
+
+BOS = "<BOS>"
+EOS = "<EOS>"
+UNK = "<UNK>"
+RESERVED = (BOS, EOS, UNK)
+
+MODEL_NAME = "Xav"
+ARCH_VERSION = "Xav-1.0"
+
+assert EMBED_DIM % NUM_HEADS == 0, "EMBED_DIM % NUM_HEADS must be 0"
+assert NUM_HEADS == 4, "Lexicon is built for exactly 4 category heads"
+
+HEAD_NAMES = ["noun", "verb", "greeting", "pronoun"]
+CAT_NAMES  = {0: "noun", 1: "verb", 2: "greeting", 3: "pronoun", 4: "other"}
+
+GREETINGS = {
+    "hello", "hi", "hey", "goodbye", "bye", "thanks", "thank", "welcome",
+    "greetings", "howdy", "cheers", "sorry", "please",
+}
+PRONOUNS = {
+    "i", "im", "ive", "id", "ill", "you", "youre", "youve", "he", "she",
+    "we", "they", "it", "its", "me", "my", "your", "his", "her", "our",
+    "their", "him", "us", "them", "myself", "yourself",
+}
+FUNCTION = {
+    "the", "a", "an", "of", "to", "and", "or", "but", "in", "on", "at", "for",
+    "with", "from", "by", "as", "that", "this", "these", "those", "there",
+    "here", "what", "who", "how", "why", "when", "where", "which", "not",
+    "no", "yes", "so", "very", "too", "just", "also", "more", "some", "any",
+    "all", "again", "together", "today", "tomorrow", "tonight", "well",
+    "every", "good", "great", "nice", "small", "big", "new", "bright",
+    "happy", "better", "next", "same", "other",
+}
+VERBS = {
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "can", "could", "will", "would", "should", "may", "might", "must",
+    "go", "goes", "make", "run", "learn", "build", "like", "love", "want",
+    "need", "see", "know", "think", "say", "get", "give", "take", "work",
+    "help", "train", "speak", "talk", "eat", "play", "read", "write",
+    "live", "come", "look", "use", "find", "tell", "ask", "feel", "try",
+    "call", "feed", "walk", "drive", "sing", "sleep", "fall", "predict",
+}
+NOUN_EXC = {
+    "thing", "something", "anything", "nothing", "everything",
+    "morning", "evening", "king", "ring", "spring", "string",
+}
+
+def category(word):
+    """Rule-based tagger. Unknown words default to noun (documented noise)."""
+    w = word.replace("'", "")
+    if w in GREETINGS: return 2
+    if w in PRONOUNS:  return 3
+    if w in FUNCTION:  return 4
+    if w in NOUN_EXC: return 0
+    if w in VERBS: return 1
+    if w.endswith("s") and w[:-1] in VERBS: return 1
+    if w.endswith("es") and w[:-2] in VERBS: return 1
+    if len(w) > 4 and w.endswith(("ing", "ed")): return 1
+    return 0
+
+STARTER_CORPUS = """hello my name is phillip
+hello how are you today
+hi i am happy to see you
+hey how is your day going
+good morning to you
+goodbye see you tomorrow
+thanks for your help
+you are welcome
+i like to learn new things
+i am building a small language model
+we are testing the model today
+she reads a book every night
+he writes code on his phone
+they play music in the garden
+the dog runs in the park
+the cat sleeps on the bed
+my dog likes the park
+the model learns the words
+i love to code
+you can help me learn
+we can build a small model together
+it is a small model
+this is a test
+the sun is bright today
+the bird sings in the tree
+she likes her cat
+he feeds the dog
+they eat food at home
+i see the bird in the tree
+you make the code better
+we run the test again
+the student reads the book
+the teacher helps the student
+my phone runs the model
+i am learning to build a model
+the model predicts the next word
+hello i am a small model
+hi my friend how are you
+hey you are my friend
+thanks my friend
+goodbye my friend
+the rain falls on the house
+the car drives on the road
+he drives the car home
+she walks the dog in the morning
+we walk to the shop
+i need a new phone
+they want some food
+you know the answer
+i think the model is learning
+the code works well"""
+
+def matmul(A, B):
+    if not A or not B:
+        raise ValueError("matmul: empty matrix")
+    N, M = len(A), len(A[0])
+    M2, P = len(B), len(B[0])
+    if M != M2:
+        raise ValueError(f"matmul shape mismatch: {N}x{M} @ {M2}x{P}")
+    C = [[0.0] * P for _ in range(N)]
+    for i in range(N):
+        Ci = C[i]
+        for k in range(M):
+            a = A[i][k]
+            if a == 0: continue
+            Bk = B[k]
+            for j in range(P):
+                Ci[j] += a * Bk[j]
+    return C
+
+def matmul_transpose_A(A, B):
+    if not A or not B:
+        raise ValueError("matmul_transpose_A: empty matrix")
+    M, N = len(A), len(A[0])
+    M2, P = len(B), len(B[0])
+    if M != M2:
+        raise ValueError(f"matmul_transpose_A: {M}x{N}^T vs {M2}x{P}")
+    C = [[0.0] * P for _ in range(N)]
+    for i in range(N):
+        Ci = C[i]
+        for k in range(M):
+            a = A[k][i]
+            if a == 0: continue
+            Bk = B[k]
+            for j in range(P):
+                Ci[j] += a * Bk[j]
+    return C
+
+def matmul_transpose_B(A, B):
+    if not A or not B:
+        raise ValueError("matmul_transpose_B: empty matrix")
+    N, M = len(A), len(A[0])
+    P, M2 = len(B), len(B[0])
+    if M != M2:
+        raise ValueError(f"matmul_transpose_B: {N}x{M} @ {P}x{M2}^T")
+    C = [[0.0] * P for _ in range(N)]
+    for i in range(N):
+        Ai = A[i]
+        for j in range(P):
+            Bj = B[j]
+            total = 0.0
+            for k in range(M):
+                total += Ai[k] * Bj[k]
+            C[i][j] = total
+    return C
+
+def slice_cols(M, start, end):
+    return [row[start:end] for row in M]
+
+def concat_cols(A, B):
+    return [A[i] + B[i] for i in range(len(A))]
+
+def concat_many(parts):
+    out = parts[0]
+    for p in parts[1:]:
+        out = concat_cols(out, p)
+    return out
+
+def softmax_1d(logits):
+    if not logits:
+        raise ValueError("softmax_1d: empty logits")
+    m = max(logits)
+    exps = [math.exp(l - m) for l in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+def log_sum_exp(logits):
+    if not logits:
+        raise ValueError("log_sum_exp: empty logits")
+    m = max(logits)
+    return m + math.log(sum(math.exp(l - m) for l in logits))
+
+def cross_entropy_from_logits(logits, target):
+    if target < 0 or target >= len(logits):
+        raise ValueError(f"Invalid target {target} for vocab size {len(logits)}")
+    return log_sum_exp(logits) - logits[target]
+
+def cosine_similarity(v1, v2):
+    dot = sum(a * b for a, b in zip(v1, v2))
+    m1 = math.sqrt(sum(a * a for a in v1))
+    m2 = math.sqrt(sum(b * b for b in v2))
+    return dot / (m1 * m2) if m1 > 0 and m2 > 0 else 0.0
+
+def attention_entropy(row):
+    return -sum(p * math.log(p + 1e-12) for p in row if p > 0)
+
+def matrix_stats(M):
+    flat = [v for row in M for v in row]
+    if not flat:
+        return {"min": 0, "max": 0, "mean": 0, "std": 0, "l2": 0, "nan": 0}
+    n = len(flat)
+    mean = sum(flat) / n
+    var = sum((v - mean) ** 2 for v in flat) / n
+    return {
+        "min": min(flat), "max": max(flat), "mean": mean,
+        "std": math.sqrt(var),
+        "l2": math.sqrt(sum(v * v for v in flat)),
+        "nan": sum(1 for v in flat if not math.isfinite(v)),
+    }
+
+def tokenize(text):
+    return re.findall(r"\b[\w']+\b", text.lower())
+
+def split_sentences(text):
+    return [s.strip() for s in re.split(r'[.\n!?]+', text) if s.strip()]
+
+class NeuralCortex:
+    def __init__(self):
+        self.vocab = []
+        self.stoi = {}
+        self.cat = {}
+        self.E = []
+        self.W1, self.b1 = [], []
+        self.W2, self.b2 = [], []
+        self.W_Q, self.W_K, self.W_V, self.W_O = [], [], [], []
+        self.beta = []
+        self.PE = []
+        self.steps = 0
+        self.metadata = {}
+        self.load_brain()
+    @staticmethod
+    def _cat_for(token):
+        return -1 if token in RESERVED else category(token)
+    def rebuild_categories(self):
+        self.cat = {i: self._cat_for(t) for i, t in enumerate(self.vocab)}
+    def make_context(self, tokens):
+        bos = self.stoi[BOS]
+        unk = self.stoi[UNK]
+        ctx = [bos] * CONTEXT_SIZE + [self.stoi.get(t, unk) for t in tokens]
+        return ctx[-CONTEXT_SIZE:]
+    def encode_sentence(self, sentence):
+        raw = tokenize(sentence)
+        unk = self.stoi[UNK]
+        ids = [self.stoi.get(t, unk) for t in raw]
+        ids.append(self.stoi[EOS])
+        return ids, raw
+    def compute_positional_encoding(self):
+        pe = []
+
+        # Additional earlier context positions.
+        for pos in range(CONTEXT_SIZE - 6):
+            pe.append([
+                math.sin(pos / (10000 ** (i / EMBED_DIM)))
+                if i % 2 == 0 else
+                math.cos(pos / (10000 ** ((i - 1) / EMBED_DIM)))
+                for i in range(EMBED_DIM)
+            ])
+
+        # Preserve original six positional encodings.
+        for pos in range(6):
+            pe.append([
+                math.sin(pos / (10000 ** (i / EMBED_DIM)))
+                if i % 2 == 0 else
+                math.cos(pos / (10000 ** ((i - 1) / EMBED_DIM)))
+                for i in range(EMBED_DIM)
+            ])
+
+        return pe
+
+    def initialize(self):
+        self.vocab = [BOS, EOS, UNK]
+        self.stoi = {t: i for i, t in enumerate(self.vocab)}
+        self.rebuild_categories()
+        self.PE = self.compute_positional_encoding()
+        self.E = [[random.uniform(-0.1, 0.1) for _ in range(EMBED_DIM)]
+                  for _ in self.vocab]
+        la = math.sqrt(6.0 / (EMBED_DIM + EMBED_DIM))
+        def attn_mat():
+            return [[random.uniform(-la, la) for _ in range(EMBED_DIM)]
+                    for _ in range(EMBED_DIM)]
+        self.W_Q, self.W_K, self.W_V, self.W_O = (attn_mat(), attn_mat(),
+                                                   attn_mat(), attn_mat())
+        self.beta = [BETA_INIT] * NUM_HEADS
+        input_size = CONTEXT_SIZE * EMBED_DIM
+        l1 = math.sqrt(6.0 / (input_size + HIDDEN_SIZE))
+        self.W1 = [[random.uniform(-l1, l1) for _ in range(HIDDEN_SIZE)]
+                   for _ in range(input_size)]
+        self.b1 = [0.0] * HIDDEN_SIZE
+        l2 = math.sqrt(6.0 / (HIDDEN_SIZE + len(self.vocab)))
+        self.W2 = [[random.uniform(-l2, l2) for _ in self.vocab]
+                   for _ in range(HIDDEN_SIZE)]
+        self.b2 = [0.0] * len(self.vocab)
+        self.steps = 0
+        self.metadata = {"created": time.time(), "tokenizer_version": "1.0"}
+    def add_token(self, token):
+        if token in self.stoi:
+            return
+        new_id = len(self.vocab)
+        self.stoi[token] = new_id
+        self.vocab.append(token)
+        self.cat[new_id] = self._cat_for(token)
+        self.E.append([random.uniform(-0.1, 0.1) for _ in range(EMBED_DIM)])
+        limit = math.sqrt(6.0 / (HIDDEN_SIZE + len(self.vocab)))
+        for row in self.W2:
+            row.append(random.uniform(-limit, limit))
+        self.b2.append(0.0)
+    def validate_shapes(self):
+        V = len(self.vocab)
+        def check_2d(M, r, c, name):
+            if len(M) != r:
+                raise ValueError(f"{name}: expected {r} rows, got {len(M)}")
+            for i, row in enumerate(M):
+                if len(row) != c:
+                    raise ValueError(f"{name}[{i}]: expected {c} cols, got {len(row)}")
+        def check_1d(v, n, name):
+            if len(v) != n:
+                raise ValueError(f"{name}: expected {n}, got {len(v)}")
+        check_2d(self.E, V, EMBED_DIM, "E")
+        for nm, M in [("W_Q", self.W_Q), ("W_K", self.W_K),
+                      ("W_V", self.W_V), ("W_O", self.W_O)]:
+            check_2d(M, EMBED_DIM, EMBED_DIM, nm)
+        check_2d(self.W1, CONTEXT_SIZE * EMBED_DIM, HIDDEN_SIZE, "W1")
+        check_2d(self.W2, HIDDEN_SIZE, V, "W2")
+        check_1d(self.b1, HIDDEN_SIZE, "b1")
+        check_1d(self.b2, V, "b2")
+        check_1d(self.beta, NUM_HEADS, "beta")
+        if len(self.cat) != V:
+            raise ValueError(f"cat map size {len(self.cat)} != vocab {V}")
+        for name, M in [("E", self.E), ("W_Q", self.W_Q), ("W_K", self.W_K),
+                        ("W_V", self.W_V), ("W_O", self.W_O),
+                        ("W1", self.W1), ("W2", self.W2)]:
+            for row in M:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError(f"Non-finite value in {name}")
+        for name, v in [("b1", self.b1), ("b2", self.b2), ("beta", self.beta)]:
+            for x in v:
+                if not math.isfinite(x):
+                    raise ValueError(f"Non-finite value in {name}")
+    def forward(self, context):
+        if len(context) != CONTEXT_SIZE:
+            raise ValueError(f"Context length {len(context)} != {CONTEXT_SIZE}")
+        bos = self.stoi[BOS]
+        X = [[self.E[context[pos]][d] + self.PE[pos][d]
+              for d in range(EMBED_DIM)] for pos in range(CONTEXT_SIZE)]
+        Q = matmul(X, self.W_Q)
+        K = matmul(X, self.W_K)
+        V = matmul(X, self.W_V)
+        scale = math.sqrt(HEAD_DIM)
+        pad = [USE_PAD_MASK and context[j] == bos for j in range(CONTEXT_SIZE)]
+        heads, outs = [], []
+        for h in range(NUM_HEADS):
+            lo, hi = h * HEAD_DIM, (h + 1) * HEAD_DIM
+            Qh = slice_cols(Q, lo, hi)
+            Kh = slice_cols(K, lo, hi)
+            Vh = slice_cols(V, lo, hi)
+            M = [1.0 if self.cat.get(context[j], -1) == h else 0.0
+                 for j in range(CONTEXT_SIZE)]
+            bias = [self.beta[h] * M[j] + (MASK_NEG if pad[j] else 0.0)
+                    for j in range(CONTEXT_SIZE)]
+            S = matmul_transpose_B(Qh, Kh)
+            for i in range(CONTEXT_SIZE):
+                for j in range(CONTEXT_SIZE):
+                    S[i][j] = S[i][j] / scale + bias[j]
+            A = [softmax_1d(row) for row in S]
+            O = matmul(A, Vh)
+            heads.append({"Q": Qh, "K": Kh, "V": Vh, "A": A, "M": M})
+            outs.append(O)
+        concat = concat_many(outs)
+        attn = matmul(concat, self.W_O)
+        res = [[X[i][d] + attn[i][d] for d in range(EMBED_DIM)]
+               for i in range(CONTEXT_SIZE)]
+        flat = []
+        for row in res:
+            flat.extend(row)
+        hidden = []
+        for j in range(HIDDEN_SIZE):
+            total = self.b1[j]
+            for i in range(len(flat)):
+                total += flat[i] * self.W1[i][j]
+            hidden.append(math.tanh(total))
+        logits = []
+        for k in range(len(self.vocab)):
+            total = self.b2[k]
+            for j in range(HIDDEN_SIZE):
+                total += hidden[j] * self.W2[j][k]
+            logits.append(total)
+        probs = softmax_1d(logits)
+        return {
+            "X": X, "heads": heads, "concat": concat, "attn": attn,
+            "res": res, "flat": flat, "hidden": hidden,
+            "logits": logits, "probs": probs,
+        }
+    def compute_loss(self, context, target):
+        r = self.forward(context)
+        return cross_entropy_from_logits(r["logits"], target)
+    def compute_gradients(self, context, target):
+        r = self.forward(context)
+        scale = math.sqrt(HEAD_DIM)
+        V = len(self.vocab)
+        loss = cross_entropy_from_logits(r["logits"], target)
+        dlogits = r["probs"][:]
+        dlogits[target] -= 1.0
+        dhidden = [0.0] * HIDDEN_SIZE
+        for j in range(HIDDEN_SIZE):
+            W2j = self.W2[j]
+            total = 0.0
+            for k in range(V):
+                total += W2j[k] * dlogits[k]
+            dhidden[j] = total
+        dz = [dhidden[j] * (1.0 - r["hidden"][j] ** 2) for j in range(HIDDEN_SIZE)]
+        dflat = [0.0] * len(r["flat"])
+        for i in range(len(r["flat"])):
+            W1i = self.W1[i]
+            total = 0.0
+            for j in range(HIDDEN_SIZE):
+                total += W1i[j] * dz[j]
+            dflat[i] = total
+        dW2 = [[r["hidden"][j] * dlogits[k] for k in range(V)]
+               for j in range(HIDDEN_SIZE)]
+        db2 = dlogits[:]
+        dW1 = [[r["flat"][i] * dz[j] for j in range(HIDDEN_SIZE)]
+               for i in range(len(r["flat"]))]
+        db1 = dz[:]
+        d_res = [dflat[i * EMBED_DIM:(i + 1) * EMBED_DIM]
+                 for i in range(CONTEXT_SIZE)]
+        d_res_attn = [row[:] for row in d_res]
+        d_res_X = [row[:] for row in d_res]
+        d_concat = matmul_transpose_B(d_res_attn, self.W_O)
+        dW_O = matmul_transpose_A(r["concat"], d_res_attn)
+        dQs, dKs, dVs = [], [], []
+        dbeta = [0.0] * NUM_HEADS
+        for h in range(NUM_HEADS):
+            H = r["heads"][h]
+            lo, hi = h * HEAD_DIM, (h + 1) * HEAD_DIM
+            d_o = slice_cols(d_concat, lo, hi)
+            dVh = matmul_transpose_A(H["A"], d_o)
+            dA = matmul_transpose_B(d_o, H["V"])
+            dSc = [[0.0] * CONTEXT_SIZE for _ in range(CONTEXT_SIZE)]
+            for i in range(CONTEXT_SIZE):
+                dot = sum(dA[i][j] * H["A"][i][j] for j in range(CONTEXT_SIZE))
+                for j in range(CONTEXT_SIZE):
+                    dSc[i][j] = H["A"][i][j] * (dA[i][j] - dot)
+            dbeta[h] = sum(dSc[i][j] * H["M"][j]
+                           for i in range(CONTEXT_SIZE)
+                           for j in range(CONTEXT_SIZE))
+            dqk = [[v / scale for v in row] for row in dSc]
+            dQs.append(matmul(dqk, H["K"]))
+            dKs.append(matmul_transpose_A(dqk, H["Q"]))
+            dVs.append(dVh)
+        dQ, dK, dV = concat_many(dQs), concat_many(dKs), concat_many(dVs)
+        dW_Q = matmul_transpose_A(r["X"], dQ)
+        dW_K = matmul_transpose_A(r["X"], dK)
+        dW_V = matmul_transpose_A(r["X"], dV)
+        dX_Q = matmul_transpose_B(dQ, self.W_Q)
+        dX_K = matmul_transpose_B(dK, self.W_K)
+        dX_V = matmul_transpose_B(dV, self.W_V)
+        dE = {}
+        for i in range(CONTEXT_SIZE):
+            tid = context[i]
+            if tid not in dE:
+                dE[tid] = [0.0] * EMBED_DIM
+            for d in range(EMBED_DIM):
+                dE[tid][d] += (dX_Q[i][d] + dX_K[i][d] + dX_V[i][d]
+                               + d_res_X[i][d])
+        return {
+            "loss": loss, "dE": dE,
+            "dW_Q": dW_Q, "dW_K": dW_K, "dW_V": dW_V, "dW_O": dW_O,
+            "dW1": dW1, "db1": db1, "dW2": dW2, "db2": db2,
+            "dbeta": dbeta,
+        }
+    def apply_gradients(self, g, lr=None, clip_norm=None):
+        if lr is None:
+            lr = LEARNING_RATE
+        if clip_norm is not None:
+            norm_sq = 0.0
+            for key in ["dW_Q", "dW_K", "dW_V", "dW_O", "dW1", "dW2"]:
+                for row in g[key]:
+                    for v in row:
+                        norm_sq += v * v
+            for key in ["db1", "db2", "dbeta"]:
+                for v in g[key]:
+                    norm_sq += v * v
+            for vec in g["dE"].values():
+                for v in vec:
+                    norm_sq += v * v
+            total = math.sqrt(norm_sq)
+            if total > clip_norm and total > 0:
+                s = clip_norm / total
+                for key in ["dW_Q", "dW_K", "dW_V", "dW_O", "dW1", "dW2"]:
+                    g[key] = [[v * s for v in row] for row in g[key]]
+                for key in ["db1", "db2", "dbeta"]:
+                    g[key] = [v * s for v in g[key]]
+                for tid in g["dE"]:
+                    g["dE"][tid] = [v * s for v in g["dE"][tid]]
+        for tid, vec in g["dE"].items():
+            Et = self.E[tid]
+            for d in range(EMBED_DIM):
+                Et[d] -= lr * vec[d]
+        for i in range(EMBED_DIM):
+            for j in range(EMBED_DIM):
+                self.W_Q[i][j] -= lr * g["dW_Q"][i][j]
+                self.W_K[i][j] -= lr * g["dW_K"][i][j]
+                self.W_V[i][j] -= lr * g["dW_V"][i][j]
+                self.W_O[i][j] -= lr * g["dW_O"][i][j]
+        for i in range(len(g["dW1"])):
+            for j in range(HIDDEN_SIZE):
+                self.W1[i][j] -= lr * g["dW1"][i][j]
+        for j in range(HIDDEN_SIZE):
+            self.b1[j] -= lr * g["db1"][j]
+        V = len(self.vocab)
+        for j in range(HIDDEN_SIZE):
+            W2j = self.W2[j]
+            gj = g["dW2"][j]
+            for k in range(V):
+                W2j[k] -= lr * gj[k]
+        for k in range(V):
+            self.b2[k] -= lr * g["db2"][k]
+        for h in range(NUM_HEADS):
+            self.beta[h] -= lr * g["dbeta"][h]
+        self.steps += 1
+    def train_step(self, context, target, lr=None):
+        g = self.compute_gradients(context, target)
+        clip = GRAD_CLIP_NORM if USE_GRAD_CLIP else None
+        self.apply_gradients(g, lr=lr, clip_norm=clip)
+        return g["loss"]
+    def evaluate(self, sentences):
+        total_loss, total_steps, correct = 0.0, 0, 0
+        total_tokens, oov = 0, 0
+        for sentence in sentences:
+            ids, raw = self.encode_sentence(sentence)
+            for t in raw:
+                total_tokens += 1
+                if t not in self.stoi:
+                    oov += 1
+            context = [self.stoi[BOS]] * CONTEXT_SIZE
+            for target in ids:
+                r = self.forward(context)
+                total_loss += cross_entropy_from_logits(r["logits"], target)
+                pred = max(range(len(r["logits"])), key=lambda k: r["logits"][k])
+                if pred == target:
+                    correct += 1
+                total_steps += 1
+                context = (context + [target])[-CONTEXT_SIZE:]
+        avg = total_loss / max(total_steps, 1)
+        return {
+            "loss": avg,
+            "ppl": math.exp(avg) if avg < 50 else float("inf"),
+            "acc": correct / max(total_steps, 1),
+            "oov_rate": oov / max(total_tokens, 1),
+        }
+    def train(self, text, epochs=10, val_split=DEFAULT_VAL_SPLIT, seed=None):
+        if seed is not None:
+            random.seed(seed)
+        sentences = split_sentences(text)
+        if not sentences:
+            return "No training data."
+        random.shuffle(sentences)
+        use_split = (len(sentences) >= MIN_SENTS_FOR_SPLIT and val_split > 0)
+        if use_split:
+            n_val = max(1, int(len(sentences) * val_split))
+            val_sentences = sentences[:n_val]
+            train_sentences = sentences[n_val:]
+        else:
+            if val_split > 0:
+                print(f"[TRAIN] Only {len(sentences)} sentences; need "
+                      f"{MIN_SENTS_FOR_SPLIT} for val split. Using all for training.")
+            val_sentences = []
+            train_sentences = sentences[:]
+        for sentence in train_sentences:
+            for t in tokenize(sentence):
+                self.add_token(t)
+        self.validate_shapes()
+        print(f"\n[Xav 1.0] Training")
+        print(f"Train sents: {len(train_sentences)} | Val sents: {len(val_sentences)} "
+              f"| Vocab: {len(self.vocab)}")
+        print(f"Heads: {NUM_HEADS} ({', '.join(HEAD_NAMES)}) | "
+              f"Grad clip: {'ON' if USE_GRAD_CLIP else 'OFF'} | Seed: {seed}")
+        if CONTEXT_SIZE >= 32:
+            print(f"[WARNING] CONTEXT_SIZE is {CONTEXT_SIZE}. Pure Python training will be slow.")
+        t_start = time.time()
+        for epoch in range(epochs):
+            lr = LR_MIN + 0.5 * (LEARNING_RATE - LR_MIN) * (
+                1.0 + math.cos(math.pi * epoch / max(epochs, 1)))
+            random.shuffle(train_sentences)
+            total_loss, total_steps = 0.0, 0
+            for sentence in train_sentences:
+                ids, _ = self.encode_sentence(sentence)
+                context = [self.stoi[BOS]] * CONTEXT_SIZE
+                for target in ids:
+                    loss = self.train_step(context, target, lr=lr)
+                    total_loss += loss
+                    total_steps += 1
+                    context = (context + [target])[-CONTEXT_SIZE:]
+            train_loss = total_loss / max(total_steps, 1)
+            if epoch == 0 or (epoch + 1) % PRINT_EVERY == 0 or epoch == epochs - 1:
+                msg = (f"Epoch {epoch + 1:3d} | Loss: {train_loss:.4f} | "
+                       f"LR: {lr:.4f}")
+                if val_sentences:
+                    v = self.evaluate(val_sentences)
+                    msg += (f" | Val: {v['loss']:.4f} | PPL: {v['ppl']:.1f} "
+                            f"| Acc: {v['acc'] * 100:.0f}%")
+                msg += f" | {time.time() - t_start:.0f}s"
+                print(msg)
+        betas = ", ".join(f"{HEAD_NAMES[h]}={self.beta[h]:+.2f}"
+                          for h in range(NUM_HEADS))
+        print(f"[HEADS] learned beta: {betas}")
+        self.save_brain()
+        return "Training completed."
+
+    def generate(self, prompt, length=30, temperature=0.8,
+                 top_k=8, top_p=0.9, rep_penalty=1.15, auto_tune=False):
+        if temperature <= 0 and not auto_tune:
+            return "[ERROR] Temperature must be positive."
+        
+        prompt_tokens = tokenize(prompt)
+        oov = [t for t in prompt_tokens if t not in self.stoi]
+        context = self.make_context(prompt_tokens)
+        result = prompt_tokens[:]
+        gen_ids = []
+        hit_eos = False
+        bos_idx, unk_idx, eos_idx = self.stoi[BOS], self.stoi[UNK], self.stoi[EOS]
+        
+        # Dynamic Temperature Tuning
+        current_temp = temperature
+        if auto_tune and current_temp <= 0:
+            # Short prompts = lack context = higher temp (exploration)
+            # Long prompts = plenty context = lower temp (exploitation)
+            prompt_ratio = min(1.0, len(prompt_tokens) / CONTEXT_SIZE)
+            current_temp = max(0.4, 1.2 - (prompt_ratio * 0.8))
+            
+        # Adaptive Repetition Penalty
+        current_penalty = rep_penalty if rep_penalty > 0 else 1.0
+        
+        for _ in range(length):
+            r = self.forward(context)
+            logits = r["logits"][:]
+            
+            # Loop detection: if last 3 tokens are the same, ramp up penalty
+            if auto_tune and len(gen_ids) >= 3:
+                if gen_ids[-1] == gen_ids[-2] == gen_ids[-3]:
+                    current_penalty = min(2.5, current_penalty + 0.2)
+            
+            for t in set(gen_ids[-REP_WINDOW:]):
+                logits[t] = logits[t] / current_penalty if logits[t] > 0 \
+                    else logits[t] * current_penalty
+                    
+            logits[bos_idx] = -1e9
+            logits[unk_idx] = -1e9
+            
+            # Top-K filtering
+            if top_k and top_k < len(logits):
+                cutoff = sorted(logits, reverse=True)[top_k - 1]
+                logits = [l if l >= cutoff else -1e9 for l in logits]
+                
+            # Top-P (Nucleus) filtering
+            if top_p and 0.0 < top_p < 1.0:
+                probs = softmax_1d([l / current_temp for l in logits])
+                sorted_indices = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)
+                cum_prob = 0.0
+                keep_indices = set()
+                for i in sorted_indices:
+                    if cum_prob < top_p:
+                        keep_indices.add(i)
+                        cum_prob += probs[i]
+                    else:
+                        break
+                logits = [l if i in keep_indices else -1e9 for i, l in enumerate(logits)]
+                
+            # Final sampling
+            probs = softmax_1d([l / current_temp for l in logits])
+            rnd = random.random()
+            cum, chosen = 0.0, len(probs) - 1
+            for i, p in enumerate(probs):
+                cum += p
+                if rnd <= cum:
+                    chosen = i
+                    break
+                    
+            if chosen == eos_idx:
+                hit_eos = True
+                break
+                
+            result.append(self.vocab[chosen])
+            gen_ids.append(chosen)
+            context = (context + [chosen])[-CONTEXT_SIZE:]
+            
+        print(f"\n[GENERATION]")
+        print(f"  Prompt tokens: {len(prompt_tokens)}"
+              f"{f' ({len(oov)} OOV: {oov})' if oov else ''}")
+        print(f"  Temp: {current_temp:.2f} | top_k: {top_k} | top_p: {top_p} | rep_penalty: {current_penalty:.2f}")
+        print(f"  Generated: {len(gen_ids)} | EOS: {hit_eos}\n")
+        return " ".join(result)
+
+    def _fd(self, ctx, tgt, container, idx, eps):
+        old = container[idx]
+        container[idx] = old + eps
+        lp = self.compute_loss(ctx, tgt)
+        container[idx] = old - eps
+        lm = self.compute_loss(ctx, tgt)
+        container[idx] = old
+        return (lp - lm) / (2 * eps)
+    def numerical_gradient_check(self, context, target, eps=1e-5):
+        g = self.compute_gradients(context, target)
+        checks = []
+        def add(name, container, idx, analytical):
+            num = self._fd(context, target, container, idx, eps)
+            diff = abs(num - analytical)
+            denom = max(abs(num), abs(analytical), 1e-8)
+            rel = diff / denom
+            ok = rel < 1e-3 or diff < 1e-7
+            checks.append((name, analytical, num, rel, ok))
+        add("W_Q[0][0]", self.W_Q[0], 0, g["dW_Q"][0][0])
+        add("W_Q[3][5]", self.W_Q[3], 5, g["dW_Q"][3][5])
+        add("W_K[1][2]", self.W_K[1], 2, g["dW_K"][1][2])
+        add("W_V[2][4]", self.W_V[2], 4, g["dW_V"][2][4])
+        add("W_O[5][7]", self.W_O[5], 7, g["dW_O"][5][7])
+        add("W1[0][0]", self.W1[0], 0, g["dW1"][0][0])
+        add("W1[150][3]", self.W1[150], 3, g["dW1"][150][3])
+        add("W2[5][tgt]", self.W2[5], target, g["dW2"][5][target])
+        add("W2[3][0]", self.W2[3], 0, g["dW2"][3][0])
+        add("b1[1]", self.b1, 1, g["db1"][1])
+        add("b2[tgt]", self.b2, target, g["db2"][target])
+        for h in range(NUM_HEADS):
+            add(f"beta[{HEAD_NAMES[h]}]", self.beta, h, g["dbeta"][h])
+        last = context[-1]
+        for d in (0, 5):
+            add(f"E[{self.vocab[last]}][{d}]", self.E[last], d, g["dE"][last][d])
+        print(f"\n=== NUMERICAL GRADIENT CHECK ===")
+        print(f"Context: {[self.vocab[t] for t in context]}")
+        print(f"Target:  {self.vocab[target]} | eps: {eps}")
+        print(f"{'Parameter':<22} {'Analytical':>13} {'Numerical':>13} {'RelErr':>9}  ")
+        print("-" * 64)
+        all_ok = True
+        for name, ana, num, rel, ok in checks:
+            all_ok = all_ok and ok
+            print(f"{name:<22} {ana:>13.8f} {num:>13.8f} {rel:>9.2e}  "
+                  f"{'PASS' if ok else 'FAIL'}")
+        print("-" * 64)
+        print("All gradients verified." if all_ok
+              else "Gradient mismatch - check backward pass.")
+        return all_ok
+    def specialization_report(self, sentences):
+        cats = [0, 1, 2, 3, 4]
+        mass = [{c: 0.0 for c in cats} for _ in range(NUM_HEADS)]
+        base = {c: 0.0 for c in cats}
+        bos = self.stoi[BOS]
+        for sentence in sentences:
+            ids, _ = self.encode_sentence(sentence)
+            context = [bos] * CONTEXT_SIZE
+            for target in ids:
+                real = [j for j in range(CONTEXT_SIZE)
+                        if not (USE_PAD_MASK and context[j] == bos)]
+                if real:
+                    r = self.forward(context)
+                    n = len(real)
+                    frac = {c: sum(1 for j in real
+                                   if self.cat.get(context[j], -1) == c) / n
+                            for c in cats}
+                    for h in range(NUM_HEADS):
+                        A = r["heads"][h]["A"]
+                        for i in range(CONTEXT_SIZE):
+                            for c in cats:
+                                if frac[c] > 0:
+                                    mass[h][c] += sum(
+                                        A[i][j] for j in real
+                                        if self.cat.get(context[j], -1) == c)
+                    for c in cats:
+                        base[c] += frac[c] * CONTEXT_SIZE
+                context = (context + [target])[-CONTEXT_SIZE:]
+        print("\n=== HEAD SPECIALIZATION (attention lift per category) ===")
+        print(f"{'head':<10}" + "".join(f"{CAT_NAMES[c]:>10}" for c in cats)
+              + "   beta")
+        print("-" * 66)
+        for h in range(NUM_HEADS):
+            row = f"{HEAD_NAMES[h]:<10}"
+            for c in cats:
+                lift = mass[h][c] / base[c] if base[c] > 0 else float("nan")
+                mark = "*" if c == h else " "
+                row += f"{lift:>9.2f}{mark}"
+            row += f"  {self.beta[h]:+.2f}"
+            print(row)
+        print("-" * 66)
+        print("* = the head's own category. Lift > 1.2 on * means specialized.\n")
+    def inspect_network(self):
+        V = len(self.vocab)
+        n_emb = V * EMBED_DIM
+        n_att = 4 * EMBED_DIM * EMBED_DIM + NUM_HEADS
+        n_ffn = CONTEXT_SIZE * EMBED_DIM * HIDDEN_SIZE + HIDDEN_SIZE
+        n_out = HIDDEN_SIZE * V + V
+        print("\n========== Xav 1.0 DIAGNOSTICS ==========")
+        print(f"Vocab: {V} | Embed: {EMBED_DIM} | Heads: {NUM_HEADS}x{HEAD_DIM}")
+        print(f"Context: {CONTEXT_SIZE} | Hidden: {HIDDEN_SIZE} | Steps: {self.steps}")
+        print(f"Grad clip: {'ON' if USE_GRAD_CLIP else 'OFF'} | LR: {LEARNING_RATE}")
+        print(f"\nParams: emb {n_emb} | attn {n_att} | ffn {n_ffn} | "
+              f"out {n_out} | total {n_emb + n_att + n_ffn + n_out}")
+        print("\nHead bias (beta): " + ", ".join(
+            f"{HEAD_NAMES[h]}={self.beta[h]:+.3f}" for h in range(NUM_HEADS)))
+        print("\n--- Weight Statistics ---")
+        for name, M in [("E", self.E), ("W_Q", self.W_Q), ("W_K", self.W_K),
+                        ("W_V", self.W_V), ("W_O", self.W_O),
+                        ("W1", self.W1), ("W2", self.W2)]:
+            s = matrix_stats(M)
+            print(f"  {name:<4} min={s['min']:>7.3f} max={s['max']:>7.3f} "
+                  f"mu={s['mean']:>7.3f} sd={s['std']:>6.3f} "
+                  f"L2={s['l2']:>7.2f} nan={s['nan']}")
+        counts = {}
+        for t, c in self.cat.items():
+            counts[c] = counts.get(c, 0) + 1
+        print("\nVocab categories: " + ", ".join(
+            f"{CAT_NAMES.get(c, 'special')}={n}" for c, n in sorted(counts.items())))
+        print("============================================\n")
+    def inspect_attention(self, prompt):
+        tokens = tokenize(prompt)
+        context = self.make_context(tokens)
+        r = self.forward(context)
+        
+        # Truncate printing for large context windows to prevent terminal wrapping
+        show_last_n = min(CONTEXT_SIZE, 15)
+        start_idx = CONTEXT_SIZE - show_last_n
+        
+        words = [self.vocab[t] for t in context][start_idx:]
+        cats = [CAT_NAMES.get(self.cat.get(t, -1), "pad") for t in context][start_idx:]
+        
+        print(f"\n=== ATTENTION MAPS ===")
+        if CONTEXT_SIZE > 15:
+            print(f"[Showing last {show_last_n} tokens of {CONTEXT_SIZE} context window]")
+        print("Context: " + "  ".join(f"{w}({c})" for w, c in zip(words, cats)))
+        for h in range(NUM_HEADS):
+            A = r["heads"][h]["A"]
+            print(f"\nHead {h} [{HEAD_NAMES[h]}] beta={self.beta[h]:+.2f}")
+            print("          " + " ".join(f"{w[:7]:>7}" for w in words))
+            for i in range(start_idx, CONTEXT_SIZE):
+                w = self.vocab[context[i]]
+                row = " ".join(f"{A[i][j]:>7.3f}" for j in range(start_idx, CONTEXT_SIZE))
+                print(f"  {w[:7]:<7} {row}  H={attention_entropy(A[i]):.2f}")
+        print()
+    def inspect_embeddings(self, w1, w2):
+        if w1 not in self.stoi or w2 not in self.stoi:
+            print(f"[ERROR] '{w1}' or '{w2}' not in vocabulary.")
+            return
+        sim = cosine_similarity(self.E[self.stoi[w1]], self.E[self.stoi[w2]])
+        label = ("very similar" if sim > 0.7 else "related" if sim > 0.3 else
+                 "unrelated" if sim > -0.3 else "opposite")
+        print(f"\ncos('{w1}', '{w2}') = {sim:+.4f}  ({label})\n")
+    def save_brain(self):
+        os.makedirs(BRAIN_DIR, exist_ok=True)
+        self.validate_shapes()
+        state = {
+            "version": ARCH_VERSION,
+            "context_size": CONTEXT_SIZE,
+            "embedding_dim": EMBED_DIM,
+            "num_heads": NUM_HEADS,
+            "head_dim": HEAD_DIM,
+            "hidden_size": HIDDEN_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "steps": self.steps,
+            "metadata": self.metadata,
+            "vocab": self.vocab,
+            "E": self.E,
+            "W1": self.W1, "b1": self.b1,
+            "W2": self.W2, "b2": self.b2,
+            "W_Q": self.W_Q, "W_K": self.W_K,
+            "W_V": self.W_V, "W_O": self.W_O,
+            "beta": self.beta,
+        }
+        if os.path.exists(WEIGHTS_FILE):
+            backup = WEIGHTS_FILE + ".bak"
+            try:
+                if os.path.exists(backup):
+                    os.remove(backup)
+                os.rename(WEIGHTS_FILE, backup)
+            except OSError:
+                pass
+        tmp = WEIGHTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, WEIGHTS_FILE)
+        print(f"[BRAIN] Saved ({len(self.vocab)} tokens, {self.steps} steps).")
+    def load_brain(self):
+        if not os.path.exists(WEIGHTS_FILE):
+            print("[BRAIN] No checkpoint. Initializing fresh (Xav 1.0).")
+            self.initialize()
+            return
+        try:
+            with open(WEIGHTS_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self._validate_state(state)
+            self.vocab = state["vocab"]
+            self.stoi = {t: i for i, t in enumerate(self.vocab)}
+            self.rebuild_categories()
+            self.E = state["E"]
+            self.W1, self.b1 = state["W1"], state["b1"]
+            self.W2, self.b2 = state["W2"], state["b2"]
+            self.W_Q, self.W_K = state["W_Q"], state["W_K"]
+            self.W_V, self.W_O = state["W_V"], state["W_O"]
+            self.beta = state["beta"]
+            self.steps = state.get("steps", 0)
+            self.metadata = state.get("metadata", {})
+            self.PE = self.compute_positional_encoding()
+            print(f"[BRAIN] Loaded Xav 1.0. Vocab: {len(self.vocab)} | Steps: {self.steps}")
+        except Exception as e:
+            backup = f"{WEIGHTS_FILE}.corrupt.{int(time.time())}"
+            try:
+                os.rename(WEIGHTS_FILE, backup)
+                print(f"[BRAIN] Bad checkpoint preserved as {backup}")
+            except OSError:
+                pass
+            print(f"[BRAIN] Load failed: {e}")
+            print("[BRAIN] Initializing fresh model.")
+            self.initialize()
+    def _validate_state(self, state):
+        if state.get("version") != ARCH_VERSION:
+            raise ValueError(f"Version {state.get('version')} != {ARCH_VERSION}")
+        for key, expected in [("context_size", CONTEXT_SIZE),
+                              ("embedding_dim", EMBED_DIM),
+                              ("num_heads", NUM_HEADS),
+                              ("hidden_size", HIDDEN_SIZE)]:
+            if state.get(key) != expected:
+                raise ValueError(f"{key}: {state.get(key)} != {expected}")
+        for key in ["vocab", "E", "W1", "b1", "W2", "b2",
+                    "W_Q", "W_K", "W_V", "W_O", "beta"]:
+            if key not in state:
+                raise ValueError(f"Missing required entry: {key}")
+        V = len(state["vocab"])
+        if len(set(state["vocab"])) != V:
+            raise ValueError("Duplicate tokens in vocabulary")
+        for reserved in RESERVED:
+            if reserved not in state["vocab"]:
+                raise ValueError(f"Missing reserved token: {reserved}")
+        def check_2d(M, r, c, name):
+            if len(M) != r:
+                raise ValueError(f"{name}: {len(M)} rows != {r}")
+            for i, row in enumerate(M):
+                if len(row) != c:
+                    raise ValueError(f"{name}[{i}]: {len(row)} != {c}")
+        check_2d(state["E"], V, EMBED_DIM, "E")
+        for k in ["W_Q", "W_K", "W_V", "W_O"]:
+            check_2d(state[k], EMBED_DIM, EMBED_DIM, k)
+        check_2d(state["W1"], CONTEXT_SIZE * EMBED_DIM, HIDDEN_SIZE, "W1")
+        check_2d(state["W2"], HIDDEN_SIZE, V, "W2")
+        if len(state["b1"]) != HIDDEN_SIZE:
+            raise ValueError("b1 dimension mismatch")
+        if len(state["b2"]) != V:
+            raise ValueError("b2 dimension mismatch")
+        if len(state["beta"]) != NUM_HEADS:
+            raise ValueError("beta dimension mismatch")
+        for key in ["E", "W_Q", "W_K", "W_V", "W_O", "W1", "W2"]:
+            for row in state[key]:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError(f"Non-finite value in {key}")
+        for v in state["beta"]:
+            if not math.isfinite(v):
+                raise ValueError("Non-finite value in beta")
+
+def ask_int(prompt, default):
+    s = input(f"{prompt} [{default}]: ").strip()
+    try:
+        return int(s) if s else default
+    except ValueError:
+        return default
+
+def ask_float(prompt, default):
+    s = input(f"{prompt} [{default}]: ").strip()
+    try:
+        return float(s) if s else default
+    except ValueError:
+        return default
+
+MENU = """
++--------------------------------------------+
+| Xav 1.0 - FOUR-HEAD CATEGORY ATTENTION     |
++--------------------------------------------+
+|  1. Train (type text)                      |
+|  2. Train from TXT file                    |
+|  3. Generate language                      |
+|  4. Inspect network                        |
+|  5. Save model                             |
+|  6. Numerical gradient check               |
+|  7. Attention map inspector (4 heads)      |
+|  8. Embedding similarity                   |
+|  9. Validate shapes                        |
+| 10. Train on built-in starter corpus       |
+| 11. Head specialization report             |
+| 12. Word category tagger                   |
+|  0. Exit                                   |
++--------------------------------------------+
+"""
+
+def main():
+    cortex = NeuralCortex()
+    while True:
+        print(MENU)
+        choice = input("Xav > ").strip()
+        if choice == "1":
+            print("Enter training text (sentences separated by '.'):")
+            text = input("> ")
+            epochs = ask_int("Epochs", 100)
+            vs = ask_float("Val split", DEFAULT_VAL_SPLIT)
+            seed = input("Random seed (blank=none): ").strip()
+            seed = int(seed) if seed.isdigit() else None
+            print(cortex.train(text, epochs, val_split=vs, seed=seed))
+        elif choice == "2":
+            fn = input("TXT filename: ").strip()
+            if os.path.isfile(fn):
+                with open(fn, "r", encoding="utf-8") as f:
+                    text = f.read()
+                epochs = ask_int("Epochs", 50)
+                print(cortex.train(text, epochs))
+            else:
+                print("[ERROR] File not found.")
+        elif choice == "3":
+            prompt = input("Prompt: ")
+            length = ask_int("New tokens", 30)
+            print("\n(Enter 0 for any parameter to enable Auto-Tuning)")
+            temp = ask_float("Temperature", 0.8)
+            topk = ask_int("Top-k (0=off)", 8)
+            topp = ask_float("Top-p (0.1-1.0)", 0.9)
+            rep = ask_float("Repetition penalty", 1.15)
+            
+            auto = (temp <= 0 or topk <= 0 or topp <= 0 or rep <= 0)
+            
+            print(cortex.generate(prompt, length, temp, topk, topp, rep, auto_tune=auto))
+        elif choice == "4":
+            cortex.inspect_network()
+        elif choice == "5":
+            cortex.save_brain()
+        elif choice == "6":
+            if len(cortex.vocab) < 5:
+                print("[ERROR] Train first.")
+                continue
+            toks = tokenize(input("Context words: "))
+            if not toks:
+                print("[ERROR] Need at least 1 word.")
+                continue
+            ctx = cortex.make_context(toks)
+            tgt_word = input("Target next word: ").strip().lower()
+            tgt = cortex.stoi.get(tgt_word, cortex.stoi[UNK])
+            cortex.numerical_gradient_check(ctx, tgt)
+        elif choice == "7":
+            p = input("Prompt: ").strip()
+            if p:
+                cortex.inspect_attention(p)
+        elif choice == "8":
+            w1 = input("First word: ").strip().lower()
+            w2 = input("Second word: ").strip().lower()
+            cortex.inspect_embeddings(w1, w2)
+        elif choice == "9":
+            try:
+                cortex.validate_shapes()
+                print("[OK] All shapes and finite values valid.")
+            except Exception as e:
+                print(f"[FAIL] {e}")
+        elif choice == "10":
+            epochs = ask_int("Epochs", 60)
+            seed = ask_int("Seed", 10)
+            print(cortex.train(STARTER_CORPUS, epochs, seed=seed))
+        elif choice == "11":
+            if len(cortex.vocab) < 5:
+                print("[ERROR] Train first.")
+                continue
+            cortex.specialization_report(split_sentences(STARTER_CORPUS))
+        elif choice == "12":
+            words = tokenize(input("Words: "))
+            for w in words:
+                c = category(w)
+                print(f"  {w:<12} -> {CAT_NAMES[c]}")
+        elif choice == "0":
+            cortex.save_brain()
+            print("[Xav] Shutdown.")
+            break
+        else:
+            print("Invalid selection.")
+
+if __name__ == "__main__":
+    main()
